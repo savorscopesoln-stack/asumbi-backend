@@ -44,11 +44,18 @@ const allowedOrigins = (process.env.FRONTEND_URL || "http://localhost:5173")
 const corsOptions = {
   origin: (origin, callback) => {
     // allow non-browser tools (curl/Postman) which send no origin
-    if (!origin || allowedOrigins.includes(origin)) {
-      callback(null, true);
-    } else {
-      callback(new Error("Not allowed by CORS: " + origin));
+    if (!origin) return callback(null, true);
+
+    // allow explicit origins from FRONTEND_URL
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+
+    // allow any Vercel preview/production deployment URL for this project
+    if (/^https:\/\/asumbi(-[a-z0-9]+)?-savorscopesoln-stacks-projects\.vercel\.app$/.test(origin)) {
+      return callback(null, true);
     }
+    if (origin === "https://asumbi.vercel.app") return callback(null, true);
+
+    callback(new Error("Not allowed by CORS: " + origin));
   },
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
