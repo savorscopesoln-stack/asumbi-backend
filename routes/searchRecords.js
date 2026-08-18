@@ -5,12 +5,11 @@ router.get("/", async (req, res) => {
   try {
     const pool = req.pool;
     const { type, q } = req.query;
+    const safeQ = q ? `%${q}%` : "%%"; // matches everything when no search term is given
 
     let query = "";
     let request = pool.request();
 
-    // Explicit column lists — never SELECT * here, these tables have a
-    // password column and this endpoint is reachable by any logged-in user.
     if (type === "students") {
       query = `
         SELECT id, name, admissionNo, studentClass, gender, status, yearOfStudy, Phone
@@ -25,7 +24,7 @@ router.get("/", async (req, res) => {
 
     if (type === "teachers") {
       query = `
-        SELECT id, name, subject, phone, staffId, email
+        SELECT id, name, subject, phone, staffId, email, status, regionId, researchDay
         FROM Teachers
         WHERE name LIKE @q
         OR subject LIKE @q
@@ -48,11 +47,11 @@ router.get("/", async (req, res) => {
       return res.status(400).json({ message: "Invalid or missing 'type' query param" });
     }
 
-    request.input("q", `%${q}%`);
+    request.input("q", safeQ);
 
     const result = await request.query(query);
 
-    res.json(result.recordset);
+    res.json({ records: result.recordset });
   } catch (err) {
     console.log("SEARCH ERROR:", err);
     res.status(500).json({ message: err.message });
