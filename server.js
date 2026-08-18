@@ -9,6 +9,14 @@ const bcrypt = require("bcrypt");
 
 const { poolPromise, sql } = require("./config/db");
 const { protect, authorize, adminOnly } = require("./middleware/authMiddleware");
+const { ensureSchema } = require("./utils/ensureSchema");
+
+// Idempotent startup check — creates/upgrades the Notifications table
+// and adds leave_outs.leave_type if either is missing. Safe to run
+// on every boot.
+poolPromise
+  .then((pool) => ensureSchema(pool, sql))
+  .catch((err) => console.error("Schema ensure skipped:", err.message));
 
 // route modules
 const registerRoutes = require("./routes/register");
@@ -24,6 +32,7 @@ const metaRoutes = require("./routes/meta.routes");
 const feesRoutes = require("./routes/fees");
 const leaveRoutes = require("./routes/leave");
 const searchRoutes = require("./routes/searchRecords");
+const notificationsRoutes = require("./routes/notifications");
 
 /* =========================================================
    APP INIT
@@ -132,6 +141,7 @@ app.use("/api/e-assessments", eAssessmentRoutes); // already protects internally
 app.use("/api/fees", protect, feesRoutes);
 app.use("/api/leave", protect, leaveRoutes);
 app.use("/api/search", protect, searchRoutes);
+app.use("/api/notifications", protect, notificationsRoutes);
 app.use("/", metaRoutes);
 
 /* =========================================================
@@ -644,19 +654,6 @@ app.get("/api/student/summary", protect, async (req, res) => {
   } catch (err) {
     console.log("STUDENT SUMMARY ERROR:", err);
     res.status(500).json({});
-  }
-});
-
-app.get("/api/student/notifications", protect, async (req, res) => {
-  try {
-    const pool = req.pool;
-    const result = await pool.request().query(`
-      SELECT TOP 10 * FROM Notifications ORDER BY createdAt DESC
-    `);
-    res.json(result.recordset || []);
-  } catch (err) {
-    console.log("NOTIFICATIONS ERROR:", err);
-    res.status(500).json([]);
   }
 });
 

@@ -1,7 +1,46 @@
 const express = require("express");
 const router = express.Router();
 
+const VALID_LEAVE_TYPES = ["short_stay", "long", "emergency"];
+
+// Sensible default durations (minutes) per leave type, used whenever
+// the caller doesn't supply an explicit duration.
+const DEFAULT_DURATION_BY_TYPE = {
+  short_stay: 120,   // 2 hours
+  long: 2880,        // 2 days
+  emergency: 60,     // 1 hour — fast turnaround
+};
+
+const LEAVE_TYPE_LABEL = {
+  short_stay: "Short Stay",
+  long: "Long Leave",
+  emergency: "Emergency Leave",
+};
+
 module.exports = (poolPromise, sql) => {
+
+  /* ================= NOTIFY HELPER =================
+     Writes a row into Notifications for the student.
+     Failure to notify should never break the leave action itself.
+  */
+  const notifyStudent = async (pool, studentId, title, message, type = "leave") => {
+    try {
+      await pool.request()
+        .input("recipientId", sql.Int, studentId)
+        .input("recipientSource", sql.NVarChar, "Students")
+        .input("title", sql.NVarChar, title)
+        .input("message", sql.NVarChar, message)
+        .input("type", sql.NVarChar, type)
+        .query(`
+          INSERT INTO Notifications
+            (recipientId, recipientSource, title, message, type, isRead, createdAt)
+          VALUES
+            (@recipientId, @recipientSource, @title, @message, @type, 0, GETDATE())
+        `);
+    } catch (err) {
+      console.log("LEAVE NOTIFY ERROR:", err.message);
+    }
+  };
 
   /* ================= CREATE LEAVE ================= */
   router.post("/", async (req, res) => {
@@ -12,19 +51,28 @@ module.exports = (poolPromise, sql) => {
         student_id,
         reason,
         request_date,
-        duration
+        duration,
+        leave_type,
       } = req.body;
+
+      if (!student_id || !reason) {
+        return res.status(400).json({ message: "student_id and reason are required" });
+      }
+
+      const type = VALID_LEAVE_TYPES.includes(leave_type) ? leave_type : "short_stay";
+      const finalDuration = duration || DEFAULT_DURATION_BY_TYPE[type];
 
       await pool.request()
         .input("student_id", sql.Int, student_id)
         .input("reason", sql.NVarChar, reason)
         .input("request_date", sql.Date, request_date)
-        .input("duration", sql.Int, duration || 120)
+        .input("duration", sql.Int, finalDuration)
+        .input("leave_type", sql.NVarChar, type)
         .query(`
           INSERT INTO leave_outs
-          (student_id, reason, request_date, duration, status)
+          (student_id, reason, request_date, duration, status, leave_type)
           VALUES
-          (@student_id, @reason, @request_date, @duration, 'pending')
+          (@student_id, @reason, @request_date, @duration, 'pending', @leave_type)
         `);
 
       res.json({ message: "Leave request submitted" });
@@ -84,6 +132,16 @@ module.exports = (poolPromise, sql) => {
 
       const { approvedAt, duration } = req.body;
 
+      const existing = await pool.request()
+        .input("id", sql.Int, req.params.id)
+        .query(`SELECT student_id, leave_type FROM leave_outs WHERE id=@id`);
+
+      if (!existing.recordset.length) {
+        return res.status(404).json({ message: "Leave not found" });
+      }
+
+      const { student_id, leave_type } = existing.recordset[0];
+
       await pool.request()
         .input("id", sql.Int, req.params.id)
         .input("approvedAt", sql.DateTime, approvedAt)
@@ -95,6 +153,13 @@ module.exports = (poolPromise, sql) => {
               duration=@duration
           WHERE id=@id AND status='pending'
         `);
+
+      await notifyStudent(
+        pool,
+        student_id,
+        "Leave Request Approved",
+        `Your ${LEAVE_TYPE_LABEL[leave_type] || "leave"} request has been approved. You may print your leave permit from the Leave & Gate Pass page.`
+      );
 
       res.json({ message: "Approved" });
 
@@ -110,16 +175,34 @@ module.exports = (poolPromise, sql) => {
       const pool = await poolPromise;
 
       const { reason } = req.body;
+      const denyReason = reason || "No reason provided";
+
+      const existing = await pool.request()
+        .input("id", sql.Int, req.params.id)
+        .query(`SELECT student_id, leave_type FROM leave_outs WHERE id=@id`);
+
+      if (!existing.recordset.length) {
+        return res.status(404).json({ message: "Leave not found" });
+      }
+
+      const { student_id, leave_type } = existing.recordset[0];
 
       await pool.request()
         .input("id", sql.Int, req.params.id)
-        .input("reason", sql.NVarChar, reason || "No reason provided")
+        .input("reason", sql.NVarChar, denyReason)
         .query(`
           UPDATE leave_outs
           SET status='denied',
               deny_reason=@reason
           WHERE id=@id AND status='pending'
         `);
+
+      await notifyStudent(
+        pool,
+        student_id,
+        "Leave Request Denied",
+        `Your ${LEAVE_TYPE_LABEL[leave_type] || "leave"} request was denied. Reason: ${denyReason}`
+      );
 
       res.json({ message: "Denied" });
 
@@ -129,16 +212,16 @@ module.exports = (poolPromise, sql) => {
     }
   });
 
-  /* ================= REVOKE (NEW FEATURE) ================= */
+  /* ================= REVOKE ================= */
   router.put("/:id/revoke", async (req, res) => {
     try {
       const pool = await poolPromise;
 
-      // Get student info first (for WhatsApp message)
+      // Get student info first (for WhatsApp + in-app notification)
       const leave = await pool.request()
         .input("id", sql.Int, req.params.id)
         .query(`
-          SELECT student_id, reason, status
+          SELECT student_id, reason, status, leave_type
           FROM leave_outs
           WHERE id=@id
         `);
@@ -169,6 +252,14 @@ module.exports = (poolPromise, sql) => {
       console.log(`📲 WhatsApp to Student ${data.student_id}:`);
       console.log(`Your leave has been REVOKED. Please report back immediately.`);
 
+      await notifyStudent(
+        pool,
+        data.student_id,
+        "Leave Revoked",
+        "Your leave has been revoked by the administration. Please report back to the institution immediately.",
+        "leave_urgent"
+      );
+
       res.json({ message: "Leave revoked & student notified" });
 
     } catch (err) {
@@ -182,6 +273,10 @@ module.exports = (poolPromise, sql) => {
     try {
       const pool = await poolPromise;
 
+      const existing = await pool.request()
+        .input("id", sql.Int, req.params.id)
+        .query(`SELECT student_id FROM leave_outs WHERE id=@id`);
+
       await pool.request()
         .input("id", sql.Int, req.params.id)
         .query(`
@@ -189,6 +284,16 @@ module.exports = (poolPromise, sql) => {
           SET status='expired'
           WHERE id=@id
         `);
+
+      if (existing.recordset.length) {
+        await notifyStudent(
+          pool,
+          existing.recordset[0].student_id,
+          "Leave Expired",
+          "Your approved leave duration has expired. Please report back to the institution.",
+          "leave_urgent"
+        );
+      }
 
       res.json({ message: "Expired" });
 

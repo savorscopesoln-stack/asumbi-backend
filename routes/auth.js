@@ -3,6 +3,14 @@ const router = express.Router();
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const { sql, poolPromise } = require("../config/db");
+const { protect } = require("../middleware/authMiddleware");
+
+// Whitelisted so a table name can never be built from unchecked input.
+const SOURCE_TABLE = {
+  Users: "Users",
+  Students: "Students",
+  Teachers: "Teachers",
+};
 
 /* =========================================================
    LOGIN (ALL USERS - FIXED)
@@ -128,6 +136,69 @@ if (!user) {
     return res.status(500).json({
       message: "Server error"
     });
+  }
+});
+
+/* =========================================================
+   CHANGE PASSWORD (ALL USERS - Users / Students / Teachers)
+   Works for whichever table the logged-in account came from,
+   identified by req.user.source set by the protect middleware
+   from the JWT issued at login.
+========================================================= */
+router.put("/change-password", protect, async (req, res) => {
+  try {
+    const { oldPassword, newPassword } = req.body;
+
+    if (!oldPassword || !newPassword) {
+      return res.status(400).json({
+        message: "Old password and new password are required",
+      });
+    }
+
+    if (String(newPassword).length < 6) {
+      return res.status(400).json({
+        message: "New password must be at least 6 characters",
+      });
+    }
+
+    const table = SOURCE_TABLE[req.user.source];
+
+    if (!table) {
+      return res.status(400).json({
+        message: "Unable to determine account type for this user",
+      });
+    }
+
+    const pool = await poolPromise;
+
+    const userRes = await pool.request()
+      .input("id", sql.Int, req.user.id)
+      .query(`SELECT id, password FROM ${table} WHERE id = @id`);
+
+    const account = userRes.recordset[0];
+
+    if (!account || !account.password) {
+      return res.status(404).json({ message: "Account not found" });
+    }
+
+    const isMatch = await bcrypt.compare(oldPassword, account.password);
+
+    if (!isMatch) {
+      return res.status(401).json({ message: "Old password is incorrect" });
+    }
+
+    const hashed = await bcrypt.hash(newPassword, 10);
+
+    await pool.request()
+      .input("id", sql.Int, req.user.id)
+      .input("password", sql.NVarChar, hashed)
+      .query(`UPDATE ${table} SET password = @password WHERE id = @id`);
+
+    return res.json({ message: "Password updated successfully" });
+
+  } catch (err) {
+    console.log("CHANGE PASSWORD ERROR:", err);
+    return res.status(500).json({ message: "Server error" });
   }
 });
 
