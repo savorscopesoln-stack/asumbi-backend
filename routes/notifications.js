@@ -100,13 +100,13 @@ router.put("/:id/read", async (req, res) => {
 });
 
 /* =========================================================
-   POST /api/notifications   (admin / teacher / staff only)
+   POST /api/notifications   (admin / teacher / sub_admin only)
    Send a notification to a single student, a single teacher,
    a whole class, or every student.
    body: { recipientType: 'student'|'teacher'|'class'|'all_students',
            recipientId, studentClass, title, message, type }
 ========================================================= */
-router.post("/", authorize("admin", "teacher", "staff"), async (req, res) => {
+router.post("/", authorize("admin", "teacher", "sub_admin"), async (req, res) => {
   try {
     const pool = await poolPromise;
     const { recipientType, recipientId, studentClass, title, message, type } = req.body;

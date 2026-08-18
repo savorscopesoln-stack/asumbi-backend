@@ -55,10 +55,43 @@ const protect = (req, res, next) => {
       username: decoded?.username || null,
       email: decoded?.email || null,
 
+      /*
+        SUB-ADMIN PAGE ACCESS
+        JSON array of page keys (see utils/pages.js) this account is
+        allowed to open. Only meaningful when role === "sub_admin";
+        "admin" always has full access regardless of this list.
+      */
+      permissions: Array.isArray(decoded?.permissions)
+        ? decoded.permissions
+        : [],
+
       source: decoded?.source || null,
       iat: decoded?.iat || null,
       exp: decoded?.exp || null,
+
+      mustChangePassword: !!decoded?.mustChangePassword,
     };
+
+    /* =====================================================
+       MANDATORY PASSWORD CHANGE
+       If this account is flagged (new account, or an admin
+       reset it to the default password), every route except
+       the change-password endpoint itself is blocked until
+       they set their own password. Centralized here so it
+       applies to every route protected by `protect`, instead
+       of having to be added to each route individually.
+    ===================================================== */
+    const isChangePasswordRoute =
+      req.method === "PUT" &&
+      req.originalUrl.split("?")[0].replace(/\/+$/, "").endsWith("/api/auth/change-password");
+
+    if (req.user.mustChangePassword && !isChangePasswordRoute) {
+      return res.status(403).json({
+        success: false,
+        code: "PASSWORD_CHANGE_REQUIRED",
+        message: "You must change your password before continuing.",
+      });
+    }
 
     next();
   } catch (err) {
@@ -159,6 +192,55 @@ const authorize = (...allowedRoles) => {
 };
 
 /* =========================================================
+   PAGE-LEVEL AUTHORIZATION (sub-admins)
+   Unlike `authorize`, which only checks a role name, this
+   checks whether the specific page was granted to a
+   "sub_admin" account at setup time. "admin" always passes,
+   exactly like the admin bypass in `authorize` above.
+========================================================= */
+const requirePage = (pageKey) => {
+  return (req, res, next) => {
+    try {
+      if (!req.user) {
+        return res.status(401).json({
+          success: false,
+          message: "Not authenticated",
+        });
+      }
+
+      const userRole = String(req.user.role || "")
+        .toLowerCase()
+        .trim();
+
+      if (userRole === "admin") {
+        return next();
+      }
+
+      const permissions = Array.isArray(req.user.permissions)
+        ? req.user.permissions
+        : [];
+
+      if (userRole === "sub_admin" && permissions.includes(pageKey)) {
+        return next();
+      }
+
+      return res.status(403).json({
+        success: false,
+        message: `Forbidden: no access to "${pageKey}"`,
+        role: userRole,
+      });
+    } catch (err) {
+      console.log("❌ PAGE AUTH ERROR:", err.message);
+
+      return res.status(500).json({
+        success: false,
+        message: "Authorization error",
+      });
+    }
+  };
+};
+
+/* =========================================================
    OPTIONAL ADMIN ONLY
 ========================================================= */
 const adminOnly = authorize("admin");
@@ -179,6 +261,7 @@ const studentOnly = authorize("student");
 module.exports = {
   protect,
   authorize,
+  requirePage,
 
   adminOnly,
   teacherOnly,

@@ -3,7 +3,11 @@ const router = express.Router();
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const { sql, poolPromise } = require("../config/db");
-const { protect } = require("../middleware/authMiddleware");
+const { protect, requirePage } = require("../middleware/authMiddleware");
+
+// Password every admin-reset account is set back to. Kept as one named
+// constant so it's easy to change later without hunting through the file.
+const DEFAULT_RESET_PASSWORD = "1234";
 
 // Whitelisted so a table name can never be built from unchecked input.
 const SOURCE_TABLE = {
@@ -90,8 +94,15 @@ if (!user) {
         message: "Invalid username or password"
       });
     }
-    /* ================= ROLE SYSTEM ================= */
+    /* ================= ROLE SYSTEM =================
+       Only two account tiers exist in the Users table now:
+       "admin" (full access) and "sub_admin" (access limited
+       to whichever pages were granted at setup, see
+       user.permissions below). Any legacy "staff" rows are
+       migrated to "sub_admin" on server boot (ensureSchema),
+       but the fallback below covers it defensively too. */
     let role = "user";
+    let permissions = [];
 
     if (source === "Students") {
       role = "student";
@@ -103,16 +114,29 @@ if (!user) {
       const dbRole = (user.role || "").toLowerCase();
 
       if (dbRole === "admin") role = "admin";
-      else if (dbRole === "staff") role = "staff";
+      else if (dbRole === "sub_admin" || dbRole === "staff") role = "sub_admin";
+
+      if (role === "sub_admin") {
+        try {
+          const parsed = JSON.parse(user.permissions || "[]");
+          permissions = Array.isArray(parsed) ? parsed : [];
+        } catch {
+          permissions = [];
+        }
+      }
     }
 
     /* ================= TOKEN ================= */
+    const mustChangePassword = !!user.mustChangePassword;
+
     const token = jwt.sign(
       {
         id: user.id,
         username: user.username,
         role,
+        permissions,
         source,
+        mustChangePassword,
       },
       process.env.JWT_SECRET || "asumbi_secret",
       { expiresIn: "1d" }
@@ -126,8 +150,10 @@ if (!user) {
         username: user.username,
         name: user.name || "",
         role,
+        permissions,
         source,
-        subject: user.subject || null
+        subject: user.subject || null,
+        mustChangePassword,
       }
     });
 
@@ -192,12 +218,62 @@ router.put("/change-password", protect, async (req, res) => {
     await pool.request()
       .input("id", sql.Int, req.user.id)
       .input("password", sql.NVarChar, hashed)
-      .query(`UPDATE ${table} SET password = @password WHERE id = @id`);
+      .query(`UPDATE ${table} SET password = @password, mustChangePassword = 0 WHERE id = @id`);
 
     return res.json({ message: "Password updated successfully" });
 
   } catch (err) {
     console.log("CHANGE PASSWORD ERROR:", err);
+    return res.status(500).json({ message: "Server error" });
+  }
+});
+
+/* =========================================================
+   ADMIN: RESET ANY ACCOUNT'S PASSWORD TO THE DEFAULT
+   Body: { id, source } where source is "Users" | "Students" | "Teachers"
+   (this is the same `source` value already used everywhere else,
+   and is exactly what /api/records?type=... returns for each row).
+   Sets mustChangePassword = 1 so the account is forced to pick its
+   own password the next time it logs in.
+========================================================= */
+router.put("/admin/reset-password", protect, requirePage("Password Reset"), async (req, res) => {
+  try {
+    const { id, source } = req.body;
+    const table = SOURCE_TABLE[source];
+
+    if (!table || !id) {
+      return res.status(400).json({
+        message: "id and a valid source (Users, Students, or Teachers) are required",
+      });
+    }
+
+    const pool = await poolPromise;
+
+    const check = await pool.request()
+      .input("id", sql.Int, id)
+      .query(`SELECT id, username FROM ${table} WHERE id = @id`);
+
+    const account = check.recordset[0];
+
+    if (!account) {
+      return res.status(404).json({ message: "Account not found" });
+    }
+
+    const hashed = await bcrypt.hash(DEFAULT_RESET_PASSWORD, 10);
+
+    await pool.request()
+      .input("id", sql.Int, id)
+      .input("password", sql.NVarChar, hashed)
+      .query(`UPDATE ${table} SET password = @password, mustChangePassword = 1 WHERE id = @id`);
+
+    return res.json({
+      message: "Password reset to default",
+      username: account.username,
+      defaultPassword: DEFAULT_RESET_PASSWORD,
+    });
+
+  } catch (err) {
+    console.log("ADMIN RESET PASSWORD ERROR:", err);
     return res.status(500).json({ message: "Server error" });
   }
 });

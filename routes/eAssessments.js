@@ -31,7 +31,7 @@ const {
   getReleasedMarks, releaseMarks, bulkReleaseMarks,
 } = require("../controllers/eAssessment.controller");
 
-const { protect, authorize } = require("../middleware/authMiddleware");
+const { protect, authorize, requirePage } = require("../middleware/authMiddleware");
 
 /* =========================================================================
    HEALTH CHECK
@@ -45,45 +45,45 @@ router.get("/health", (req, res) => {
 ========================================================================= */
 router.get("/classes", protect, getClasses);
 router.get("/subjects", protect, getSubjects);
-router.get("/teachers", protect, authorize("admin"), getTeachers);
+router.get("/teachers", protect, requirePage("E-Assessments"), getTeachers);
 
 /* =========================================================================
    ADMIN — ASSESSMENT MANAGEMENT
 ========================================================================= */
-router.post("/admin/assign-teacher", protect, authorize("admin"), assignTeacher);
-router.get("/admin/assigned-teachers", protect, authorize("admin"), getAssignedTeachers);
-router.get("/admin/pending", protect, authorize("admin"), getPendingAssessments);
-router.put("/admin/:id/review", protect, authorize("admin"), reviewAssessment);
-router.put("/admin/:id/toggle-active", protect, authorize("admin"), toggleEAssessmentActive);
-router.get("/admin/:id/quick-stats", protect, authorize("admin"), getEAssessmentQuickStats);
-router.delete("/admin/delete-assessments", protect, authorize("admin"), deleteAssessments);
-router.delete("/admin/delete-assignments", protect, authorize("admin"), deleteAssignments);
+router.post("/admin/assign-teacher", protect, requirePage("E-Assessments"), assignTeacher);
+router.get("/admin/assigned-teachers", protect, requirePage("E-Assessments"), getAssignedTeachers);
+router.get("/admin/pending", protect, requirePage("E-Assessments"), getPendingAssessments);
+router.put("/admin/:id/review", protect, requirePage("E-Assessments"), reviewAssessment);
+router.put("/admin/:id/toggle-active", protect, requirePage("E-Assessments"), toggleEAssessmentActive);
+router.get("/admin/:id/quick-stats", protect, requirePage("E-Assessments"), getEAssessmentQuickStats);
+router.delete("/admin/delete-assessments", protect, requirePage("E-Assessments"), deleteAssessments);
+router.delete("/admin/delete-assignments", protect, requirePage("E-Assessments"), deleteAssignments);
 
 /* =========================================================================
    ADMIN — SUBMISSIONS / ASSIGNMENT
 ========================================================================= */
-router.get("/submissions", protect, authorize("admin"), getAllSubmissions);
-router.post("/admin/assign-submission", protect, authorize("admin"), assignSubmission);
-router.post("/admin/bulk-assign-submissions", protect, authorize("admin"), bulkAssignSubmissions);
+router.get("/submissions", protect, requirePage("E-Assessments"), getAllSubmissions);
+router.post("/admin/assign-submission", protect, requirePage("E-Assessments"), assignSubmission);
+router.post("/admin/bulk-assign-submissions", protect, requirePage("E-Assessments"), bulkAssignSubmissions);
 
 /* =========================================================================
    ADMIN — REMARK REQUESTS
 ========================================================================= */
-router.get("/admin/remark-requests", protect, authorize("admin"), getRemarkRequests);
-router.put("/admin/remark-requests/:id/review", protect, authorize("admin"), reviewRemarkRequest);
+router.get("/admin/remark-requests", protect, requirePage("E-Assessments"), getRemarkRequests);
+router.put("/admin/remark-requests/:id/review", protect, requirePage("E-Assessments"), reviewRemarkRequest);
 
 /* =========================================================================
    ADMIN — RELEASE MARKS
 ========================================================================= */
-router.get("/admin/released-marks", protect, authorize("admin"), getReleasedMarks);
-router.put("/admin/release-marks", protect, authorize("admin"), releaseMarks);
-router.put("/admin/bulk-release-marks", protect, authorize("admin"), bulkReleaseMarks);
+router.get("/admin/released-marks", protect, requirePage("E-Assessments"), getReleasedMarks);
+router.put("/admin/release-marks", protect, requirePage("E-Assessments"), releaseMarks);
+router.put("/admin/bulk-release-marks", protect, requirePage("E-Assessments"), bulkReleaseMarks);
 
 /* =========================================================================
    ADMIN — EXAM SESSION / DEVICE-LOCK MANAGEMENT
 ========================================================================= */
-router.get("/admin/exam-sessions", protect, authorize("admin"), getExamSessions);
-router.put("/admin/exam-sessions/:id/unlock", protect, authorize("admin"), unlockExamSession);
+router.get("/admin/exam-sessions", protect, requirePage("E-Assessments"), getExamSessions);
+router.put("/admin/exam-sessions/:id/unlock", protect, requirePage("E-Assessments"), unlockExamSession);
 
 /* =========================================================================
    STUDENT

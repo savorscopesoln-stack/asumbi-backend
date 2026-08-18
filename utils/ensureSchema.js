@@ -77,7 +77,45 @@ async function ensureSchema(pool, sql) {
       ALTER TABLE leave_outs ADD leave_type NVARCHAR(20) NOT NULL CONSTRAINT DF_leave_outs_leave_type DEFAULT 'short_stay'
     `);
 
-    console.log("✅ Schema check complete (Notifications, leave_outs.leave_type)");
+    /* ---------------- mustChangePassword (Users / Students / Teachers) ----------------
+       Drives the "must change password on next login" flow: set to 1 whenever an
+       admin creates an account or resets a password to the default, cleared back
+       to 0 the moment that account successfully changes its own password. */
+    for (const table of ["Users", "Students", "Teachers"]) {
+      await pool.request().query(`
+        IF EXISTS (SELECT * FROM sysobjects WHERE name='${table}' AND xtype='U')
+        AND NOT EXISTS (
+          SELECT * FROM sys.columns
+          WHERE Name = N'mustChangePassword' AND Object_ID = Object_ID(N'${table}')
+        )
+        ALTER TABLE ${table} ADD mustChangePassword BIT NOT NULL CONSTRAINT DF_${table}_mustChangePassword DEFAULT 0
+      `);
+    }
+
+    /* ---------------- Users.permissions (sub-admin page access) ----------------
+       Stores a JSON array of page keys (see backend/utils/pages.js) that a
+       "sub_admin" account is allowed to open. NULL/empty for a plain "admin"
+       account, which always has full access regardless of this column. */
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='Users' AND xtype='U')
+      AND NOT EXISTS (
+        SELECT * FROM sys.columns
+        WHERE Name = N'permissions' AND Object_ID = Object_ID(N'Users')
+      )
+      ALTER TABLE Users ADD permissions NVARCHAR(MAX) NULL
+    `);
+
+    /* ---------------- Retire the old "staff" role ----------------
+       The system used to have a flat "staff" role with no configurable
+       access. Any existing accounts of that role become "sub_admin"
+       with no pages granted yet — an admin should open Users/Registration
+       and assign the pages that account needs. */
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='Users' AND xtype='U')
+      UPDATE Users SET role = 'sub_admin' WHERE LOWER(role) = 'staff'
+    `);
+
+    console.log("✅ Schema check complete (Notifications, leave_outs.leave_type, mustChangePassword, Users.permissions, staff→sub_admin migration)");
   } catch (err) {
     console.error("⚠️  Schema ensure failed:", err.message);
   }

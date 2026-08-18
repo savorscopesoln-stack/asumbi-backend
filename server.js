@@ -8,7 +8,7 @@ const XLSX = require("xlsx");
 const bcrypt = require("bcrypt");
 
 const { poolPromise, sql } = require("./config/db");
-const { protect, authorize, adminOnly } = require("./middleware/authMiddleware");
+const { protect, authorize, adminOnly, requirePage } = require("./middleware/authMiddleware");
 const { ensureSchema } = require("./utils/ensureSchema");
 
 // Idempotent startup check — creates/upgrades the Notifications table
@@ -273,9 +273,9 @@ app.get("/api/records", protect, adminOnly, async (req, res) => {
     // Never return password hashes to the client — Students/Teachers/Users
     // all store a `password` column, so SELECT * is not safe here.
     const RECORD_COLUMNS = {
-      Users: "id, username, email, role",
-      Students: "id, name, admissionNo, studentClass, gender, status, yearOfStudy, username, role, Phone, assessmentNumber",
-      Teachers: "id, name, staffId, subject, phone, email, username, role",
+      Users: "id, username, email, role, mustChangePassword",
+      Students: "id, name, admissionNo, studentClass, gender, status, yearOfStudy, username, role, Phone, assessmentNumber, mustChangePassword",
+      Teachers: "id, name, staffId, subject, phone, email, username, role, mustChangePassword",
     };
     const columns = RECORD_COLUMNS[table] || "*";
 
@@ -496,9 +496,9 @@ app.post("/api/upload", protect, adminOnly, upload.single("file"), async (req, r
           .input("Phone", sql.NVarChar, (row.phone || "").toString().trim())
           .query(`
             INSERT INTO Students
-            (name, admissionNo, studentClass, gender, status, yearOfStudy, username, password, role, Phone)
+            (name, admissionNo, studentClass, gender, status, yearOfStudy, username, password, role, Phone, mustChangePassword)
             VALUES
-            (@name, @admissionNo, @studentClass, @gender, @status, @yearOfStudy, @username, @password, @role, @Phone)
+            (@name, @admissionNo, @studentClass, @gender, @status, @yearOfStudy, @username, @password, @role, @Phone, 1)
           `);
       }
     }
@@ -527,8 +527,8 @@ app.post("/api/upload", protect, adminOnly, upload.single("file"), async (req, r
           .input("password", sql.NVarChar, password)
           .input("role", sql.NVarChar, "teacher")
           .query(`
-            INSERT INTO Teachers (name, staffId, subject, phone, email, username, password, role)
-            VALUES (@name, @staffId, @subject, @phone, @email, @username, @password, @role)
+            INSERT INTO Teachers (name, staffId, subject, phone, email, username, password, role, mustChangePassword)
+            VALUES (@name, @staffId, @subject, @phone, @email, @username, @password, @role, 1)
           `);
       }
     }
@@ -543,8 +543,8 @@ app.post("/api/upload", protect, adminOnly, upload.single("file"), async (req, r
           .input("email", sql.NVarChar, row.email || "")
           .input("password", sql.NVarChar, hashedPassword)
           .query(`
-            INSERT INTO Users (username, role, email, password)
-            VALUES (@username, @role, @email, @password)
+            INSERT INTO Users (username, role, email, password, mustChangePassword)
+            VALUES (@username, @role, @email, @password, 1)
           `);
       }
     }
@@ -895,13 +895,25 @@ app.get("/api/teachers", protect, async (req, res) => {
   }
 });
 
-app.get("/api/users", protect, adminOnly, async (req, res) => {
+app.get("/api/users", protect, requirePage("Users"), async (req, res) => {
   try {
     const pool = req.pool;
     const result = await pool.request().query(`
-      SELECT id, username, email, role FROM Users
+      SELECT id, username, email, role, permissions FROM Users
     `);
-    res.json(result.recordset || []);
+
+    const rows = (result.recordset || []).map((row) => {
+      let permissions = [];
+      try {
+        permissions = JSON.parse(row.permissions || "[]");
+        if (!Array.isArray(permissions)) permissions = [];
+      } catch {
+        permissions = [];
+      }
+      return { ...row, permissions };
+    });
+
+    res.json(rows);
   } catch (err) {
     console.log("USERS ERROR:", err);
     res.status(500).json([]);

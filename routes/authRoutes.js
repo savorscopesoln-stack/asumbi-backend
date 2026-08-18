@@ -94,7 +94,7 @@ if (!user) {
       const dbRole = (user.role || "").toLowerCase();
 
       if (dbRole === "admin") role = "admin";
-      else if (dbRole === "staff") role = "staff";
+      else if (dbRole === "sub_admin") role = "sub_admin";
     }
 
     /* ================= TOKEN ================= */
