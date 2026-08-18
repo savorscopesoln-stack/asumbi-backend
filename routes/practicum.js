@@ -397,32 +397,25 @@ router.post("/auto-assign/:sessionId", async (req, res) => {
       });
     });
 
-    for (const row of rows) {
-      const assignment = await pool.request()
-        .input("sessionId", row.sessionId)
-        .input("teacherId", row.teacherId)
-        .input("studentId", row.studentId)
-        .input("schoolId", row.schoolId)
-        .input("regionId", row.regionId)
-        .input("day", row.day)
-        .query(`
-          INSERT INTO PracticumAssignments (sessionId, teacherId, studentId, schoolId, regionId, day)
-          OUTPUT INSERTED.id
-          VALUES (@sessionId, @teacherId, @studentId, @schoolId, @regionId, @day)
-        `);
-
-      const assignmentId = assignment.recordset[0].id;
-
-      for (let n = 1; n <= 6; n++) {
-        await pool.request()
-          .input("assignmentId", assignmentId)
-          .input("n", n)
-          .query(`
-            INSERT INTO PracticumAssessments (assignmentId, assessmentNumber)
-            VALUES (@assignmentId, @n)
-          `);
-      }
-    }
+    await Promise.all(
+  rows.map((row) =>
+    pool.request()
+      .input("sessionId", row.sessionId)
+      .input("teacherId", row.teacherId)
+      .input("studentId", row.studentId)
+      .input("schoolId", row.schoolId)
+      .input("regionId", row.regionId)
+      .input("day", row.day)
+      .query(`
+        INSERT INTO PracticumAssignments (sessionId, teacherId, studentId, schoolId, regionId, day)
+        VALUES (@sessionId, @teacherId, @studentId, @schoolId, @regionId, @day);
+        DECLARE @newAssignmentId INT = SCOPE_IDENTITY();
+        INSERT INTO PracticumAssessments (assignmentId, assessmentNumber)
+        VALUES (@newAssignmentId,1),(@newAssignmentId,2),(@newAssignmentId,3),
+               (@newAssignmentId,4),(@newAssignmentId,5),(@newAssignmentId,6);
+      `)
+  )
+);
 
     res.json({
       message: "assigned",
@@ -511,7 +504,106 @@ router.delete("/assign/session/:sessionId", async (req, res) => {
     res.status(500).json({ error: "Failed to reset assignments" });
   }
 });
+router.post("/deploy", async (req, res) => {
+  const pool = req.pool;
+  const { sessionId, regionId, isExtra, day, teacherIds } = req.body;
 
+  try {
+    if (!sessionId || !regionId || !Array.isArray(teacherIds) || !teacherIds.length) {
+      return res.status(400).json({ error: "sessionId, regionId and at least one teacherId are required" });
+    }
+    if (isExtra && !day) {
+      return res.status(400).json({ error: "A day is required for an extra deployment" });
+    }
+
+    const teachersRes = await pool.request()
+      .input("regionId", regionId)
+      .query(`SELECT * FROM Teachers WHERE regionId = @regionId`);
+    const teacherIdSet = new Set(teacherIds.map(String));
+    const teachers = teachersRes.recordset.filter((t) => teacherIdSet.has(String(t.id)));
+    if (!teachers.length) {
+      return res.status(400).json({ error: "None of the selected teachers were found in this region" });
+    }
+
+    const studentsRes = await pool.request()
+      .input("regionId", regionId)
+      .query(`
+        SELECT s.id, s.schoolId
+        FROM Students s
+        JOIN Schools sc ON sc.id = s.schoolId
+        WHERE sc.regionId = @regionId
+        ORDER BY sc.name, s.name
+      `);
+    const students = studentsRes.recordset;
+    if (!students.length) {
+      return res.status(400).json({ error: "No students found in this region's schools" });
+    }
+
+    // Overwrite: clear any existing assignments for these students in this session
+    const studentIds = students.map((s) => Number(s.id)).filter(Number.isInteger);
+    await pool.request()
+      .input("sessionId", sessionId)
+      .query(`
+        DELETE FROM PracticumAssignments
+        WHERE sessionId = @sessionId
+        AND studentId IN (${studentIds.join(",")})
+      `);
+
+    // Bucket into groups of MAX_PER_TEACHER, same school first
+    const groups = [];
+    let bucket = [];
+    for (const student of students) {
+      bucket.push(student);
+      if (bucket.length === MAX_PER_TEACHER) {
+        groups.push(bucket);
+        bucket = [];
+      }
+    }
+    if (bucket.length) groups.push(bucket);
+
+    // Round-robin groups across the deployed teachers; each teacher's day is
+    // their own research day, or the shared extra day if this is an extra deployment
+    const rows = [];
+    groups.forEach((group, i) => {
+      const teacher = teachers[i % teachers.length];
+      const teacherDay = isExtra ? day : teacher.researchDay || day || "Unscheduled";
+      group.forEach((student) => {
+        rows.push({
+          sessionId, teacherId: teacher.id, studentId: student.id,
+          schoolId: student.schoolId, regionId, day: teacherDay,
+        });
+      });
+    });
+
+    // One round trip per student (assignment + its 6 assessments together),
+    // fired in parallel instead of sequentially — this is what was making
+    // auto-assign/deploy feel slow.
+    await Promise.all(
+      rows.map((row) =>
+        pool.request()
+          .input("sessionId", row.sessionId)
+          .input("teacherId", row.teacherId)
+          .input("studentId", row.studentId)
+          .input("schoolId", row.schoolId)
+          .input("regionId", row.regionId)
+          .input("day", row.day)
+          .query(`
+            INSERT INTO PracticumAssignments (sessionId, teacherId, studentId, schoolId, regionId, day)
+            VALUES (@sessionId, @teacherId, @studentId, @schoolId, @regionId, @day);
+            DECLARE @newAssignmentId INT = SCOPE_IDENTITY();
+            INSERT INTO PracticumAssessments (assignmentId, assessmentNumber)
+            VALUES (@newAssignmentId,1),(@newAssignmentId,2),(@newAssignmentId,3),
+                   (@newAssignmentId,4),(@newAssignmentId,5),(@newAssignmentId,6);
+          `)
+      )
+    );
+
+    res.json({ message: "deployed", studentsDeployed: rows.length, teachersUsed: teachers.length, groups: groups.length });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Deployment failed" });
+  }
+});
 /* ============================================================================
    ASSESSMENTS (1-6 per assignment)
 ============================================================================ */
