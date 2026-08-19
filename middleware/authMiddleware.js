@@ -70,6 +70,18 @@ const protect = (req, res, next) => {
       exp: decoded?.exp || null,
 
       mustChangePassword: !!decoded?.mustChangePassword,
+
+      /*
+        EXAM-ONLY SESSION SCOPING
+        These two claims come from /e-assessments/exam-login and scope
+        the token to exactly one assessment. Without forwarding them
+        here, every check in eAssessment.controller.js that reads
+        req.user.examOnly / req.user.examAssessmentId always saw
+        `undefined`, so a student could never actually start an exam
+        even after a correct exam-password login.
+      */
+      examOnly: !!decoded?.examOnly,
+      examAssessmentId: decoded?.examAssessmentId ?? null,
     };
 
     /* =====================================================
