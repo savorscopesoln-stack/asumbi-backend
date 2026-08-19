@@ -114,11 +114,37 @@ const redactForRole = (row, role) => {
 const getEAssessments = async (req, res) => {
   try {
     const pool = req.pool;
-    const result = await pool.request().query(`
-      SELECT ea.*, t.name AS teacher_name, c.name AS class_name
+
+    // A teacher must see: (a) assessments THEY created/own
+    // (e_assessments.teacher_id, set from req.user.id in createEAssessment),
+    // AND (b) assessments they didn't create but where an admin (or another
+    // teacher) has assigned them one or more submissions to mark, via
+    // e_assessment_submission_assignments. Without part (b), a teacher who
+    // only grades — never authors — an assessment had no way to ever see it
+    // in their list, even though submissions were sitting in their queue.
+    // Admin and sub_admin still see everything (needed for review/approval),
+    // and students see everything for their class (redactForRole strips the
+    // exam password for them).
+    const isTeacher = req.user?.role === "teacher";
+
+    const request = pool.request();
+    if (isTeacher) request.input("teacherId", sql.Int, toInt(req.user.id));
+
+    const result = await request.query(`
+      SELECT ea.*, t.name AS teacher_name, c.name AS class_name,
+        ${isTeacher ? "CASE WHEN ea.teacher_id = @teacherId THEN 0 ELSE 1 END" : "0"} AS assigned_only
       FROM e_assessments ea
       LEFT JOIN Teachers t ON ea.teacher_id = t.id
       LEFT JOIN Classes c ON ea.class_id = c.id
+      ${isTeacher ? `
+      WHERE ea.teacher_id = @teacherId
+         OR EXISTS (
+              SELECT 1
+              FROM e_assessment_submissions s
+              INNER JOIN e_assessment_submission_assignments aa
+                ON aa.submission_id = s.id AND aa.teacher_id = @teacherId
+              WHERE s.e_assessment_id = ea.id
+            )` : ""}
       ORDER BY ea.id DESC
     `);
     const rows = (result.recordset || []).map((r) => redactForRole(r, req.user?.role));
@@ -1112,7 +1138,17 @@ const getAssessmentSubmissions = async (req, res) => {
   try {
     const pool = req.pool;
     const assessmentId = toInt(req.params.assessmentId);
-    const result = await pool.request().input("assessmentId", sql.Int, assessmentId).query(`
+
+    // Only show a teacher the submissions that were actually distributed
+    // to THEM (e_assessment_submission_assignments.teacher_id). Without
+    // this join/filter, every teacher saw every submission for the
+    // assessment regardless of who admin assigned it to.
+    const isTeacher = req.user?.role === "teacher";
+
+    const request = pool.request().input("assessmentId", sql.Int, assessmentId);
+    if (isTeacher) request.input("teacherId", sql.Int, toInt(req.user.id));
+
+    const result = await request.query(`
       SELECT
         s.id,
         s.e_assessment_id,
@@ -1129,6 +1165,7 @@ const getAssessmentSubmissions = async (req, res) => {
       FROM e_assessment_submissions s
       LEFT JOIN e_assessments a ON a.id = s.e_assessment_id
       LEFT JOIN Students st ON st.id = s.student_id
+      ${isTeacher ? "INNER JOIN e_assessment_submission_assignments aa ON aa.submission_id = s.id AND aa.teacher_id = @teacherId" : ""}
       WHERE s.e_assessment_id = @assessmentId
       ORDER BY s.id DESC
     `);
@@ -1143,6 +1180,19 @@ const getSubmissionForMarking = async (req, res) => {
   try {
     const pool = req.pool;
     const submissionId = toInt(req.params.id);
+
+    // Direct-by-ID lookup, so it needs its own ownership check: a teacher
+    // must not be able to open a submission just by guessing/typing its
+    // id if it wasn't distributed to them.
+    if (req.user?.role === "teacher") {
+      const owns = await pool.request()
+        .input("id", sql.Int, submissionId)
+        .input("teacherId", sql.Int, toInt(req.user.id))
+        .query(`SELECT id FROM e_assessment_submission_assignments WHERE submission_id = @id AND teacher_id = @teacherId`);
+      if (!owns.recordset.length) {
+        return res.status(403).json({ message: "This submission was not assigned to you." });
+      }
+    }
 
     const submission = await pool.request().input("id", sql.Int, submissionId)
       .query(`SELECT * FROM e_assessment_submissions WHERE id = @id`);
@@ -1169,8 +1219,20 @@ const getAllSubmissionsForMarking = async (req, res) => {
     const e_assessmentId = toInt(req.params.id);
     if (!e_assessmentId) return res.status(400).json({ success: false, message: "Invalid e_assessment ID" });
 
-    const submissionsResult = await pool.request().input("e_assessmentId", sql.Int, e_assessmentId)
-      .query(`SELECT * FROM e_assessment_submissions WHERE e_assessment_id = @e_assessmentId`);
+    // Same fix as getAssessmentSubmissions: a teacher can only mark the
+    // submissions that were distributed to them, not every submission for
+    // the assessment. Admin/sub_admin (who don't hit this teacher-only
+    // route in practice) fall back to the unfiltered query.
+    const isTeacher = req.user?.role === "teacher";
+    const request = pool.request().input("e_assessmentId", sql.Int, e_assessmentId);
+    if (isTeacher) request.input("teacherId", sql.Int, toInt(req.user.id));
+
+    const submissionsResult = await request.query(`
+      SELECT s.*
+      FROM e_assessment_submissions s
+      ${isTeacher ? "INNER JOIN e_assessment_submission_assignments aa ON aa.submission_id = s.id AND aa.teacher_id = @teacherId" : ""}
+      WHERE s.e_assessment_id = @e_assessmentId
+    `);
     const submissions = submissionsResult.recordset;
     if (!submissions.length) return res.status(200).json([]);
 
@@ -1323,8 +1385,20 @@ const bulkAssignSubmissions = async (req, res) => {
 const getNextSubmissionForMarking = async (req, res) => {
   try {
     const pool = req.pool;
-    const result = await pool.request().query(`
-      SELECT TOP 1 * FROM e_assessment_submissions WHERE status = 'submitted' ORDER BY NEWID()
+
+    // Same distribution rule: a teacher can only be handed a submission
+    // that was actually assigned to them, never one assigned to (or
+    // unassigned and belonging to) another teacher.
+    const isTeacher = req.user?.role === "teacher";
+    const request = pool.request();
+    if (isTeacher) request.input("teacherId", sql.Int, toInt(req.user.id));
+
+    const result = await request.query(`
+      SELECT TOP 1 s.*
+      FROM e_assessment_submissions s
+      ${isTeacher ? "INNER JOIN e_assessment_submission_assignments aa ON aa.submission_id = s.id AND aa.teacher_id = @teacherId" : ""}
+      WHERE s.status = 'submitted'
+      ORDER BY NEWID()
     `);
     res.json(result.recordset[0] || null);
   } catch (err) {
