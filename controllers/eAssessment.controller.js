@@ -134,11 +134,18 @@ const getEAssessmentById = async (req, res) => {
     const pool = req.pool;
     const assessmentId = toInt(req.params.id);
 
-    // An exam-only token (issued by /e-assessments/exam-login, no full
-    // portal login) may only ever fetch the one assessment it was
-    // scoped to — never anyone else's questions.
-    if (req.user?.examOnly && req.user.examAssessmentId !== assessmentId) {
-      return res.status(403).json({ message: "This exam session isn't valid for this assessment" });
+    // A student may only ever fetch an assessment's content through the
+    // exam-only session created by /e-assessments/exam-login (username +
+    // this assessment's admin-set exam password) — and only for the exact
+    // assessment that token was scoped to. A regular, otherwise-valid
+    // student-portal login session is deliberately NOT enough on its own;
+    // this is what stops a student who is simply logged into the portal
+    // from opening someone else's — or even their own — exam without the
+    // exam password.
+    if (req.user?.role === "student") {
+      if (!req.user.examOnly || req.user.examAssessmentId !== assessmentId) {
+        return res.status(403).json({ message: "You must sign in with your username and this assessment's exam password to view it." });
+      }
     }
 
     const assessmentResult = await pool.request()
@@ -486,8 +493,13 @@ const startExamSession = async (req, res) => {
       return res.status(400).json({ message: "Missing assessment or student" });
     }
 
-    if (req.user?.examOnly && req.user.examAssessmentId !== e_assessment_id) {
-      return res.status(403).json({ message: "This exam session isn't valid for this assessment" });
+    // Starting an exam session — the very first step of taking an exam —
+    // requires the exam-only token issued by /e-assessments/exam-login for
+    // this exact assessment. A general student-portal login is never
+    // sufficient by itself: without the admin-set exam password for THIS
+    // assessment, a portal session cannot start (or resume) it.
+    if (!req.user?.examOnly || req.user.examAssessmentId !== e_assessment_id) {
+      return res.status(403).json({ message: "You must sign in with your username and this assessment's exam password to start it." });
     }
 
     const existing = await pool.request()
