@@ -1,5 +1,6 @@
 const sql = require("mssql");
 const crypto = require("crypto");
+const jwt = require("jsonwebtoken");
 
 /* =========================================================================
    HELPERS
@@ -25,7 +26,7 @@ const generateToken = () => {
 const createEAssessment = async (req, res) => {
   try {
     const pool = req.pool;
-    const { title, subject, class_id, duration_minutes, instructions, total_marks } = req.body;
+    const { title, subject, class_id, duration_minutes, instructions, total_marks, exam_password } = req.body;
     const teacher_id = req.user?.id || null;
 
     if (!title || !subject || !class_id) {
@@ -40,12 +41,13 @@ const createEAssessment = async (req, res) => {
       .input("duration_minutes", sql.Int, duration_minutes || 30)
       .input("total_marks", sql.Int, total_marks || 100)
       .input("instructions", sql.NVarChar, instructions || "")
+      .input("exam_password", sql.NVarChar, (exam_password || "").trim() || null)
       .query(`
         INSERT INTO e_assessments
-          (title, subject, class_id, teacher_id, duration_minutes, total_marks, instructions, status)
+          (title, subject, class_id, teacher_id, duration_minutes, total_marks, instructions, status, exam_password)
         OUTPUT INSERTED.id
         VALUES
-          (@title, @subject, @class_id, @teacher_id, @duration_minutes, @total_marks, @instructions, 'pending')
+          (@title, @subject, @class_id, @teacher_id, @duration_minutes, @total_marks, @instructions, 'pending', @exam_password)
       `);
 
     res.status(201).json({ success: true, assessment_id: result.recordset[0].id });
@@ -58,7 +60,7 @@ const updateEAssessment = async (req, res) => {
   try {
     const pool = req.pool;
     const id = toInt(req.params.id);
-    const { title, subject, class_id, duration_minutes, instructions, total_marks } = req.body;
+    const { title, subject, class_id, duration_minutes, instructions, total_marks, exam_password } = req.body;
 
     if (!id) return res.status(400).json({ message: "Invalid assessment ID" });
     if (!title || !subject || !class_id) {
@@ -79,6 +81,7 @@ const updateEAssessment = async (req, res) => {
       .input("duration_minutes", sql.Int, duration_minutes || 30)
       .input("total_marks", sql.Int, total_marks || 100)
       .input("instructions", sql.NVarChar, instructions || "")
+      .input("exam_password", sql.NVarChar, (exam_password || "").trim() || null)
       .query(`
         UPDATE e_assessments
         SET title = @title,
@@ -86,7 +89,8 @@ const updateEAssessment = async (req, res) => {
             class_id = @class_id,
             duration_minutes = @duration_minutes,
             total_marks = @total_marks,
-            instructions = @instructions
+            instructions = @instructions,
+            exam_password = @exam_password
         WHERE id = @id
       `);
 
@@ -95,6 +99,16 @@ const updateEAssessment = async (req, res) => {
     console.error("UPDATE E-ASSESSMENT ERROR:", err);
     res.status(500).json({ message: "Update failed", error: err.message });
   }
+};
+
+// Students (including exam-only sessions) never receive exam_password or
+// correct_answer in a payload — only admin/teacher accounts managing the
+// assessment need to see either of those.
+const STAFF_ROLES = ["admin", "sub_admin", "teacher"];
+const redactForRole = (row, role) => {
+  if (STAFF_ROLES.includes(role)) return row;
+  const { exam_password, ...rest } = row;
+  return rest;
 };
 
 const getEAssessments = async (req, res) => {
@@ -107,7 +121,8 @@ const getEAssessments = async (req, res) => {
       LEFT JOIN Classes c ON ea.class_id = c.id
       ORDER BY ea.id DESC
     `);
-    res.json(result.recordset || []);
+    const rows = (result.recordset || []).map((r) => redactForRole(r, req.user?.role));
+    res.json(rows);
   } catch (err) {
     console.error("GET ASSESSMENTS ERROR:", err);
     res.status(500).json([]);
@@ -118,6 +133,13 @@ const getEAssessmentById = async (req, res) => {
   try {
     const pool = req.pool;
     const assessmentId = toInt(req.params.id);
+
+    // An exam-only token (issued by /e-assessments/exam-login, no full
+    // portal login) may only ever fetch the one assessment it was
+    // scoped to — never anyone else's questions.
+    if (req.user?.examOnly && req.user.examAssessmentId !== assessmentId) {
+      return res.status(403).json({ message: "This exam session isn't valid for this assessment" });
+    }
 
     const assessmentResult = await pool.request()
       .input("id", sql.Int, assessmentId)
@@ -132,7 +154,7 @@ const getEAssessmentById = async (req, res) => {
     if (!assessmentResult.recordset.length) {
       return res.status(404).json({ message: "Assessment not found" });
     }
-    const assessment = assessmentResult.recordset[0];
+    const assessment = redactForRole(assessmentResult.recordset[0], req.user?.role);
 
     const questionResult = await pool.request()
       .input("id", sql.Int, assessmentId)
@@ -145,6 +167,10 @@ const getEAssessmentById = async (req, res) => {
         ORDER BY q.id, o.option_label
       `);
 
+    // Students taking the exam must never receive the answer key —
+    // only admin/teacher (building/marking the assessment) get it.
+    const includeAnswers = STAFF_ROLES.includes(req.user?.role);
+
     const map = {};
     questionResult.recordset.forEach((row) => {
       if (!map[row.question_id]) {
@@ -152,7 +178,7 @@ const getEAssessmentById = async (req, res) => {
           id: row.question_id,
           question_text: row.question_text,
           marks: row.marks,
-          correct_answer: row.correct_answer,
+          ...(includeAnswers ? { correct_answer: row.correct_answer } : {}),
           question_type: row.question_type || "mcq",
           options: [],
         };
@@ -168,6 +194,117 @@ const getEAssessmentById = async (req, res) => {
     res.status(500).json({ message: "Server Error" });
   }
 };
+
+/* =========================================================================
+   STANDALONE EXAM LOGIN (no portal account session required)
+   ─────────────────────────────────────────────────────────
+   Body: { assessmentId, username, examPassword }
+
+   Lets a student reach /take-assessment/:id directly (e.g. from a link
+   shared by their teacher) using just their username + the exam
+   password set on this specific assessment — no prior /login needed.
+
+   Deliberately never responds with HTTP 401/403: the frontend's global
+   axios interceptor treats any 401/403 as "session invalid" and wipes
+   localStorage + redirects to /login, which would yank a student who
+   was never logged in in the first place off of this page. Bad
+   credentials here are reported as normal 400-level JSON instead.
+
+   The issued token is a normal student JWT (so all the existing
+   protect/authorize("student") routes work unchanged) plus two extra
+   claims — examOnly + examAssessmentId — that scope it to this one
+   assessment. See redactForRole/getEAssessmentById and the exam-only
+   checks in startExamSession/submitEAssessment/getStudentResult below.
+========================================================================= */
+
+const examLogin = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const assessmentId = toInt(req.body.assessmentId);
+    const username = (req.body.username || "").trim();
+    const examPassword = (req.body.examPassword || "").trim();
+
+    if (!assessmentId || !username || !examPassword) {
+      return res.status(400).json({ success: false, message: "Assessment, username and exam password are all required" });
+    }
+
+    const aRes = await pool.request()
+      .input("id", sql.Int, assessmentId)
+      .query(`SELECT id, title, subject, duration_minutes, class_id, status, active_status, exam_password FROM e_assessments WHERE id = @id`);
+
+    if (!aRes.recordset.length) {
+      return res.status(404).json({ success: false, message: "Assessment not found" });
+    }
+    const assessment = aRes.recordset[0];
+
+    if (!assessment.exam_password) {
+      return res.status(400).json({ success: false, message: "This assessment has no exam password configured. Ask your teacher to set one, or log in to the student portal normally." });
+    }
+    if (assessment.exam_password !== examPassword) {
+      return res.status(400).json({ success: false, message: "Incorrect exam password" });
+    }
+    if (assessment.status && assessment.status !== "approved") {
+      return res.status(400).json({ success: false, message: "This assessment isn't open yet — check with your teacher." });
+    }
+    if (assessment.active_status && assessment.active_status !== "Active") {
+      return res.status(400).json({ success: false, message: "This assessment isn't active right now." });
+    }
+
+    const sRes = await pool.request()
+      .input("username", sql.NVarChar, username)
+      .query(`SELECT id, username, name FROM Students WHERE username = @username`);
+
+    if (!sRes.recordset.length) {
+      return res.status(400).json({ success: false, message: "No student account found with that username" });
+    }
+    const student = sRes.recordset[0];
+
+    // Short-lived on purpose: just long enough to sit the exam, not a
+    // standing session. duration_minutes + 20 min buffer, clamped.
+    const minutes = Math.min(Math.max((assessment.duration_minutes || 30) + 20, 30), 240);
+
+    const token = jwt.sign(
+      {
+        id: student.id,
+        username: student.username,
+        role: "student",
+        permissions: [],
+        source: "Students",
+        mustChangePassword: false,
+        examOnly: true,
+        examAssessmentId: assessment.id,
+      },
+      process.env.JWT_SECRET || "asumbi_secret",
+      { expiresIn: `${minutes}m` }
+    );
+
+    return res.json({
+      success: true,
+      token,
+      user: {
+        id: student.id,
+        username: student.username,
+        name: student.name || "",
+        role: "student",
+        permissions: [],
+        source: "Students",
+        mustChangePassword: false,
+        examOnly: true,
+        examAssessmentId: assessment.id,
+      },
+      assessment: {
+        id: assessment.id,
+        title: assessment.title,
+        subject: assessment.subject,
+        duration_minutes: assessment.duration_minutes,
+      },
+    });
+  } catch (err) {
+    console.error("EXAM LOGIN ERROR:", err);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+};
+
 
 /* =========================================================================
    QUESTIONS
@@ -347,6 +484,10 @@ const startExamSession = async (req, res) => {
     const student_id = req.user?.id;
     if (!e_assessment_id || !student_id) {
       return res.status(400).json({ message: "Missing assessment or student" });
+    }
+
+    if (req.user?.examOnly && req.user.examAssessmentId !== e_assessment_id) {
+      return res.status(403).json({ message: "This exam session isn't valid for this assessment" });
     }
 
     const existing = await pool.request()
@@ -575,6 +716,10 @@ const submitEAssessment = async (req, res) => {
     }
     if (!student_id) return res.status(401).json({ success: false, message: "Unauthorized" });
 
+    if (req.user?.examOnly && req.user.examAssessmentId !== toInt(assessment_id)) {
+      return res.status(403).json({ success: false, message: "This exam session isn't valid for this assessment" });
+    }
+
     // Validate the exam session token/device before accepting the submission
     if (token) {
       const sessionCheck = await pool.request()
@@ -684,6 +829,10 @@ const getStudentResult = async (req, res) => {
     const pool = req.pool;
     const assessmentId = toInt(req.params.assessmentId);
     const studentId = req.user?.id;
+
+    if (req.user?.examOnly && req.user.examAssessmentId !== assessmentId) {
+      return res.status(403).json({ message: "This exam session isn't valid for this assessment" });
+    }
 
     const result = await pool.request()
       .input("assessmentId", sql.Int, assessmentId)
@@ -1381,6 +1530,9 @@ module.exports = {
   // core
   createEAssessment, updateEAssessment, getEAssessments, getEAssessmentById,
   addEAssessmentQuestion, getAssessmentQuestions, updateQuestion, deleteQuestion,
+
+  // standalone exam-password login (no portal account session)
+  examLogin,
 
   // exam session / device lock
   startExamSession, activateExamSession, heartbeatExamSession, endExamSession,

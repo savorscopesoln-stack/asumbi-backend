@@ -6,6 +6,9 @@ const {
   createEAssessment, updateEAssessment, getEAssessments, getEAssessmentById,
   addEAssessmentQuestion, getAssessmentQuestions, updateQuestion, deleteQuestion,
 
+  // standalone exam-password login (no portal account session)
+  examLogin,
+
   // exam session / device lock
   startExamSession, activateExamSession, heartbeatExamSession, endExamSession,
   getExamSessions, unlockExamSession,
@@ -39,6 +42,15 @@ const { protect, authorize, requirePage } = require("../middleware/authMiddlewar
 router.get("/health", (req, res) => {
   res.json({ success: true, message: "E-Assessment API Running", timestamp: new Date() });
 });
+
+/* =========================================================================
+   STANDALONE EXAM LOGIN — deliberately NOT behind `protect`.
+   Lets a student reach /take-assessment/:id without ever going through
+   the normal student-portal login, using their username + the exam
+   password set on this specific assessment (see AdminEAssessments →
+   Create/Edit Assessment → "Exam Password").
+========================================================================= */
+router.post("/exam-login", examLogin);
 
 /* =========================================================================
    SUPPORT DATA

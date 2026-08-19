@@ -7,6 +7,20 @@
 
 async function ensureSchema(pool, sql) {
   try {
+    /* ---------------- e_assessments.exam_password ----------------
+       Lets a student join a single assessment via the standalone
+       /take-assessment/:id page (no portal account login) using
+       their username + this per-assessment password, set by the
+       admin/teacher when creating or editing the assessment. */
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='e_assessments' AND xtype='U')
+      AND NOT EXISTS (
+        SELECT * FROM sys.columns
+        WHERE Name = N'exam_password' AND Object_ID = Object_ID(N'e_assessments')
+      )
+      ALTER TABLE e_assessments ADD exam_password NVARCHAR(50) NULL
+    `);
+
     /* ---------------- Notifications table ---------------- */
     await pool.request().query(`
       IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='Notifications' AND xtype='U')
