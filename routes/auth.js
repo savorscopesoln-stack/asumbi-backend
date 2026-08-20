@@ -95,12 +95,14 @@ if (!user) {
       });
     }
     /* ================= ROLE SYSTEM =================
-       Only two account tiers exist in the Users table now:
-       "admin" (full access) and "sub_admin" (access limited
-       to whichever pages were granted at setup, see
-       user.permissions below). Any legacy "staff" rows are
-       migrated to "sub_admin" on server boot (ensureSchema),
-       but the fallback below covers it defensively too. */
+       Three account tiers exist in the Users table now:
+       "admin" (full access), "sub_admin", and "sub_admin_2"
+       (both sub-admin tiers have access limited to whichever
+       pages were granted at setup, see user.permissions
+       below — they're two independent, equally-capable
+       tiers). Any legacy "staff" rows are migrated to
+       "sub_admin" on server boot (ensureSchema), but the
+       fallback below covers it defensively too. */
     let role = "user";
     let permissions = [];
 
@@ -115,8 +117,9 @@ if (!user) {
 
       if (dbRole === "admin") role = "admin";
       else if (dbRole === "sub_admin" || dbRole === "staff") role = "sub_admin";
+      else if (dbRole === "sub_admin_2") role = "sub_admin_2";
 
-      if (role === "sub_admin") {
+      if (role === "sub_admin" || role === "sub_admin_2") {
         try {
           const parsed = JSON.parse(user.permissions || "[]");
           permissions = Array.isArray(parsed) ? parsed : [];

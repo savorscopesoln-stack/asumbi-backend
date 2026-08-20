@@ -106,7 +106,7 @@ router.put("/:id/read", async (req, res) => {
    body: { recipientType: 'student'|'teacher'|'class'|'all_students',
            recipientId, studentClass, title, message, type }
 ========================================================= */
-router.post("/", authorize("admin", "teacher", "sub_admin"), async (req, res) => {
+router.post("/", authorize("admin", "teacher", "sub_admin", "sub_admin_2"), async (req, res) => {
   try {
     const pool = await poolPromise;
     const { recipientType, recipientId, studentClass, title, message, type } = req.body;

@@ -58,8 +58,9 @@ const protect = (req, res, next) => {
       /*
         SUB-ADMIN PAGE ACCESS
         JSON array of page keys (see utils/pages.js) this account is
-        allowed to open. Only meaningful when role === "sub_admin";
-        "admin" always has full access regardless of this list.
+        allowed to open. Only meaningful when role === "sub_admin" or
+        "sub_admin_2"; "admin" always has full access regardless of
+        this list.
       */
       permissions: Array.isArray(decoded?.permissions)
         ? decoded.permissions
@@ -207,8 +208,9 @@ const authorize = (...allowedRoles) => {
    PAGE-LEVEL AUTHORIZATION (sub-admins)
    Unlike `authorize`, which only checks a role name, this
    checks whether the specific page was granted to a
-   "sub_admin" account at setup time. "admin" always passes,
-   exactly like the admin bypass in `authorize` above.
+   "sub_admin" or "sub_admin_2" account at setup time. "admin"
+   always passes, exactly like the admin bypass in `authorize`
+   above.
 ========================================================= */
 const requirePage = (pageKey) => {
   return (req, res, next) => {
@@ -232,7 +234,10 @@ const requirePage = (pageKey) => {
         ? req.user.permissions
         : [];
 
-      if (userRole === "sub_admin" && permissions.includes(pageKey)) {
+      if (
+        (userRole === "sub_admin" || userRole === "sub_admin_2") &&
+        permissions.includes(pageKey)
+      ) {
         return next();
       }
 

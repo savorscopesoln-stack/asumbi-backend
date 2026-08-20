@@ -143,7 +143,7 @@ const updateEAssessment = async (req, res) => {
 // Students (including exam-only sessions) never receive exam_password or
 // correct_answer in a payload — only admin/teacher accounts managing the
 // assessment need to see either of those.
-const STAFF_ROLES = ["admin", "sub_admin", "teacher"];
+const STAFF_ROLES = ["admin", "sub_admin", "sub_admin_2", "teacher"];
 const redactForRole = (row, role) => {
   if (STAFF_ROLES.includes(role)) return row;
   const { exam_password, ...rest } = row;
@@ -198,7 +198,7 @@ const getEAssessments = async (req, res) => {
     // Attach each assessment's permitted question-setter teacher ids
     // (admin/sub_admin only need this — it's what pre-fills the "Teachers
     // allowed to add questions" picker when they reopen Edit).
-    if (rows.length && (req.user?.role === "admin" || req.user?.role === "sub_admin")) {
+    if (rows.length && ["admin", "sub_admin", "sub_admin_2"].includes(req.user?.role)) {
       const setterResult = await pool.request().query(`
         SELECT e_assessment_id, teacher_id FROM e_assessment_question_setters
       `);
@@ -412,7 +412,7 @@ const examLogin = async (req, res) => {
 // respond with directly.
 async function canManageAssessmentQuestions(pool, req, e_assessmentId) {
   const role = req.user?.role;
-  if (role === "admin" || role === "sub_admin") return { ok: true };
+  if (["admin", "sub_admin", "sub_admin_2"].includes(role)) return { ok: true };
 
   const teacherId = toInt(req.user?.id);
   const result = await pool.request()

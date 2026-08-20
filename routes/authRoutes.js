@@ -95,6 +95,7 @@ if (!user) {
 
       if (dbRole === "admin") role = "admin";
       else if (dbRole === "sub_admin") role = "sub_admin";
+      else if (dbRole === "sub_admin_2") role = "sub_admin_2";
     }
 
     /* ================= TOKEN ================= */
