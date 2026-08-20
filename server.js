@@ -37,6 +37,8 @@ const leaveRoutes = require("./routes/leave");
 const searchRoutes = require("./routes/searchRecords");
 const notificationsRoutes = require("./routes/notifications");
 const broadcastNotificationsRoutes = require("./routes/broadcastNotifications");
+const notificationSettingsRoutes = require("./routes/notificationSettings");
+const studentCouncilRoutes = require("./routes/studentCouncil");
 const { dispatchBroadcast } = require("./controllers/broadcastNotification.controller");
 const { startNotificationScheduler } = require("./utils/notificationScheduler");
 
@@ -155,6 +157,13 @@ app.use("/api/leave", protect, leaveRoutes);
 app.use("/api/search", protect, searchRoutes);
 app.use("/api/notifications", protect, notificationsRoutes);
 app.use("/api/broadcast-notifications", protect, requirePage("Notifications"), broadcastNotificationsRoutes);
+// API-credential management (SMTP/Twilio) — a level above the
+// "Notifications" broadcast page permission, so this is admin-only
+// even for a sub_admin who was granted that page.
+app.use("/api/notification-settings", protect, adminOnly, notificationSettingsRoutes);
+
+// Student Council Voting System — router applies protect/role checks per-route internally
+app.use("/api/student-council", studentCouncilRoutes);
 app.use("/", metaRoutes);
 
 // Sweeps ScheduledNotifications once a minute for anything due and sends

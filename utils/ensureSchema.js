@@ -5,8 +5,15 @@
    on every server boot.
 ========================================================= */
 
+const { ensureElectionSchema } = require("./electionSchema");
+
 async function ensureSchema(pool, sql) {
   try {
+    // Student Council Voting System — its own file since it owns a
+    // self-contained set of tables; kept as a separate module so it's
+    // easy to find/maintain without wading through the rest of this file.
+    await ensureElectionSchema(pool, sql);
+
     /* ---------------- e_assessments.exam_password ----------------
        Lets a student join a single assessment via the standalone
        /take-assessment/:id page (no portal account login) using
@@ -83,6 +90,10 @@ async function ensureSchema(pool, sql) {
       ["isRead", "BIT NOT NULL DEFAULT 0"],
       ["createdBy", "INT NULL"],
       ["createdBySource", "NVARCHAR(20) NULL"],
+      // Human-readable name/username of whoever sent this (or NULL for
+      // system-generated notifications) — so the recipient's inbox can
+      // show "From: Jane Admin" instead of just a source/id pair.
+      ["createdByName", "NVARCHAR(200) NULL"],
       ["createdAt", "DATETIME NULL DEFAULT GETDATE()"],
     ];
 
@@ -122,6 +133,80 @@ async function ensureSchema(pool, sql) {
         WHERE Name = N'leave_type' AND Object_ID = Object_ID(N'leave_outs')
       )
       ALTER TABLE leave_outs ADD leave_type NVARCHAR(20) NOT NULL CONSTRAINT DF_leave_outs_leave_type DEFAULT 'short_stay'
+    `);
+
+    /* ---------------- leave_outs: multi-stage approval workflow ----------------
+       Emergency Leave: Student -> Sub-Admin 2 (stage 1) -> Sub-Admin 1 OR Admin
+       (final stage). Long-Stay Leave: Student -> Admin only, never touches the
+       sub-admin queues. Admin can also "force grant" a leave directly (no
+       workflow at all). Every actor identity below is captured at the moment
+       of the action (id + source + resolved display name), so notifications
+       and history never have to guess who did what. */
+    const leaveOutColumns = [
+      ["subadmin2_approver_id", "INT NULL"],
+      ["subadmin2_approver_source", "NVARCHAR(20) NULL"],
+      ["subadmin2_approver_name", "NVARCHAR(200) NULL"],
+      ["subadmin2_approved_at", "DATETIME NULL"],
+
+      ["final_approver_id", "INT NULL"],
+      ["final_approver_source", "NVARCHAR(20) NULL"],
+      ["final_approver_name", "NVARCHAR(200) NULL"],
+      ["final_approved_at", "DATETIME NULL"],
+
+      ["rejected_by_id", "INT NULL"],
+      ["rejected_by_source", "NVARCHAR(20) NULL"],
+      ["rejected_by_name", "NVARCHAR(200) NULL"],
+      ["rejected_at", "DATETIME NULL"],
+      ["reject_stage", "NVARCHAR(30) NULL"],
+
+      ["is_admin_granted", "BIT NOT NULL CONSTRAINT DF_leave_outs_is_admin_granted DEFAULT 0"],
+      ["granted_by_id", "INT NULL"],
+      ["granted_by_source", "NVARCHAR(20) NULL"],
+      ["granted_by_name", "NVARCHAR(200) NULL"],
+      ["granted_at", "DATETIME NULL"],
+
+      ["submitted_by_name", "NVARCHAR(200) NULL"],
+      ["end_date", "DATETIME NULL"],
+    ];
+
+    for (const [name, type] of leaveOutColumns) {
+      await pool.request().query(`
+        IF EXISTS (SELECT * FROM sysobjects WHERE name='leave_outs' AND xtype='U')
+        AND NOT EXISTS (
+          SELECT * FROM sys.columns
+          WHERE Name = N'${name}' AND Object_ID = Object_ID(N'leave_outs')
+        )
+        ALTER TABLE leave_outs ADD ${name} ${type}
+      `);
+    }
+
+    /* ---------------- Users.name ----------------
+       Display name for admin / sub_admin / sub_admin_2 accounts, used
+       any time a notification needs to name the actual authenticated
+       account that performed an action (never a role label, never
+       hard-coded). Falls back to username wherever this is NULL, so
+       existing accounts keep working immediately without needing to be
+       edited first. */
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='Users' AND xtype='U')
+      AND NOT EXISTS (
+        SELECT * FROM sys.columns
+        WHERE Name = N'name' AND Object_ID = Object_ID(N'Users')
+      )
+      ALTER TABLE Users ADD name NVARCHAR(200) NULL
+    `);
+
+    /* ---------------- Notifications.link ----------------
+       Optional in-app route the notification should take the user to
+       when clicked (e.g. the Leave-out page for a leave-related
+       notification). NULL for notifications with nothing to link to. */
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='Notifications' AND xtype='U')
+      AND NOT EXISTS (
+        SELECT * FROM sys.columns
+        WHERE Name = N'link' AND Object_ID = Object_ID(N'Notifications')
+      )
+      ALTER TABLE Notifications ADD link NVARCHAR(300) NULL
     `);
 
     /* ---------------- mustChangePassword (Users / Students / Teachers) ----------------
@@ -185,8 +270,53 @@ async function ensureSchema(pool, sql) {
         resultSummary NVARCHAR(MAX) NULL,
         createdBy INT NULL,
         createdBySource NVARCHAR(20) NULL,
+        createdByName NVARCHAR(200) NULL,
         createdAt DATETIME NOT NULL DEFAULT GETDATE(),
         sentAt DATETIME NULL
+      )
+    `);
+
+    // Patch createdByName onto a pre-existing ScheduledNotifications table
+    // (same reasoning as the Notifications table above — the sender's
+    // display name so both the broadcast history and every recipient's
+    // in-app notification can show who sent it).
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='ScheduledNotifications' AND xtype='U')
+      AND NOT EXISTS (
+        SELECT * FROM sys.columns
+        WHERE Name = N'createdByName' AND Object_ID = Object_ID(N'ScheduledNotifications')
+      )
+      ALTER TABLE ScheduledNotifications ADD createdByName NVARCHAR(200) NULL
+    `);
+
+    /* ---------------- NotificationSettings table ----------------
+       Single-row table holding the API credentials for the outbound
+       notification channels (email/SMTP, SMS + WhatsApp via Twilio),
+       so an admin can wire these up from the "Notification Settings"
+       config page instead of needing server/.env access. Secret
+       columns (passwords/tokens) are only ever written here, never
+       read back to the browser in plain text — see
+       controllers/notificationSettings.controller.js.
+       backend/services/notificationChannels.js falls back to the
+       equivalent environment variable whenever a column is NULL, so
+       nothing already relying on .env breaks. */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='NotificationSettings' AND xtype='U')
+      CREATE TABLE NotificationSettings (
+        id INT NOT NULL PRIMARY KEY DEFAULT 1,
+        emailHost NVARCHAR(200) NULL,
+        emailPort INT NULL,
+        emailSecure BIT NULL,
+        emailUser NVARCHAR(200) NULL,
+        emailPassword NVARCHAR(500) NULL,
+        emailFrom NVARCHAR(200) NULL,
+        twilioAccountSid NVARCHAR(200) NULL,
+        twilioAuthToken NVARCHAR(500) NULL,
+        twilioSmsFrom NVARCHAR(50) NULL,
+        twilioWhatsappFrom NVARCHAR(50) NULL,
+        updatedAt DATETIME NULL,
+        updatedByName NVARCHAR(200) NULL,
+        CONSTRAINT CK_NotificationSettings_singleton CHECK (id = 1)
       )
     `);
 
@@ -214,7 +344,7 @@ async function ensureSchema(pool, sql) {
       ALTER TABLE Teachers ADD photoUrl NVARCHAR(500) NULL
     `);
 
-    console.log("✅ Schema check complete (Notifications, ScheduledNotifications, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, mustChangePassword, Users.permissions, staff→sub_admin migration, Students/Teachers.photoUrl)");
+    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl)");
   } catch (err) {
     console.error("⚠️  Schema ensure failed:", err.message);
   }

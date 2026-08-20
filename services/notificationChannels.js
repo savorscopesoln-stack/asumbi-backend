@@ -7,48 +7,79 @@
      - whatsapp  via Twilio's WhatsApp API (same REST endpoint, "whatsapp:"
                  prefixed numbers)
 
-   Every function here is defensive about missing configuration: if the
-   relevant env vars aren't set, it returns { ok: false, skipped: true }
-   instead of throwing, so a broadcast that fans out to all four channels
-   still succeeds on the channels that ARE configured (e.g. in-app +
-   email) even before an admin has wired up Twilio.
+   Configuration is read via utils/notificationSettingsStore.js, which
+   prefers whatever was saved from the admin "Notification Settings"
+   page and falls back to the matching environment variable — so this
+   keeps working unmodified for a deployment that only ever used .env.
+
+   Every function here is defensive about missing configuration: if
+   nothing is configured (DB or env), it returns { ok: false, skipped:
+   true } instead of throwing, so a broadcast that fans out to all four
+   channels still succeeds on the channels that ARE configured (e.g.
+   in-app + email) even before an admin has wired up Twilio.
 ========================================================================= */
 
 const nodemailer = require("nodemailer");
+const { getEffectiveConfig } = require("../utils/notificationSettingsStore");
+
+/* A pool-less fallback config for the rare caller that doesn't have a
+   pool handy — env vars only, same as the old behaviour. */
+const envOnlyConfig = () => ({
+  emailHost: process.env.EMAIL_HOST || null,
+  emailPort: Number(process.env.EMAIL_PORT) || 587,
+  emailSecure: String(process.env.EMAIL_SECURE || "false") === "true",
+  emailUser: process.env.EMAIL_USER || null,
+  emailPassword: process.env.EMAIL_PASSWORD || null,
+  emailFrom: process.env.EMAIL_FROM || process.env.EMAIL_USER || null,
+  twilioAccountSid: process.env.TWILIO_ACCOUNT_SID || null,
+  twilioAuthToken: process.env.TWILIO_AUTH_TOKEN || null,
+  twilioSmsFrom: process.env.TWILIO_SMS_FROM || null,
+  twilioWhatsappFrom: process.env.TWILIO_WHATSAPP_FROM || null,
+});
+
+const resolveConfig = async (pool) => {
+  if (!pool) return envOnlyConfig();
+  try {
+    return await getEffectiveConfig(pool);
+  } catch (err) {
+    console.error("⚠️ Failed to load notification settings, falling back to env:", err.message);
+    return envOnlyConfig();
+  }
+};
 
 /* ================= EMAIL ================= */
 
-const emailConfigured = () =>
-  !!(process.env.EMAIL_HOST && process.env.EMAIL_USER && process.env.EMAIL_PASSWORD);
-
-let cachedTransporter = null;
-const getTransporter = () => {
-  if (!emailConfigured()) return null;
-  if (cachedTransporter) return cachedTransporter;
-
-  cachedTransporter = nodemailer.createTransport({
-    host: process.env.EMAIL_HOST,
-    port: Number(process.env.EMAIL_PORT) || 587,
-    secure: String(process.env.EMAIL_SECURE || "false") === "true",
-    auth: {
-      user: process.env.EMAIL_USER,
-      pass: process.env.EMAIL_PASSWORD,
-    },
-  });
-  return cachedTransporter;
+const emailConfigured = async (pool) => {
+  const cfg = await resolveConfig(pool);
+  return !!(cfg.emailHost && cfg.emailUser && cfg.emailPassword);
 };
 
-const sendEmail = async ({ to, subject, message }) => {
+// Transporters are cheap to (re)build and config can change at any time
+// from the settings page, so no cross-call caching here — this only
+// runs once per outgoing email, not per keystroke.
+const buildTransporter = (cfg) =>
+  nodemailer.createTransport({
+    host: cfg.emailHost,
+    port: Number(cfg.emailPort) || 587,
+    secure: !!cfg.emailSecure,
+    auth: {
+      user: cfg.emailUser,
+      pass: cfg.emailPassword,
+    },
+  });
+
+const sendEmail = async ({ to, subject, message }, pool) => {
   if (!to) return { ok: false, reason: "No email address on file" };
 
-  const transporter = getTransporter();
-  if (!transporter) {
-    return { ok: false, skipped: true, reason: "EMAIL_HOST / EMAIL_USER / EMAIL_PASSWORD not configured" };
+  const cfg = await resolveConfig(pool);
+  if (!cfg.emailHost || !cfg.emailUser || !cfg.emailPassword) {
+    return { ok: false, skipped: true, reason: "Email (SMTP) is not configured yet — add it under Notification Settings" };
   }
 
   try {
+    const transporter = buildTransporter(cfg);
     await transporter.sendMail({
-      from: process.env.EMAIL_FROM || process.env.EMAIL_USER,
+      from: cfg.emailFrom || cfg.emailUser,
       to,
       subject: subject || "Notification",
       text: message,
@@ -66,7 +97,10 @@ const sendEmail = async ({ to, subject, message }) => {
 
 /* ================= SMS + WHATSAPP (Twilio) ================= */
 
-const twilioConfigured = () => !!(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN);
+const twilioConfigured = async (pool) => {
+  const cfg = await resolveConfig(pool);
+  return !!(cfg.twilioAccountSid && cfg.twilioAuthToken);
+};
 
 // Best-effort local-number normalization. Kenyan-style "07XXXXXXXX" /
 // "01XXXXXXXX" numbers become "+254XXXXXXXXX"; anything already in
@@ -79,14 +113,14 @@ const normalizePhone = (raw) => {
   return phone;
 };
 
-const twilioSendRaw = async ({ to, from, body }) => {
-  if (!twilioConfigured()) {
-    return { ok: false, skipped: true, reason: "TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN not configured" };
+const twilioSendRaw = async ({ to, from, body, cfg }) => {
+  if (!cfg.twilioAccountSid || !cfg.twilioAuthToken) {
+    return { ok: false, skipped: true, reason: "Twilio is not configured yet — add it under Notification Settings" };
   }
   if (!from) return { ok: false, skipped: true, reason: "Sender number not configured" };
 
-  const sid = process.env.TWILIO_ACCOUNT_SID;
-  const authToken = process.env.TWILIO_AUTH_TOKEN;
+  const sid = cfg.twilioAccountSid;
+  const authToken = cfg.twilioAuthToken;
   const url = `https://api.twilio.com/2010-04-01/Accounts/${sid}/Messages.json`;
   const auth = Buffer.from(`${sid}:${authToken}`).toString("base64");
 
@@ -112,17 +146,19 @@ const twilioSendRaw = async ({ to, from, body }) => {
   }
 };
 
-const sendSms = async ({ to, message }) => {
+const sendSms = async ({ to, message }, pool) => {
   const phone = normalizePhone(to);
   if (!phone) return { ok: false, reason: "No/invalid phone number on file" };
-  return twilioSendRaw({ to: phone, from: process.env.TWILIO_SMS_FROM, body: message });
+  const cfg = await resolveConfig(pool);
+  return twilioSendRaw({ to: phone, from: cfg.twilioSmsFrom, body: message, cfg });
 };
 
-const sendWhatsapp = async ({ to, message }) => {
+const sendWhatsapp = async ({ to, message }, pool) => {
   const phone = normalizePhone(to);
   if (!phone) return { ok: false, reason: "No/invalid phone number on file" };
-  const from = process.env.TWILIO_WHATSAPP_FROM ? `whatsapp:${process.env.TWILIO_WHATSAPP_FROM.replace(/^whatsapp:/, "")}` : null;
-  return twilioSendRaw({ to: `whatsapp:${phone}`, from, body: message });
+  const cfg = await resolveConfig(pool);
+  const from = cfg.twilioWhatsappFrom ? `whatsapp:${cfg.twilioWhatsappFrom.replace(/^whatsapp:/, "")}` : null;
+  return twilioSendRaw({ to: `whatsapp:${phone}`, from, body: message, cfg });
 };
 
 module.exports = {

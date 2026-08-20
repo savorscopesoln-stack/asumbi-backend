@@ -233,11 +233,12 @@ const dispatchBroadcast = async (pool, io, row) => {
           .input("type", sql.NVarChar, "broadcast")
           .input("createdBy", sql.Int, row.createdBy)
           .input("createdBySource", sql.NVarChar, row.createdBySource)
+          .input("createdByName", sql.NVarChar, row.createdByName || null)
           .query(`
             INSERT INTO Notifications
-              (recipientId, recipientSource, title, message, type, isRead, createdBy, createdBySource, createdAt)
+              (recipientId, recipientSource, title, message, type, isRead, createdBy, createdBySource, createdByName, createdAt)
             VALUES
-              (@recipientId, @recipientSource, @title, @message, @type, 0, @createdBy, @createdBySource, GETDATE())
+              (@recipientId, @recipientSource, @title, @message, @type, 0, @createdBy, @createdBySource, @createdByName, GETDATE())
           `);
         summary.in_app.sent++;
       } catch (err) {
@@ -247,7 +248,7 @@ const dispatchBroadcast = async (pool, io, row) => {
     }
 
     if (channels.includes("email")) {
-      const result = await sendEmail({ to: rec.email, subject: row.title || "Notification", message: row.message });
+      const result = await sendEmail({ to: rec.email, subject: row.title || "Notification", message: row.message }, pool);
       if (result.ok) summary.email.sent++;
       else if (result.skipped) summary.email.skipped++;
       else {
@@ -257,7 +258,7 @@ const dispatchBroadcast = async (pool, io, row) => {
     }
 
     if (channels.includes("sms")) {
-      const result = await sendSms({ to: rec.phone, message: row.message });
+      const result = await sendSms({ to: rec.phone, message: row.message }, pool);
       if (result.ok) summary.sms.sent++;
       else if (result.skipped) summary.sms.skipped++;
       else {
@@ -267,7 +268,7 @@ const dispatchBroadcast = async (pool, io, row) => {
     }
 
     if (channels.includes("whatsapp")) {
-      const result = await sendWhatsapp({ to: rec.phone, message: row.message });
+      const result = await sendWhatsapp({ to: rec.phone, message: row.message }, pool);
       if (result.ok) summary.whatsapp.sent++;
       else if (result.skipped) summary.whatsapp.skipped++;
       else {
@@ -339,7 +340,19 @@ const createBroadcast = async (req, res) => {
         return res.status(400).json({ message: "Invalid scheduledFor date" });
       }
     }
-    const sendNow = !scheduledDate || scheduledDate.getTime() <= Date.now();
+
+    // `sendNow` (an explicit boolean from the "Send now" / "Schedule for
+    // later" toggle on the compose form) is authoritative when present —
+    // it wins even if a stray scheduledFor value somehow made it into
+    // the request, so clicking "Send now" can never silently fall back
+    // to scheduling. Older/other callers that don't send this flag keep
+    // the previous date-comparison behaviour.
+    const sendNow = typeof req.body.sendNow === "boolean"
+      ? req.body.sendNow
+      : (!scheduledDate || scheduledDate.getTime() <= Date.now());
+
+    const effectiveScheduledDate = sendNow ? null : scheduledDate;
+    const createdByName = req.user?.username || req.user?.email || null;
 
     const insertResult = await pool.request()
       .input("title", sql.NVarChar, title || "Notification")
@@ -348,23 +361,50 @@ const createBroadcast = async (req, res) => {
       .input("recipientType", sql.NVarChar, recipientType)
       .input("recipientIds", sql.NVarChar, recipientType === "specific" ? JSON.stringify(recipientIds) : null)
       .input("studentClass", sql.NVarChar, recipientType === "class" ? studentClass : null)
-      .input("scheduledFor", sql.DateTime, sendNow ? null : scheduledDate)
+      .input("scheduledFor", sql.DateTime, effectiveScheduledDate)
       .input("createdBy", sql.Int, req.user?.id || null)
       .input("createdBySource", sql.NVarChar, req.user?.source || req.user?.role || null)
+      .input("createdByName", sql.NVarChar, createdByName)
       .query(`
         INSERT INTO ScheduledNotifications
-          (title, message, channels, recipientType, recipientIds, studentClass, scheduledFor, status, createdBy, createdBySource, createdAt)
+          (title, message, channels, recipientType, recipientIds, studentClass, scheduledFor, status, createdBy, createdBySource, createdByName, createdAt)
         OUTPUT INSERTED.*
         VALUES
-          (@title, @message, @channels, @recipientType, @recipientIds, @studentClass, @scheduledFor, 'pending', @createdBy, @createdBySource, GETDATE())
+          (@title, @message, @channels, @recipientType, @recipientIds, @studentClass, @scheduledFor, 'pending', @createdBy, @createdBySource, @createdByName, GETDATE())
       `);
 
     const row = insertResult.recordset[0];
 
     if (sendNow) {
       const io = req.app.get("io");
-      const { summary } = await dispatchBroadcast(pool, io, row);
-      return res.json({ message: "Notification sent", status: "sent", summary });
+      try {
+        const { summary } = await dispatchBroadcast(pool, io, row);
+        return res.json({ message: "Notification sent", status: "sent", summary });
+      } catch (dispatchErr) {
+        // IMPORTANT: this is the fix for "Send now" leaving a row stuck
+        // showing as Scheduled forever. Previously, if dispatchBroadcast
+        // threw (e.g. a transient DB hiccup) *before* it reached its own
+        // status='sent' update, the row was left exactly as inserted —
+        // status='pending' with no scheduledFor — which the UI then
+        // rendered as a "Scheduled" badge with a Cancel button, even
+        // though nothing was ever actually scheduled or sent, and the
+        // background scheduler (which only picks up rows that DO have a
+        // scheduledFor) would never retry it either. Now any such
+        // failure is written back as status='failed' immediately, so
+        // "Send now" always ends in either Sent or Failed — never a
+        // phantom Scheduled.
+        console.error("SEND NOW DISPATCH ERROR:", dispatchErr);
+        try {
+          await pool.request()
+            .input("id", sql.Int, row.id)
+            .input("status", sql.NVarChar, "failed")
+            .input("summary", sql.NVarChar, JSON.stringify({ errors: [dispatchErr.message || "Failed to dispatch"] }))
+            .query(`UPDATE ScheduledNotifications SET status = @status, resultSummary = @summary, sentAt = GETDATE() WHERE id = @id`);
+        } catch (markErr) {
+          console.error("Failed to mark broadcast as failed after dispatch error:", markErr.message);
+        }
+        return res.status(500).json({ message: "Failed to send notification", error: dispatchErr.message });
+      }
     }
 
     res.json({ message: `Notification scheduled for ${scheduledDate.toLocaleString()}`, status: "scheduled", id: row.id });
