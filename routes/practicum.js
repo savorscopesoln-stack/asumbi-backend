@@ -1,5 +1,6 @@
 const express = require("express");
 const router = express.Router();
+const { notifyUsers } = require("../utils/notify");
 
 // A teacher assesses at most this many trainees in one sitting/day.
 const MAX_PER_TEACHER = 7;
@@ -417,6 +418,28 @@ router.post("/auto-assign/:sessionId", async (req, res) => {
   )
 );
 
+    const notifiedTeacherIds = new Set(rows.map((r) => r.teacherId));
+    const notifiedStudentIds = new Set(rows.map((r) => r.studentId));
+
+    await notifyUsers(
+      pool,
+      [...notifiedTeacherIds].map((id) => ({ id, source: "Teachers" })),
+      {
+        title: "Practicum Allocation",
+        message: "You've been allocated students for practicum supervision. Check Practicum for your assignment.",
+        type: "allocation",
+      }
+    );
+    await notifyUsers(
+      pool,
+      [...notifiedStudentIds].map((id) => ({ id, source: "Students" })),
+      {
+        title: "Practicum Allocation",
+        message: "You've been allocated a supervising teacher and school for practicum. Check Practicum for details.",
+        type: "allocation",
+      }
+    );
+
     res.json({
       message: "assigned",
       studentsAssigned: rows.length,
@@ -596,6 +619,23 @@ router.post("/deploy", async (req, res) => {
                    (@newAssignmentId,4),(@newAssignmentId,5),(@newAssignmentId,6);
           `)
       )
+    );
+
+    const deployedTeacherIds = new Set(rows.map((r) => r.teacherId));
+    const deployedStudentIds = new Set(rows.map((r) => r.studentId));
+    const deployMsg = isExtra
+      ? `You've been deployed for an extra practicum session${day ? ` on ${day}` : ""}.`
+      : "You've been deployed for practicum. Check Practicum for your school and schedule.";
+
+    await notifyUsers(
+      pool,
+      [...deployedTeacherIds].map((id) => ({ id, source: "Teachers" })),
+      { title: "Practicum Deployment", message: deployMsg, type: "deployment" }
+    );
+    await notifyUsers(
+      pool,
+      [...deployedStudentIds].map((id) => ({ id, source: "Students" })),
+      { title: "Practicum Deployment", message: deployMsg, type: "deployment" }
     );
 
     res.json({ message: "deployed", studentsDeployed: rows.length, teachersUsed: teachers.length, groups: groups.length });

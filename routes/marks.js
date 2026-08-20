@@ -1,5 +1,6 @@
 const express = require("express");
 const app = express();
+const { notifyUsers } = require("../utils/notify");
 
 /* ================= SAFE NUMBER ================= */
 const toNum = (v) => {
@@ -68,7 +69,7 @@ app.post("/api/marks/save", async (req, res) => {
     const assessmentResult = await pool.request()
       .input("assessmentId", aId)
       .query(`
-        SELECT status, totalMarks
+        SELECT status, totalMarks, name
         FROM Assessments
         WHERE id = @assessmentId
       `);
@@ -89,6 +90,8 @@ app.post("/api/marks/save", async (req, res) => {
        BULK SAVE MODE
     ===================================================== */
     if (Array.isArray(data) && data.length > 0) {
+      const notifiedStudentIds = new Set();
+
       for (const d of data) {
         const sId = toNum(d.studentId);
         const subId = toNum(d.subjectId || subjectId);
@@ -103,7 +106,19 @@ app.post("/api/marks/save", async (req, res) => {
           score,
           max
         });
+
+        notifiedStudentIds.add(sId);
       }
+
+      await notifyUsers(
+        pool,
+        [...notifiedStudentIds].map((id) => ({ id, source: "Students" })),
+        {
+          title: "Marks Posted",
+          message: `Your marks for "${assessment.name || "an assessment"}" have been posted.`,
+          type: "marks",
+        }
+      );
 
       return res.json({ message: "Bulk marks saved" });
     }
@@ -127,6 +142,12 @@ app.post("/api/marks/save", async (req, res) => {
       max
     });
 
+    // NOTE: deliberately not notifying here — this branch is the
+    // per-cell autosave path (see "SINGLE SAVE MODE (AUTOSAVE)" above)
+    // and fires on nearly every keystroke while a teacher is entering
+    // marks; notifying on it would spam the student. The bulk-save
+    // path above (the actual "save marks for the class" action) is
+    // where the notification belongs.
     return res.json({ message: "Saved" });
 
   } catch (err) {
