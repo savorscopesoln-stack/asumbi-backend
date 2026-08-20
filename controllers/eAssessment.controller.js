@@ -1,7 +1,6 @@
 const sql = require("mssql");
 const crypto = require("crypto");
 const jwt = require("jsonwebtoken");
-const { notifyUsers, notifyOne } = require("../utils/notify");
 
 /* =========================================================================
    HELPERS
@@ -1050,25 +1049,11 @@ const reviewAssessment = async (req, res) => {
     const { status, admin_comment } = req.body;
     if (!["approved", "rejected"].includes(status)) return res.status(400).json({ message: "Invalid status" });
 
-    const existing = await pool.request().input("id", sql.Int, assessmentId)
-      .query(`SELECT teacher_id, title FROM e_assessments WHERE id = @id`);
-
     await pool.request()
       .input("id", sql.Int, assessmentId)
       .input("status", sql.NVarChar, status)
       .input("admin_comment", sql.NVarChar, admin_comment || "")
       .query(`UPDATE e_assessments SET status = @status, admin_comment = @admin_comment WHERE id = @id`);
-
-    if (existing.recordset.length && existing.recordset[0].teacher_id) {
-      const { teacher_id, title } = existing.recordset[0];
-      await notifyOne(pool, teacher_id, "Teachers", {
-        title: status === "approved" ? "Assessment Approved" : "Assessment Rejected",
-        message: status === "approved"
-          ? `Your assessment "${title}" was approved and can now be activated for students.`
-          : `Your assessment "${title}" was rejected.${admin_comment ? ` Reason: ${admin_comment}` : ""}`,
-        type: "exam",
-      });
-    }
 
     res.json({ success: true, message: `Assessment ${status}` });
   } catch (err) {
@@ -1083,32 +1068,12 @@ const toggleEAssessmentActive = async (req, res) => {
     const id = toInt(req.params.id);
 
     const current = await pool.request().input("id", sql.Int, id)
-      .query(`SELECT active_status, class_id, title FROM e_assessments WHERE id = @id`);
+      .query(`SELECT active_status FROM e_assessments WHERE id = @id`);
     if (!current.recordset.length) return res.status(404).json({ message: "Assessment not found" });
 
-    const { class_id, title } = current.recordset[0];
     const next = current.recordset[0].active_status === "Active" ? "Inactive" : "Active";
     await pool.request().input("id", sql.Int, id).input("active_status", sql.NVarChar(20), next)
       .query(`UPDATE e_assessments SET active_status = @active_status WHERE id = @id`);
-
-    if (next === "Active" && class_id) {
-      const students = await pool.request().input("classId", sql.Int, class_id)
-        .query(`
-          SELECT st.id
-          FROM Students st
-          JOIN Classes c ON c.id = @classId
-          WHERE st.studentClass = c.name
-        `);
-      await notifyUsers(
-        pool,
-        (students.recordset || []).map((s) => ({ id: s.id, source: "Students" })),
-        {
-          title: "Assessment Now Open",
-          message: `"${title}" is now open — you can take it from your E-Assessments page.`,
-          type: "exam",
-        }
-      );
-    }
 
     res.json({ success: true, active_status: next });
   } catch (err) {
@@ -1201,20 +1166,6 @@ const assignTeacher = async (req, res) => {
     await pool.request()
       .input("teacher_id", sql.Int, teacher_id).input("subject_id", sql.Int, subject_id).input("class_id", sql.Int, class_id)
       .query(`INSERT INTO TeacherSubjects (teacher_id, subject_id, class_id) VALUES (@teacher_id, @subject_id, @class_id)`);
-
-    const names = await pool.request()
-      .input("subject_id", sql.Int, subject_id).input("class_id", sql.Int, class_id)
-      .query(`
-        SELECT (SELECT name FROM Subjects WHERE id = @subject_id) AS subject_name,
-               (SELECT name FROM Classes  WHERE id = @class_id)  AS class_name
-      `);
-    const { subject_name, class_name } = names.recordset[0] || {};
-
-    await notifyOne(pool, teacher_id, "Teachers", {
-      title: "New Class Allocation",
-      message: `You've been allocated to teach ${subject_name || "a subject"} for ${class_name || "a class"}.`,
-      type: "allocation",
-    });
 
     res.json({ success: true, message: "Teacher assigned successfully" });
   } catch (err) {
@@ -1643,13 +1594,6 @@ const reviewRemarkRequest = async (req, res) => {
     const validStatuses = ["approved", "rejected", "revision", "pending"];
     if (!validStatuses.includes(status)) return res.status(400).json({ message: "Invalid status" });
 
-    const existing = await pool.request().input("id", sql.Int, id).query(`
-      SELECT s.student_id, a.title
-      FROM e_assessment_submissions s
-      LEFT JOIN e_assessments a ON a.id = s.e_assessment_id
-      WHERE s.id = @id
-    `);
-
     await pool.request()
       .input("id", sql.Int, id).input("status", sql.NVarChar(50), status)
       .input("admin_comment", sql.NVarChar(sql.MAX), admin_comment || "").query(`
@@ -1659,16 +1603,6 @@ const reviewRemarkRequest = async (req, res) => {
             reviewed_at = GETDATE()
         WHERE id = @id
       `);
-
-    if (existing.recordset.length && status !== "pending") {
-      const { student_id, title } = existing.recordset[0];
-      const statusLabel = { approved: "approved", rejected: "rejected", revision: "sent for revision" }[status] || status;
-      await notifyOne(pool, student_id, "Students", {
-        title: "Remark Request Update",
-        message: `Your remark request for "${title || "an assessment"}" was ${statusLabel}.${admin_comment ? ` ${admin_comment}` : ""}`,
-        type: "exam",
-      });
-    }
 
     res.json({ success: true, message: `Remark request ${status}` });
   } catch (err) {
@@ -1745,13 +1679,6 @@ WHERE s.id = @id
     `);
 
     await transaction.commit();
-
-    await notifyOne(pool, sub.student_id, "Students", {
-      title: "Exam Results Released",
-      message: `Your results for "${sub.title || "an assessment"}" have been released. Score: ${sub.score}/${sub.total_marks}.`,
-      type: "exam",
-    });
-
     res.json({ success: true, message: "Marks released successfully" });
   } catch (err) {
     console.error("RELEASE MARKS ERROR:", err);
@@ -1805,12 +1732,6 @@ const bulkReleaseMarks = async (req, res) => {
         `);
         await transaction.commit();
         released++;
-
-        await notifyOne(pool, sub.student_id, "Students", {
-          title: "Exam Results Released",
-          message: `Your results for "${sub.title || "an assessment"}" have been released. Score: ${sub.score}/${sub.total_marks}.`,
-          type: "exam",
-        });
       } catch (innerErr) {
         try { await transaction.rollback(); } catch (_) {}
         console.error("BULK RELEASE ITEM ERROR:", innerErr);
