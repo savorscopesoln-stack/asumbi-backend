@@ -200,20 +200,24 @@ module.exports = (poolPromise, sql) => {
   });
 
   /* ================= ADMIN GET ALL =================
-     admin sees every leave. sub_admin / sub_admin_2 never see
-     Long-Stay Leave — it must not appear in either sub-admin queue.
+     admin sees every leave. sub_admin never sees Long-Stay Leave.
+     sub_admin_2 is scoped even tighter — it's an Emergency-only
+     reviewer role, so it must never see short_stay or long leaves,
+     only 'emergency'.
   */
   router.get("/", authorize(...LEAVE_STAFF_ROLES), async (req, res) => {
     try {
       const pool = await poolPromise;
 
       const role = req.user.role;
-      const excludeLong = role === "sub_admin" || role === "sub_admin_2";
+      let where = "";
+      if (role === "sub_admin_2") where = "WHERE leave_type = 'emergency'";
+      else if (role === "sub_admin") where = "WHERE leave_type <> 'long'";
 
       const result = await pool.request().query(`
         SELECT *
         FROM leave_outs
-        ${excludeLong ? "WHERE leave_type <> 'long'" : ""}
+        ${where}
         ORDER BY id DESC
       `);
 
@@ -698,12 +702,17 @@ module.exports = (poolPromise, sql) => {
   });
 
   /* ================= ANALYTICS ================= */
-  router.get("/analytics", authorize(...LEAVE_STAFF_ROLES), async (req, res) => {
+  /* sub_admin_2 is intentionally excluded here (admin / sub_admin only).
+     That role can only ever see a raw list of Emergency requests, never
+     totals/counts/analytics of any kind — see LeaveOut.jsx, which also
+     never calls this endpoint for that role. Enforced here too so it
+     can't be reached by calling the API directly. */
+  router.get("/analytics", authorize("admin", "sub_admin"), async (req, res) => {
     try {
       const pool = await poolPromise;
 
       const role = req.user.role;
-      const excludeLong = role === "sub_admin" || role === "sub_admin_2";
+      const excludeLong = role === "sub_admin";
 
       const result = await pool.request().query(`
         SELECT 
