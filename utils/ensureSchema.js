@@ -190,7 +190,31 @@ async function ensureSchema(pool, sql) {
       )
     `);
 
-    console.log("✅ Schema check complete (Notifications, ScheduledNotifications, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, mustChangePassword, Users.permissions, staff→sub_admin migration)");
+    /* ---------------- Students.photoUrl / Teachers.photoUrl ----------------
+       Profile photo, required at registration time for both portals (see
+       backend/routes/register.js) and replaceable later from the
+       student/teacher's own profile page. Stores the relative URL path
+       returned by the photo upload middleware (e.g. /uploads/photos/xyz.jpg),
+       not the file itself. */
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='Students' AND xtype='U')
+      AND NOT EXISTS (
+        SELECT * FROM sys.columns
+        WHERE Name = N'photoUrl' AND Object_ID = Object_ID(N'Students')
+      )
+      ALTER TABLE Students ADD photoUrl NVARCHAR(500) NULL
+    `);
+
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='Teachers' AND xtype='U')
+      AND NOT EXISTS (
+        SELECT * FROM sys.columns
+        WHERE Name = N'photoUrl' AND Object_ID = Object_ID(N'Teachers')
+      )
+      ALTER TABLE Teachers ADD photoUrl NVARCHAR(500) NULL
+    `);
+
+    console.log("✅ Schema check complete (Notifications, ScheduledNotifications, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, mustChangePassword, Users.permissions, staff→sub_admin migration, Students/Teachers.photoUrl)");
   } catch (err) {
     console.error("⚠️  Schema ensure failed:", err.message);
   }

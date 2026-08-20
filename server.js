@@ -7,9 +7,12 @@ const multer = require("multer");
 const XLSX = require("xlsx");
 const bcrypt = require("bcrypt");
 
+const path = require("path");
+
 const { poolPromise, sql } = require("./config/db");
 const { protect, authorize, adminOnly, requirePage } = require("./middleware/authMiddleware");
 const { ensureSchema } = require("./utils/ensureSchema");
+const { photoUrlFor, deletePhotoByUrl, runPhotoUpload } = require("./middleware/photoUpload");
 
 // Idempotent startup check — creates/upgrades the Notifications table
 // and adds leave_outs.leave_type if either is missing. Safe to run
@@ -95,6 +98,12 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 const upload = multer({ storage: multer.memoryStorage() });
+
+/* ================= PROFILE PHOTOS (static) =================
+   Files land on disk via backend/middleware/photoUpload.js under
+   backend/uploads/photos; served back out from here so a stored
+   photoUrl like "/uploads/photos/xyz.jpg" resolves to a real image. */
+app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
 if (process.env.NODE_ENV !== "production") {
   app.use((req, res, next) => {
@@ -620,13 +629,15 @@ app.get("/api/student/marks", protect, async (req, res) => {
 app.get("/api/student/profile", protect, async (req, res) => {
   try {
     const pool = req.pool;
-    const studentId = toInt(req.query.studentId);
+    // A logged-in student's own id from their token is the normal case;
+    // ?studentId= stays supported for an admin/teacher looking someone up.
+    const studentId = toInt(req.query.studentId) || req.user.id;
 
     const result = await pool
       .request()
       .input("studentId", sql.Int, studentId)
       .query(`
-        SELECT id, name, admissionNo, studentClass, gender, yearOfStudy, status
+        SELECT id, name, admissionNo, studentClass, gender, yearOfStudy, status, photoUrl
         FROM Students
         WHERE id = @studentId
       `);
@@ -635,6 +646,114 @@ app.get("/api/student/profile", protect, async (req, res) => {
   } catch (err) {
     console.log("STUDENT PROFILE ERROR:", err);
     res.status(500).json({});
+  }
+});
+
+/* =========================================================
+   TEACHER PROFILE (mirrors /api/student/profile above)
+========================================================= */
+app.get("/api/teacher/profile", protect, async (req, res) => {
+  try {
+    const pool = req.pool;
+    const teacherId = toInt(req.query.teacherId) || req.user.id;
+
+    const result = await pool
+      .request()
+      .input("teacherId", sql.Int, teacherId)
+      .query(`
+        SELECT id, name, staffId, subject, phone, email, status, photoUrl
+        FROM Teachers
+        WHERE id = @teacherId
+      `);
+
+    res.json(result.recordset[0] || {});
+  } catch (err) {
+    console.log("TEACHER PROFILE ERROR:", err);
+    res.status(500).json({});
+  }
+});
+
+/* =========================================================
+   PROFILE PHOTO — SELF-SERVICE UPLOAD/REPLACE
+   Student or teacher uploads/replaces their own photo from
+   their profile page. The old file (if any) is cleaned up
+   after the DB row is updated to point at the new one.
+========================================================= */
+app.put("/api/student/profile/photo", protect, authorize("student"), async (req, res) => {
+  let uploaded;
+  try {
+    await runPhotoUpload(req, res);
+    uploaded = req.file;
+  } catch (err) {
+    return res.status(400).json({ message: err.message || "Photo upload failed" });
+  }
+
+  try {
+    if (!uploaded) {
+      return res.status(400).json({ message: "No photo file received" });
+    }
+
+    const pool = req.pool;
+    const photoUrl = photoUrlFor(uploaded.filename);
+
+    const existing = await pool
+      .request()
+      .input("id", sql.Int, req.user.id)
+      .query(`SELECT photoUrl FROM Students WHERE id = @id`);
+
+    await pool
+      .request()
+      .input("id", sql.Int, req.user.id)
+      .input("photoUrl", sql.NVarChar, photoUrl)
+      .query(`UPDATE Students SET photoUrl = @photoUrl WHERE id = @id`);
+
+    const oldPhotoUrl = existing.recordset[0]?.photoUrl;
+    if (oldPhotoUrl) deletePhotoByUrl(oldPhotoUrl);
+
+    res.json({ message: "Profile photo updated", photoUrl });
+  } catch (err) {
+    deletePhotoByUrl(uploaded.path);
+    console.log("STUDENT PHOTO UPLOAD ERROR:", err);
+    res.status(500).json({ message: "Photo upload failed" });
+  }
+});
+
+app.put("/api/teacher/profile/photo", protect, authorize("teacher"), async (req, res) => {
+  let uploaded;
+  try {
+    await runPhotoUpload(req, res);
+    uploaded = req.file;
+  } catch (err) {
+    return res.status(400).json({ message: err.message || "Photo upload failed" });
+  }
+
+  try {
+    if (!uploaded) {
+      return res.status(400).json({ message: "No photo file received" });
+    }
+
+    const pool = req.pool;
+    const photoUrl = photoUrlFor(uploaded.filename);
+
+    const existing = await pool
+      .request()
+      .input("id", sql.Int, req.user.id)
+      .query(`SELECT photoUrl FROM Teachers WHERE id = @id`);
+
+    await pool
+      .request()
+      .input("id", sql.Int, req.user.id)
+      .input("photoUrl", sql.NVarChar, photoUrl)
+      .query(`UPDATE Teachers SET photoUrl = @photoUrl WHERE id = @id`);
+
+    const oldPhotoUrl = existing.recordset[0]?.photoUrl;
+    if (oldPhotoUrl) deletePhotoByUrl(oldPhotoUrl);
+
+    res.json({ message: "Profile photo updated", photoUrl });
+  } catch (err) {
+    deletePhotoByUrl(uploaded.path);
+    console.log("TEACHER PHOTO UPLOAD ERROR:", err);
+    res.status(500).json({ message: "Photo upload failed" });
   }
 });
 

@@ -1,8 +1,10 @@
 const express = require("express");
 const bcrypt = require("bcrypt");
+const fs = require("fs");
 const router = express.Router();
 const { protect, adminOnly } = require("../middleware/authMiddleware");
 const { PAGE_KEYS, sanitizePermissions } = require("../utils/pages");
+const { photoUrlFor, deletePhotoByUrl, runPhotoUpload } = require("../middleware/photoUpload");
 
 /* =========================================================
    HELPER: GENERATE DEFAULT PASSWORD
@@ -15,6 +17,17 @@ const generatePassword = () => {
    REGISTER STUDENT
 ========================================================= */
 router.post("/student", async (req, res) => {
+  // Parsed here (rather than as route middleware) so a bad/missing file
+  // fails with the same 400 JSON shape as any other missing field below,
+  // instead of an unhandled multer error.
+  try {
+    await runPhotoUpload(req, res);
+  } catch (err) {
+    return res.status(400).json({ message: err.message || "Photo upload failed" });
+  }
+
+  const uploadedPhotoPath = req.file ? req.file.path : null;
+
   try {
     const pool = req.pool;
 
@@ -28,7 +41,13 @@ router.post("/student", async (req, res) => {
 
     // ✅ VALIDATION
     if (!name || !admissionNo || !studentClass || !gender || !yearOfStudy) {
+      if (uploadedPhotoPath) fs.unlink(uploadedPhotoPath, () => {});
       return res.status(400).json({ message: "All fields required" });
+    }
+
+    // ✅ PROFILE PHOTO REQUIRED
+    if (!req.file) {
+      return res.status(400).json({ message: "A profile photo is required" });
     }
 
     // ✅ CHECK DUPLICATE
@@ -37,6 +56,7 @@ router.post("/student", async (req, res) => {
       .query(`SELECT id FROM Students WHERE admissionNo = @admissionNo`);
 
     if (exists.recordset.length > 0) {
+      fs.unlink(uploadedPhotoPath, () => {});
       return res.status(400).json({ message: "Student already exists" });
     }
 
@@ -44,6 +64,7 @@ router.post("/student", async (req, res) => {
     const username = admissionNo;
     const plainPassword = generatePassword();
     const hashedPassword = await bcrypt.hash(plainPassword, 10);
+    const photoUrl = photoUrlFor(req.file.filename);
 
     // ================= INSERT =================
     await pool.request()
@@ -55,11 +76,12 @@ router.post("/student", async (req, res) => {
       .input("username", username)
       .input("password", hashedPassword)
       .input("role", "student")
+      .input("photoUrl", photoUrl)
       .query(`
         INSERT INTO Students 
-        (name, admissionNo, studentClass, gender, yearOfStudy, status, username, password, role, mustChangePassword)
+        (name, admissionNo, studentClass, gender, yearOfStudy, status, username, password, role, mustChangePassword, photoUrl)
         VALUES 
-        (@name, @admissionNo, @studentClass, @gender, @yearOfStudy, 'active', @username, @password, @role, 1)
+        (@name, @admissionNo, @studentClass, @gender, @yearOfStudy, 'active', @username, @password, @role, 1, @photoUrl)
       `);
 
     res.status(201).json({
@@ -71,6 +93,7 @@ router.post("/student", async (req, res) => {
     });
 
   } catch (err) {
+    if (uploadedPhotoPath) deletePhotoByUrl(uploadedPhotoPath);
     console.log("REGISTER STUDENT ERROR:", err);
     res.status(500).json({ message: "Server error" });
   }
@@ -81,17 +104,32 @@ router.post("/student", async (req, res) => {
 ========================================================= */
 router.post("/teacher", async (req, res) => {
   try {
+    await runPhotoUpload(req, res);
+  } catch (err) {
+    return res.status(400).json({ message: err.message || "Photo upload failed" });
+  }
+
+  const uploadedPhotoPath = req.file ? req.file.path : null;
+
+  try {
     const pool = req.pool;
 
     const { name, subject, phone, staffId } = req.body;
 
     // ✅ VALIDATION
     if (!name || !subject || !phone || !staffId) {
+      if (uploadedPhotoPath) fs.unlink(uploadedPhotoPath, () => {});
       return res.status(400).json({ message: "All fields required" });
+    }
+
+    // ✅ PROFILE PHOTO REQUIRED
+    if (!req.file) {
+      return res.status(400).json({ message: "A profile photo is required" });
     }
 
     // 📱 Kenyan phone validation
     if (!/^(\+254|0)[7-9]\d{8}$/.test(phone)) {
+      fs.unlink(uploadedPhotoPath, () => {});
       return res.status(400).json({ message: "Invalid phone number" });
     }
 
@@ -101,6 +139,7 @@ router.post("/teacher", async (req, res) => {
       .query(`SELECT id FROM Teachers WHERE staffId = @staffId`);
 
     if (exists.recordset.length > 0) {
+      fs.unlink(uploadedPhotoPath, () => {});
       return res.status(400).json({ message: "Teacher already exists" });
     }
 
@@ -108,6 +147,7 @@ router.post("/teacher", async (req, res) => {
     const username = staffId;
     const plainPassword = generatePassword();
     const hashedPassword = await bcrypt.hash(plainPassword, 10);
+    const photoUrl = photoUrlFor(req.file.filename);
 
     // ================= INSERT =================
     await pool.request()
@@ -118,11 +158,12 @@ router.post("/teacher", async (req, res) => {
       .input("username", username)
       .input("password", hashedPassword)
       .input("role", "teacher")
+      .input("photoUrl", photoUrl)
       .query(`
         INSERT INTO Teachers 
-        (name, subject, phone, staffId, username, password, role, mustChangePassword)
+        (name, subject, phone, staffId, username, password, role, mustChangePassword, photoUrl)
         VALUES 
-        (@name, @subject, @phone, @staffId, @username, @password, @role, 1)
+        (@name, @subject, @phone, @staffId, @username, @password, @role, 1, @photoUrl)
       `);
 
     res.status(201).json({
@@ -134,6 +175,7 @@ router.post("/teacher", async (req, res) => {
     });
 
   } catch (err) {
+    if (uploadedPhotoPath) deletePhotoByUrl(uploadedPhotoPath);
     console.log("REGISTER TEACHER ERROR:", err);
     res.status(500).json({ message: "Server error" });
   }

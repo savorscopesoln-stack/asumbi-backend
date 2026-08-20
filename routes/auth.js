@@ -153,6 +153,7 @@ if (!user) {
         permissions,
         source,
         subject: user.subject || null,
+        photoUrl: user.photoUrl || null,
         mustChangePassword,
       }
     });
