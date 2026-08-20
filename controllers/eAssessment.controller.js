@@ -1,6 +1,7 @@
 const sql = require("mssql");
 const crypto = require("crypto");
 const jwt = require("jsonwebtoken");
+const { notifyUsers, notifyOne } = require("../utils/notify");
 
 /* =========================================================================
    HELPERS
@@ -26,7 +27,7 @@ const generateToken = () => {
 const createEAssessment = async (req, res) => {
   try {
     const pool = req.pool;
-    const { title, subject, class_id, duration_minutes, instructions, total_marks, exam_password } = req.body;
+    const { title, subject, class_id, duration_minutes, instructions, total_marks, exam_password, questions_deadline, question_setter_teacher_ids } = req.body;
     const teacher_id = req.user?.id || null;
 
     if (!title || !subject || !class_id) {
@@ -42,15 +43,32 @@ const createEAssessment = async (req, res) => {
       .input("total_marks", sql.Int, total_marks || 100)
       .input("instructions", sql.NVarChar, instructions || "")
       .input("exam_password", sql.NVarChar, (exam_password || "").trim() || null)
+      .input("questions_deadline", sql.DateTime, questions_deadline ? new Date(questions_deadline) : null)
       .query(`
         INSERT INTO e_assessments
-          (title, subject, class_id, teacher_id, duration_minutes, total_marks, instructions, status, exam_password)
+          (title, subject, class_id, teacher_id, duration_minutes, total_marks, instructions, status, exam_password, questions_deadline)
         OUTPUT INSERTED.id
         VALUES
-          (@title, @subject, @class_id, @teacher_id, @duration_minutes, @total_marks, @instructions, 'pending', @exam_password)
+          (@title, @subject, @class_id, @teacher_id, @duration_minutes, @total_marks, @instructions, 'pending', @exam_password, @questions_deadline)
       `);
 
-    res.status(201).json({ success: true, assessment_id: result.recordset[0].id });
+    const assessmentId = result.recordset[0].id;
+
+    if (Array.isArray(question_setter_teacher_ids)) {
+      for (const tId of question_setter_teacher_ids) {
+        const tid = toInt(tId);
+        if (!tid) continue;
+        await pool.request()
+          .input("e_assessment_id", sql.Int, assessmentId)
+          .input("teacher_id", sql.Int, tid)
+          .query(`
+            INSERT INTO e_assessment_question_setters (e_assessment_id, teacher_id)
+            VALUES (@e_assessment_id, @teacher_id)
+          `);
+      }
+    }
+
+    res.status(201).json({ success: true, assessment_id: assessmentId });
   } catch (err) {
     console.error("CREATE E-ASSESSMENT ERROR:", err);
     res.status(500).json({ message: "Create assessment failed" });
@@ -60,7 +78,7 @@ const updateEAssessment = async (req, res) => {
   try {
     const pool = req.pool;
     const id = toInt(req.params.id);
-    const { title, subject, class_id, duration_minutes, instructions, total_marks, exam_password } = req.body;
+    const { title, subject, class_id, duration_minutes, instructions, total_marks, exam_password, questions_deadline, question_setter_teacher_ids } = req.body;
 
     if (!id) return res.status(400).json({ message: "Invalid assessment ID" });
     if (!title || !subject || !class_id) {
@@ -82,6 +100,7 @@ const updateEAssessment = async (req, res) => {
       .input("total_marks", sql.Int, total_marks || 100)
       .input("instructions", sql.NVarChar, instructions || "")
       .input("exam_password", sql.NVarChar, (exam_password || "").trim() || null)
+      .input("questions_deadline", sql.DateTime, questions_deadline ? new Date(questions_deadline) : null)
       .query(`
         UPDATE e_assessments
         SET title = @title,
@@ -90,9 +109,29 @@ const updateEAssessment = async (req, res) => {
             duration_minutes = @duration_minutes,
             total_marks = @total_marks,
             instructions = @instructions,
-            exam_password = @exam_password
+            exam_password = @exam_password,
+            questions_deadline = @questions_deadline
         WHERE id = @id
       `);
+
+    // Only touch the setter list when the caller explicitly sent one —
+    // an array (including empty, to clear it) replaces the list; omitting
+    // the field entirely leaves the existing assignments untouched.
+    if (Array.isArray(question_setter_teacher_ids)) {
+      await pool.request().input("id", sql.Int, id)
+        .query(`DELETE FROM e_assessment_question_setters WHERE e_assessment_id = @id`);
+      for (const tId of question_setter_teacher_ids) {
+        const tid = toInt(tId);
+        if (!tid) continue;
+        await pool.request()
+          .input("e_assessment_id", sql.Int, id)
+          .input("teacher_id", sql.Int, tid)
+          .query(`
+            INSERT INTO e_assessment_question_setters (e_assessment_id, teacher_id)
+            VALUES (@e_assessment_id, @teacher_id)
+          `);
+      }
+    }
 
     res.json({ success: true, message: "Assessment updated successfully" });
   } catch (err) {
@@ -117,14 +156,17 @@ const getEAssessments = async (req, res) => {
 
     // A teacher must see: (a) assessments THEY created/own
     // (e_assessments.teacher_id, set from req.user.id in createEAssessment),
-    // AND (b) assessments they didn't create but where an admin (or another
+    // (b) assessments they didn't create but where an admin (or another
     // teacher) has assigned them one or more submissions to mark, via
-    // e_assessment_submission_assignments. Without part (b), a teacher who
-    // only grades — never authors — an assessment had no way to ever see it
-    // in their list, even though submissions were sitting in their queue.
-    // Admin and sub_admin still see everything (needed for review/approval),
-    // and students see everything for their class (redactForRole strips the
-    // exam password for them).
+    // e_assessment_submission_assignments, AND (c) assessments where the
+    // admin picked them as a permitted question-setter (e_assessment_
+    // question_setters) — this is the case that matters BEFORE any
+    // submissions exist yet, since a teacher can't be assigned a
+    // submission for an exam nobody has taken. Without (b)/(c) a teacher
+    // who isn't the creator has no way to ever find the assessment.
+    // Admin and sub_admin still see everything (needed for review/
+    // approval), and students see everything for their class
+    // (redactForRole strips the exam password for them).
     const isTeacher = req.user?.role === "teacher";
 
     const request = pool.request();
@@ -144,10 +186,29 @@ const getEAssessments = async (req, res) => {
               INNER JOIN e_assessment_submission_assignments aa
                 ON aa.submission_id = s.id AND aa.teacher_id = @teacherId
               WHERE s.e_assessment_id = ea.id
+            )
+         OR EXISTS (
+              SELECT 1 FROM e_assessment_question_setters qs
+              WHERE qs.e_assessment_id = ea.id AND qs.teacher_id = @teacherId
             )` : ""}
       ORDER BY ea.id DESC
     `);
     const rows = (result.recordset || []).map((r) => redactForRole(r, req.user?.role));
+
+    // Attach each assessment's permitted question-setter teacher ids
+    // (admin/sub_admin only need this — it's what pre-fills the "Teachers
+    // allowed to add questions" picker when they reopen Edit).
+    if (rows.length && (req.user?.role === "admin" || req.user?.role === "sub_admin")) {
+      const setterResult = await pool.request().query(`
+        SELECT e_assessment_id, teacher_id FROM e_assessment_question_setters
+      `);
+      const byAssessment = {};
+      for (const s of setterResult.recordset || []) {
+        (byAssessment[s.e_assessment_id] ||= []).push(s.teacher_id);
+      }
+      for (const r of rows) r.question_setter_teacher_ids = byAssessment[r.id] || [];
+    }
+
     res.json(rows);
   } catch (err) {
     console.error("GET ASSESSMENTS ERROR:", err);
@@ -342,6 +403,40 @@ const examLogin = async (req, res) => {
 /* =========================================================================
    QUESTIONS
 ========================================================================= */
+
+// Shared gate for add/update/delete question actions. Admin/sub_admin
+// always pass. A teacher passes only if they created the assessment
+// (legacy path) OR the admin explicitly picked them as a permitted
+// question-setter in e_assessment_question_setters. Returns
+// { ok: true } or { ok: false, status, message } for the caller to
+// respond with directly.
+async function canManageAssessmentQuestions(pool, req, e_assessmentId) {
+  const role = req.user?.role;
+  if (role === "admin" || role === "sub_admin") return { ok: true };
+
+  const teacherId = toInt(req.user?.id);
+  const result = await pool.request()
+    .input("id", sql.Int, e_assessmentId)
+    .input("teacherId", sql.Int, teacherId)
+    .query(`
+      SELECT
+        (SELECT teacher_id FROM e_assessments WHERE id = @id) AS owner_teacher_id,
+        (SELECT COUNT(*) FROM e_assessment_question_setters
+          WHERE e_assessment_id = @id AND teacher_id = @teacherId) AS is_setter
+    `);
+  const row = result.recordset[0];
+  if (!row || row.owner_teacher_id == null) {
+    return { ok: false, status: 404, message: "Assessment not found" };
+  }
+  if (row.owner_teacher_id === teacherId || row.is_setter > 0) {
+    return { ok: true };
+  }
+  return {
+    ok: false, status: 403,
+    message: "You have not been assigned to add questions to this assessment.",
+  };
+}
+
 const addEAssessmentQuestion = async (req, res) => {
   try {
     const pool = req.pool;
@@ -351,6 +446,27 @@ const addEAssessmentQuestion = async (req, res) => {
     if (!e_assessmentId || !question_text) {
       return res.status(400).json({ message: "Missing required fields" });
     }
+
+    const permission = await canManageAssessmentQuestions(pool, req, e_assessmentId);
+    if (!permission.ok) {
+      return res.status(permission.status).json({ message: permission.message });
+    }
+
+    // Enforce the admin-set "add questions by" deadline server-side —
+    // the frontend disables the button too, but that alone can always be
+    // bypassed by calling the API directly, so the real gate lives here.
+    const deadlineCheck = await pool.request().input("id", sql.Int, e_assessmentId)
+      .query(`SELECT questions_deadline FROM e_assessments WHERE id = @id`);
+    if (!deadlineCheck.recordset.length) {
+      return res.status(404).json({ message: "Assessment not found" });
+    }
+    const deadline = deadlineCheck.recordset[0].questions_deadline;
+    if (deadline && new Date(deadline) < new Date()) {
+      return res.status(403).json({
+        message: `The deadline to add questions to this assessment passed on ${new Date(deadline).toLocaleString()}.`,
+      });
+    }
+
     const type = question_type === "essay" ? "essay" : "mcq";
 
     const questionResult = await pool.request()
@@ -439,6 +555,16 @@ const updateQuestion = async (req, res) => {
     const { question_text, marks, correct_answer, marking_guide, essay_answer, options, question_type, time_limit } = req.body;
     const type = question_type === "essay" || question_type === "descriptive" ? "essay" : "mcq";
 
+    const parent = await pool.request().input("id", sql.Int, questionId)
+      .query(`SELECT e_assessment_id FROM e_assessment_questions WHERE id = @id`);
+    if (!parent.recordset.length) {
+      return res.status(404).json({ success: false, message: "Question not found" });
+    }
+    const permission = await canManageAssessmentQuestions(pool, req, parent.recordset[0].e_assessment_id);
+    if (!permission.ok) {
+      return res.status(permission.status).json({ success: false, message: permission.message });
+    }
+
     await pool.request()
       .input("id", sql.Int, questionId)
       .input("question_text", sql.NVarChar(sql.MAX), question_text)
@@ -482,6 +608,16 @@ const deleteQuestion = async (req, res) => {
     const pool = req.pool;
     const questionId = toInt(req.params.questionId);
     if (!questionId) return res.status(400).json({ success: false, message: "Invalid question ID" });
+
+    const parent = await pool.request().input("id", sql.Int, questionId)
+      .query(`SELECT e_assessment_id FROM e_assessment_questions WHERE id = @id`);
+    if (!parent.recordset.length) {
+      return res.status(404).json({ success: false, message: "Question not found" });
+    }
+    const permission = await canManageAssessmentQuestions(pool, req, parent.recordset[0].e_assessment_id);
+    if (!permission.ok) {
+      return res.status(permission.status).json({ success: false, message: permission.message });
+    }
 
     await pool.request().input("id", sql.Int, questionId).query(`DELETE FROM e_assessment_options WHERE question_id = @id`);
     await pool.request().input("id", sql.Int, questionId).query(`DELETE FROM e_assessment_answers WHERE question_id = @id`);
@@ -914,11 +1050,25 @@ const reviewAssessment = async (req, res) => {
     const { status, admin_comment } = req.body;
     if (!["approved", "rejected"].includes(status)) return res.status(400).json({ message: "Invalid status" });
 
+    const existing = await pool.request().input("id", sql.Int, assessmentId)
+      .query(`SELECT teacher_id, title FROM e_assessments WHERE id = @id`);
+
     await pool.request()
       .input("id", sql.Int, assessmentId)
       .input("status", sql.NVarChar, status)
       .input("admin_comment", sql.NVarChar, admin_comment || "")
       .query(`UPDATE e_assessments SET status = @status, admin_comment = @admin_comment WHERE id = @id`);
+
+    if (existing.recordset.length && existing.recordset[0].teacher_id) {
+      const { teacher_id, title } = existing.recordset[0];
+      await notifyOne(pool, teacher_id, "Teachers", {
+        title: status === "approved" ? "Assessment Approved" : "Assessment Rejected",
+        message: status === "approved"
+          ? `Your assessment "${title}" was approved and can now be activated for students.`
+          : `Your assessment "${title}" was rejected.${admin_comment ? ` Reason: ${admin_comment}` : ""}`,
+        type: "exam",
+      });
+    }
 
     res.json({ success: true, message: `Assessment ${status}` });
   } catch (err) {
@@ -933,12 +1083,32 @@ const toggleEAssessmentActive = async (req, res) => {
     const id = toInt(req.params.id);
 
     const current = await pool.request().input("id", sql.Int, id)
-      .query(`SELECT active_status FROM e_assessments WHERE id = @id`);
+      .query(`SELECT active_status, class_id, title FROM e_assessments WHERE id = @id`);
     if (!current.recordset.length) return res.status(404).json({ message: "Assessment not found" });
 
+    const { class_id, title } = current.recordset[0];
     const next = current.recordset[0].active_status === "Active" ? "Inactive" : "Active";
     await pool.request().input("id", sql.Int, id).input("active_status", sql.NVarChar(20), next)
       .query(`UPDATE e_assessments SET active_status = @active_status WHERE id = @id`);
+
+    if (next === "Active" && class_id) {
+      const students = await pool.request().input("classId", sql.Int, class_id)
+        .query(`
+          SELECT st.id
+          FROM Students st
+          JOIN Classes c ON c.id = @classId
+          WHERE st.studentClass = c.name
+        `);
+      await notifyUsers(
+        pool,
+        (students.recordset || []).map((s) => ({ id: s.id, source: "Students" })),
+        {
+          title: "Assessment Now Open",
+          message: `"${title}" is now open — you can take it from your E-Assessments page.`,
+          type: "exam",
+        }
+      );
+    }
 
     res.json({ success: true, active_status: next });
   } catch (err) {
@@ -1031,6 +1201,20 @@ const assignTeacher = async (req, res) => {
     await pool.request()
       .input("teacher_id", sql.Int, teacher_id).input("subject_id", sql.Int, subject_id).input("class_id", sql.Int, class_id)
       .query(`INSERT INTO TeacherSubjects (teacher_id, subject_id, class_id) VALUES (@teacher_id, @subject_id, @class_id)`);
+
+    const names = await pool.request()
+      .input("subject_id", sql.Int, subject_id).input("class_id", sql.Int, class_id)
+      .query(`
+        SELECT (SELECT name FROM Subjects WHERE id = @subject_id) AS subject_name,
+               (SELECT name FROM Classes  WHERE id = @class_id)  AS class_name
+      `);
+    const { subject_name, class_name } = names.recordset[0] || {};
+
+    await notifyOne(pool, teacher_id, "Teachers", {
+      title: "New Class Allocation",
+      message: `You've been allocated to teach ${subject_name || "a subject"} for ${class_name || "a class"}.`,
+      type: "allocation",
+    });
 
     res.json({ success: true, message: "Teacher assigned successfully" });
   } catch (err) {
@@ -1459,6 +1643,13 @@ const reviewRemarkRequest = async (req, res) => {
     const validStatuses = ["approved", "rejected", "revision", "pending"];
     if (!validStatuses.includes(status)) return res.status(400).json({ message: "Invalid status" });
 
+    const existing = await pool.request().input("id", sql.Int, id).query(`
+      SELECT s.student_id, a.title
+      FROM e_assessment_submissions s
+      LEFT JOIN e_assessments a ON a.id = s.e_assessment_id
+      WHERE s.id = @id
+    `);
+
     await pool.request()
       .input("id", sql.Int, id).input("status", sql.NVarChar(50), status)
       .input("admin_comment", sql.NVarChar(sql.MAX), admin_comment || "").query(`
@@ -1468,6 +1659,16 @@ const reviewRemarkRequest = async (req, res) => {
             reviewed_at = GETDATE()
         WHERE id = @id
       `);
+
+    if (existing.recordset.length && status !== "pending") {
+      const { student_id, title } = existing.recordset[0];
+      const statusLabel = { approved: "approved", rejected: "rejected", revision: "sent for revision" }[status] || status;
+      await notifyOne(pool, student_id, "Students", {
+        title: "Remark Request Update",
+        message: `Your remark request for "${title || "an assessment"}" was ${statusLabel}.${admin_comment ? ` ${admin_comment}` : ""}`,
+        type: "exam",
+      });
+    }
 
     res.json({ success: true, message: `Remark request ${status}` });
   } catch (err) {
@@ -1544,6 +1745,13 @@ WHERE s.id = @id
     `);
 
     await transaction.commit();
+
+    await notifyOne(pool, sub.student_id, "Students", {
+      title: "Exam Results Released",
+      message: `Your results for "${sub.title || "an assessment"}" have been released. Score: ${sub.score}/${sub.total_marks}.`,
+      type: "exam",
+    });
+
     res.json({ success: true, message: "Marks released successfully" });
   } catch (err) {
     console.error("RELEASE MARKS ERROR:", err);
@@ -1597,6 +1805,12 @@ const bulkReleaseMarks = async (req, res) => {
         `);
         await transaction.commit();
         released++;
+
+        await notifyOne(pool, sub.student_id, "Students", {
+          title: "Exam Results Released",
+          message: `Your results for "${sub.title || "an assessment"}" have been released. Score: ${sub.score}/${sub.total_marks}.`,
+          type: "exam",
+        });
       } catch (innerErr) {
         try { await transaction.rollback(); } catch (_) {}
         console.error("BULK RELEASE ITEM ERROR:", innerErr);

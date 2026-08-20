@@ -21,6 +21,39 @@ async function ensureSchema(pool, sql) {
       ALTER TABLE e_assessments ADD exam_password NVARCHAR(50) NULL
     `);
 
+    /* ---------------- e_assessment_question_setters ----------------
+       Admin picks, at create/edit time, exactly which teacher(s) are
+       allowed to add/edit/delete questions on an assessment — separate
+       from e_assessments.teacher_id (whoever's account created the row,
+       which for admin-created assessments is the admin's own id and
+       isn't a teacher at all). Enforced in addEAssessmentQuestion /
+       updateQuestion / deleteQuestion, and used to decide which teachers
+       see the assessment on their E-Assessments page. */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='e_assessment_question_setters' AND xtype='U')
+      CREATE TABLE e_assessment_question_setters (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        e_assessment_id INT NOT NULL,
+        teacher_id INT NOT NULL,
+        createdAt DATETIME NOT NULL DEFAULT GETDATE()
+      )
+    `);
+
+    /* ---------------- e_assessments.questions_deadline ----------------
+       Admin-set cutoff for when a teacher can still add/edit questions
+       on an assessment. NULL = no deadline (always open), matching prior
+       behavior for existing rows. Enforced server-side in
+       addEAssessmentQuestion; the frontend also disables the "Add
+       Questions" button once this has passed. */
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='e_assessments' AND xtype='U')
+      AND NOT EXISTS (
+        SELECT * FROM sys.columns
+        WHERE Name = N'questions_deadline' AND Object_ID = Object_ID(N'e_assessments')
+      )
+      ALTER TABLE e_assessments ADD questions_deadline DATETIME NULL
+    `);
+
     /* ---------------- Notifications table ---------------- */
     await pool.request().query(`
       IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='Notifications' AND xtype='U')
@@ -129,7 +162,35 @@ async function ensureSchema(pool, sql) {
       UPDATE Users SET role = 'sub_admin' WHERE LOWER(role) = 'staff'
     `);
 
-    console.log("✅ Schema check complete (Notifications, leave_outs.leave_type, mustChangePassword, Users.permissions, staff→sub_admin migration)");
+    /* ---------------- ScheduledNotifications table ----------------
+       Backs the admin "Notifications" broadcast page: pick a set of
+       recipients (everyone / all students / all teachers / admins /
+       one class / hand-picked accounts), a message, which channels to
+       fan it out over (in-app, email, SMS, WhatsApp), and either send
+       right away or schedule it for later. A background tick in
+       utils/notificationScheduler.js sweeps for due rows. */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='ScheduledNotifications' AND xtype='U')
+      CREATE TABLE ScheduledNotifications (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        title NVARCHAR(200) NULL,
+        message NVARCHAR(MAX) NOT NULL,
+        channels NVARCHAR(200) NOT NULL DEFAULT '["in_app"]',
+        recipientType NVARCHAR(30) NOT NULL,
+        recipientIds NVARCHAR(MAX) NULL,
+        studentClass NVARCHAR(50) NULL,
+        scheduledFor DATETIME NULL,
+        status NVARCHAR(20) NOT NULL DEFAULT 'pending',
+        recipientCount INT NULL,
+        resultSummary NVARCHAR(MAX) NULL,
+        createdBy INT NULL,
+        createdBySource NVARCHAR(20) NULL,
+        createdAt DATETIME NOT NULL DEFAULT GETDATE(),
+        sentAt DATETIME NULL
+      )
+    `);
+
+    console.log("✅ Schema check complete (Notifications, ScheduledNotifications, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, mustChangePassword, Users.permissions, staff→sub_admin migration)");
   } catch (err) {
     console.error("⚠️  Schema ensure failed:", err.message);
   }

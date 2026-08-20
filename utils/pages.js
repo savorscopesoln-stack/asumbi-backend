@@ -26,6 +26,7 @@ const PAGE_KEYS = [
   "AttendanceReport",
   "Reports",
   "Graduation",
+  "Notifications",
 ];
 
 /* Keep only valid, de-duplicated page keys from whatever was submitted. */

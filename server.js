@@ -33,6 +33,9 @@ const feesRoutes = require("./routes/fees");
 const leaveRoutes = require("./routes/leave");
 const searchRoutes = require("./routes/searchRecords");
 const notificationsRoutes = require("./routes/notifications");
+const broadcastNotificationsRoutes = require("./routes/broadcastNotifications");
+const { dispatchBroadcast } = require("./controllers/broadcastNotification.controller");
+const { startNotificationScheduler } = require("./utils/notificationScheduler");
 
 /* =========================================================
    APP INIT
@@ -142,7 +145,12 @@ app.use("/api/fees", protect, feesRoutes);
 app.use("/api/leave", protect, leaveRoutes);
 app.use("/api/search", protect, searchRoutes);
 app.use("/api/notifications", protect, notificationsRoutes);
+app.use("/api/broadcast-notifications", protect, requirePage("Notifications"), broadcastNotificationsRoutes);
 app.use("/", metaRoutes);
+
+// Sweeps ScheduledNotifications once a minute for anything due and sends
+// it out over its configured channels (in-app / email / SMS / WhatsApp).
+startNotificationScheduler(poolPromise, io, dispatchBroadcast);
 
 /* =========================================================
    CLASSES
