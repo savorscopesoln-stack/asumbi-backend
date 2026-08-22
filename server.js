@@ -134,7 +134,13 @@ const toInt = (val) => {
   const n = parseInt(val, 10);
   return isNaN(n) ? null : n;
 };
-
+app.get("/api/health", (req, res) => {
+  res.status(200).json({
+    status: "ok",
+    message: "Asumbi backend is running",
+    timestamp: new Date().toISOString()
+  });
+});
 /* =========================================================
    HEALTH CHECK (unauthenticated, for uptime monitors)
 ========================================================= */

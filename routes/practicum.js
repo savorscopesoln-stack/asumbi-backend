@@ -402,6 +402,98 @@ router.get("/", async (req, res) => {
   }
 });
 
+/* ============================================================================
+   TEACHER-FACING VIEWS
+   The Teacher Portal's Practicum page only ever needs to see the students
+   THAT teacher is supervising — never the coordinator's full manage/deploy
+   tooling. These two endpoints keep that scoped down to just the teacher's
+   own sessionId, mirroring the same row shape /report/:sessionId already
+   uses (so the frontend can reuse the same grouping/rendering logic).
+============================================================================ */
+
+// Every session this teacher has at least one assignment in, with a count
+// of how many students they're supervising in each — powers the session
+// picker on the teacher's Practicum page.
+router.get("/teacher/:teacherId/sessions", async (req, res) => {
+  try {
+    const pool = req.pool;
+    const result = await pool.request()
+      .input("teacherId", req.params.teacherId)
+      .query(`
+        SELECT ps.id, ps.title, ps.date, ps.term, COUNT(a.id) AS studentCount
+        FROM PracticumAssignments a
+        JOIN PracticumSessions ps ON ps.id = a.sessionId
+        WHERE a.teacherId = @teacherId
+        GROUP BY ps.id, ps.title, ps.date, ps.term
+        ORDER BY ps.id DESC
+      `);
+    res.json(result.recordset);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json([]);
+  }
+});
+
+// This teacher's assigned students for one session, each with their day,
+// school/region, deployment date, and their 6 assessment rows (score,
+// remarks, assessedDate) — everything the Assignments tab needs to render
+// and everything Assessments needs to edit, in one round trip.
+router.get("/teacher/:teacherId/assignments", async (req, res) => {
+  try {
+    const pool = req.pool;
+    const { sessionId } = req.query;
+    if (!sessionId) return res.status(400).json({ error: "sessionId is required" });
+
+    const teacherRes = await pool.request()
+      .input("teacherId", req.params.teacherId)
+      .query(`SELECT id, name, researchDay FROM Teachers WHERE id = @teacherId`);
+
+    const rowsRes = await pool.request()
+      .input("teacherId", req.params.teacherId)
+      .input("sessionId", sessionId)
+      .query(`
+        SELECT
+          a.id AS assignmentId, a.day, a.deployDate, a.isExtra,
+          s.id AS studentId, s.name AS studentName,
+          sc.name AS schoolName, r.name AS regionName
+        FROM PracticumAssignments a
+        JOIN Students s ON s.id = a.studentId
+        LEFT JOIN Schools sc ON sc.id = a.schoolId
+        LEFT JOIN Regions r ON r.id = a.regionId
+        WHERE a.teacherId = @teacherId AND a.sessionId = @sessionId
+        ORDER BY r.name, sc.name, s.name
+      `);
+
+    const assignmentIds = rowsRes.recordset.map((r) => r.assignmentId);
+    let assessmentsByAssignment = {};
+    if (assignmentIds.length) {
+      const idList = assignmentIds.join(",");
+      const assessRes = await pool.request().query(`
+        SELECT * FROM PracticumAssessments
+        WHERE assignmentId IN (${idList})
+        ORDER BY assignmentId, assessmentNumber
+      `);
+      assessmentsByAssignment = assessRes.recordset.reduce((acc, row) => {
+        (acc[row.assignmentId] ||= []).push(row);
+        return acc;
+      }, {});
+    }
+
+    const rows = rowsRes.recordset.map((r) => ({
+      ...r,
+      assessments: assessmentsByAssignment[r.assignmentId] || [],
+    }));
+
+    res.json({
+      teacher: teacherRes.recordset[0] || null,
+      rows,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to load teacher assignments" });
+  }
+});
+
 router.put("/:sessionId", async (req, res) => {
   try {
     const pool = req.pool;

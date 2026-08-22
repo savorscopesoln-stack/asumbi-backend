@@ -33,7 +33,8 @@ router.post("/verify", authorize(...GATE_STAFF_ROLES), async (req, res) => {
     if (!code) return res.status(400).json({ message: "Code is required" });
 
     const result = await pool.request().input("code", sql.NVarChar, code).query(`
-      SELECT lo.id, lo.student_id, lo.leave_type, lo.exit_time, lo.reentry_time,
+      SELECT lo.id, lo.student_id, lo.leave_type, lo.reason, lo.duration,
+             lo.exit_time, lo.reentry_time,
              s.name AS student_name, s.admissionNo, s.studentClass
       FROM leave_outs lo
       LEFT JOIN Students s ON s.id = lo.student_id
@@ -53,15 +54,24 @@ router.post("/verify", authorize(...GATE_STAFF_ROLES), async (req, res) => {
       });
     }
 
+    // Captured explicitly (instead of relying on GETDATE()) so the exact
+    // same timestamp we just wrote to the DB is also what we hand back to
+    // the frontend for the printable pass — no round trip / clock drift
+    // between "what we saved" and "what we show".
+    const now = new Date();
+
     if (!leave.exit_time) {
       await pool.request()
         .input("id", sql.Int, leave.id)
         .input("name", sql.NVarChar, actorName)
+        .input("exitTime", sql.DateTime, now)
         .query(`
           UPDATE leave_outs
-          SET exit_time = GETDATE(), exit_verified_by_name = @name, gate_status = 'out'
+          SET exit_time = @exitTime, exit_verified_by_name = @name, gate_status = 'out'
           WHERE id = @id
         `);
+
+      const expectedReturn = new Date(now.getTime() + (leave.duration || 0) * 60000);
 
       return res.json({
         action: "exit",
@@ -70,17 +80,35 @@ router.post("/verify", authorize(...GATE_STAFF_ROLES), async (req, res) => {
         admissionNo: leave.admissionNo,
         studentClass: leave.studentClass,
         leave_type: leave.leave_type,
+        leave: {
+          id: leave.id,
+          gate_code: code,
+          reason: leave.reason,
+          leave_type: leave.leave_type,
+          duration: leave.duration,
+          student_name: leave.student_name,
+          admissionNo: leave.admissionNo,
+          studentClass: leave.studentClass,
+          exit_time: now.toISOString(),
+          expected_return: expectedReturn.toISOString(),
+          verified_by: actorName,
+        },
       });
     }
 
     await pool.request()
       .input("id", sql.Int, leave.id)
       .input("name", sql.NVarChar, actorName)
+      .input("reentryTime", sql.DateTime, now)
       .query(`
         UPDATE leave_outs
-        SET reentry_time = GETDATE(), reentry_verified_by_name = @name, gate_status = 'returned'
+        SET reentry_time = @reentryTime, reentry_verified_by_name = @name, gate_status = 'returned'
         WHERE id = @id
       `);
+
+    const expectedReturn = leave.exit_time
+      ? new Date(new Date(leave.exit_time).getTime() + (leave.duration || 0) * 60000)
+      : null;
 
     return res.json({
       action: "reentry",
@@ -89,6 +117,21 @@ router.post("/verify", authorize(...GATE_STAFF_ROLES), async (req, res) => {
       admissionNo: leave.admissionNo,
       studentClass: leave.studentClass,
       leave_type: leave.leave_type,
+      leave: {
+        id: leave.id,
+        gate_code: code,
+        reason: leave.reason,
+        leave_type: leave.leave_type,
+        duration: leave.duration,
+        student_name: leave.student_name,
+        admissionNo: leave.admissionNo,
+        studentClass: leave.studentClass,
+        exit_time: leave.exit_time,
+        reentry_time: now.toISOString(),
+        expected_return: expectedReturn ? expectedReturn.toISOString() : null,
+        returned_late: expectedReturn ? now > expectedReturn : false,
+        verified_by: actorName,
+      },
     });
   } catch (err) {
     console.error("GATE VERIFY ERROR:", err);
@@ -109,7 +152,7 @@ router.get("/report", authorize(...GATE_STAFF_ROLES), async (req, res) => {
     const date = req.query.date || new Date().toISOString().slice(0, 10);
 
     const result = await pool.request().input("date", sql.Date, date).query(`
-      SELECT lo.id, lo.leave_type, lo.reason, lo.gate_code, lo.gate_status,
+      SELECT lo.id, lo.leave_type, lo.reason, lo.duration, lo.gate_code, lo.gate_status,
              lo.exit_time, lo.exit_verified_by_name,
              lo.reentry_time, lo.reentry_verified_by_name,
              s.name AS student_name, s.admissionNo, s.studentClass
