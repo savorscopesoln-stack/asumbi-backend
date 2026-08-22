@@ -1,9 +1,126 @@
 const express = require("express");
+const sql = require("mssql");
 const router = express.Router();
 const { notifyUsers } = require("../utils/notify");
 
 // A teacher assesses at most this many trainees in one sitting/day.
 const MAX_PER_TEACHER = 7;
+
+// Weekday-name -> real calendar date helpers (server-side mirror of the
+// frontend's date helpers). Used to stamp a deployment with the actual
+// date it goes into effect, so date-based reports don't have to guess.
+const WEEKDAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+function nextDateForWeekday(weekdayName, fromDate = new Date()) {
+  const targetIndex = WEEKDAY_NAMES.indexOf(weekdayName);
+  if (targetIndex === -1) return null;
+  const from = new Date(fromDate);
+  from.setHours(0, 0, 0, 0);
+  const diff = (targetIndex - from.getDay() + 7) % 7;
+  const result = new Date(from);
+  result.setDate(from.getDate() + diff);
+  return result;
+}
+
+/* ============================================================================
+   BULK ASSIGNMENT INSERT — used by both auto-assign and deploy.
+
+   The old code fired one pool.request() PER STUDENT (assignment insert +
+   6 assessment inserts), all in parallel via Promise.all. That's what was
+   actually making auto-assign/deploy "slow and doesn't finish":
+     - The pool only has 10 connections (backend/config/db.js), so for any
+       region/session bigger than ~10 students, most of those requests just
+       queued up waiting for a free connection instead of running.
+     - Dozens-to-hundreds of concurrent INSERTs against the same two tables
+       cause SQL Server lock contention and, under real load, deadlocks —
+       one request gets killed as the deadlock victim, Promise.all rejects
+       immediately, and everything else in flight is abandoned. Because none
+       of this ran in a transaction, whatever had already committed stayed
+       committed, leaving a half-deployed session with no clean way to
+       retry (re-running would try to insert duplicates for whoever *did*
+       make it in).
+
+   Fixed by doing the whole deploy/auto-assign as ONE transaction with a
+   small, fixed number of round trips: a handful of multi-row INSERT
+   statements (chunked to stay under SQL Server's ~2100-parameter limit)
+   instead of one round trip per student. If anything fails, the
+   transaction rolls back completely — no partial deployments — and it's
+   safe to just retry.
+============================================================================ */
+const ASSIGNMENT_COLS = [
+  { name: "sessionId", type: sql.Int },
+  { name: "teacherId", type: sql.Int },
+  { name: "studentId", type: sql.Int },
+  { name: "schoolId", type: sql.Int },
+  { name: "regionId", type: sql.Int },
+  { name: "day", type: sql.NVarChar(50) },
+  // Real calendar date this deployment goes into effect (nullable — see
+  // note above ASSIGNMENT_COLS's old definition; auto-assign's numeric
+  // "day 1/2/3..." rows don't have a real date, so this stays NULL there).
+  { name: "deployDate", type: sql.Date },
+  // Distinguishes a one-off "extra day" deployment from a standing
+  // weekly research-day deployment — needed so date-based reports can
+  // tell the two apart instead of guessing from the weekday alone.
+  { name: "isExtra", type: sql.Bit },
+];
+const CHUNK_SIZE = 250; // 250 rows * 8 params/row = 2000 params, safely under the 2100 limit
+
+function chunk(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+// Inserts PracticumAssignments + their 6 PracticumAssessments rows each,
+// in batches, inside the given transaction. Returns the new assignment IDs.
+async function bulkInsertAssignments(transaction, rows) {
+  const assignmentIds = [];
+
+  for (const batch of chunk(rows, CHUNK_SIZE)) {
+    const request = new sql.Request(transaction);
+    const valuesSql = batch
+      .map((row, i) => {
+        ASSIGNMENT_COLS.forEach(({ name, type }) =>
+          request.input(`${name}${i}`, type, row[name] === undefined ? null : row[name])
+        );
+        return `(@sessionId${i}, @teacherId${i}, @studentId${i}, @schoolId${i}, @regionId${i}, @day${i}, @deployDate${i}, @isExtra${i})`;
+      })
+      .join(",\n        ");
+
+    const result = await request.query(`
+      INSERT INTO PracticumAssignments (sessionId, teacherId, studentId, schoolId, regionId, day, deployDate, isExtra)
+      OUTPUT INSERTED.id
+      VALUES
+        ${valuesSql};
+    `);
+    // Multi-row INSERT...OUTPUT returns rows in insertion order.
+    result.recordset.forEach((r) => assignmentIds.push(r.id));
+  }
+
+  const assessmentRows = [];
+  for (const assignmentId of assignmentIds) {
+    for (let n = 1; n <= 6; n++) assessmentRows.push({ assignmentId, assessmentNumber: n });
+  }
+
+  for (const batch of chunk(assessmentRows, CHUNK_SIZE * 3)) {
+    const request = new sql.Request(transaction);
+    const valuesSql = batch
+      .map((row, i) => {
+        request.input(`assignmentId${i}`, row.assignmentId);
+        request.input(`assessmentNumber${i}`, row.assessmentNumber);
+        return `(@assignmentId${i}, @assessmentNumber${i})`;
+      })
+      .join(",\n        ");
+
+    await request.query(`
+      INSERT INTO PracticumAssessments (assignmentId, assessmentNumber)
+      VALUES
+        ${valuesSql};
+    `);
+  }
+
+  return assignmentIds;
+}
 
 /* ============================================================================
    META — regions, schools, teachers, students in a single round trip
@@ -331,6 +448,7 @@ router.delete("/:sessionId", async (req, res) => {
 router.post("/auto-assign/:sessionId", async (req, res) => {
   const pool = req.pool;
   const sessionId = req.params.sessionId;
+  const transaction = new sql.Transaction(pool);
 
   try {
     const [teachersRes, studentsRes, existingRes] = await Promise.all([
@@ -394,29 +512,20 @@ router.post("/auto-assign/:sessionId", async (req, res) => {
           schoolId: student.schoolId,
           regionId: group.regionId,
           day,
+          deployDate: null, // auto-assign uses session day numbers (1,2,3...), not a real weekday/date
+          isExtra: false,
         });
       });
     });
 
-    await Promise.all(
-  rows.map((row) =>
-    pool.request()
-      .input("sessionId", row.sessionId)
-      .input("teacherId", row.teacherId)
-      .input("studentId", row.studentId)
-      .input("schoolId", row.schoolId)
-      .input("regionId", row.regionId)
-      .input("day", row.day)
-      .query(`
-        INSERT INTO PracticumAssignments (sessionId, teacherId, studentId, schoolId, regionId, day)
-        VALUES (@sessionId, @teacherId, @studentId, @schoolId, @regionId, @day);
-        DECLARE @newAssignmentId INT = SCOPE_IDENTITY();
-        INSERT INTO PracticumAssessments (assignmentId, assessmentNumber)
-        VALUES (@newAssignmentId,1),(@newAssignmentId,2),(@newAssignmentId,3),
-               (@newAssignmentId,4),(@newAssignmentId,5),(@newAssignmentId,6);
-      `)
-  )
-);
+    await transaction.begin();
+    try {
+      await bulkInsertAssignments(transaction, rows);
+      await transaction.commit();
+    } catch (err) {
+      await transaction.rollback();
+      throw err;
+    }
 
     const notifiedTeacherIds = new Set(rows.map((r) => r.teacherId));
     const notifiedStudentIds = new Set(rows.map((r) => r.studentId));
@@ -463,7 +572,7 @@ router.get("/assign/:sessionId", async (req, res) => {
       .input("sessionId", req.params.sessionId)
       .query(`
         SELECT
-          a.id AS assignmentId, a.day,
+          a.id AS assignmentId, a.day, a.deployDate, a.isExtra,
           t.id AS teacherId, t.name AS teacherName,
           s.id AS studentId, s.name AS studentName,
           sc.name AS schoolName, r.name AS regionName
@@ -483,13 +592,55 @@ router.get("/assign/:sessionId", async (req, res) => {
 });
 
 // Manual override — reassign one student to a different teacher.
+// Manual override — reassign one student to a different teacher.
+// If the destination teacher is already at (or over) the MAX_PER_TEACHER
+// cap for that day, this is a "manual addition" beyond the normal
+// auto-assign/deploy limit, and — per the practicum policy — only an
+// admin is allowed to do that. Sub-admins with Practicum access can
+// still reassign freely as long as the destination teacher stays within
+// the cap.
 router.put("/assign/:assignmentId", async (req, res) => {
   try {
     const pool = req.pool;
     const { teacherId } = req.body;
+    const assignmentId = req.params.assignmentId;
+
+    if (!teacherId) {
+      return res.status(400).json({ error: "teacherId is required" });
+    }
+
+    const currentRes = await pool.request()
+      .input("id", assignmentId)
+      .query(`SELECT sessionId, day, teacherId FROM PracticumAssignments WHERE id = @id`);
+    const current = currentRes.recordset[0];
+    if (!current) {
+      return res.status(404).json({ error: "Assignment not found" });
+    }
+
+    // Only check the cap when this actually moves the student to a
+    // DIFFERENT teacher — reassigning to the same teacher is a no-op.
+    if (String(teacherId) !== String(current.teacherId)) {
+      const countRes = await pool.request()
+        .input("sessionId", current.sessionId)
+        .input("day", current.day)
+        .input("teacherId", teacherId)
+        .query(`
+          SELECT COUNT(*) AS cnt
+          FROM PracticumAssignments
+          WHERE sessionId = @sessionId AND day = @day AND teacherId = @teacherId
+        `);
+      const destinationCount = countRes.recordset[0]?.cnt || 0;
+
+      const requesterRole = String(req.user?.role || "").toLowerCase().trim();
+      if (destinationCount >= MAX_PER_TEACHER && requesterRole !== "admin") {
+        return res.status(403).json({
+          error: `That teacher already has ${destinationCount}/${MAX_PER_TEACHER} trainees for this day. Only an admin can manually add beyond the cap.`,
+        });
+      }
+    }
 
     await pool.request()
-      .input("id", req.params.assignmentId)
+      .input("id", assignmentId)
       .input("teacherId", teacherId)
       .query(`UPDATE PracticumAssignments SET teacherId = @teacherId WHERE id = @id`);
 
@@ -529,7 +680,8 @@ router.delete("/assign/session/:sessionId", async (req, res) => {
 });
 router.post("/deploy", async (req, res) => {
   const pool = req.pool;
-  const { sessionId, regionId, isExtra, day, teacherIds } = req.body;
+  const { sessionId, regionId, isExtra, day, date, teacherIds } = req.body;
+  const transaction = new sql.Transaction(pool);
 
   try {
     if (!sessionId || !regionId || !Array.isArray(teacherIds) || !teacherIds.length) {
@@ -537,6 +689,19 @@ router.post("/deploy", async (req, res) => {
     }
     if (isExtra && !day) {
       return res.status(400).json({ error: "A day is required for an extra deployment" });
+    }
+
+    // The exact one-off calendar date for an extra deployment, if the
+    // caller supplied one (yyyy-mm-dd from a <input type="date">).
+    // Falls back to the next upcoming date for the chosen weekday.
+    let extraDate = null;
+    if (isExtra) {
+      if (date) {
+        const parsed = new Date(`${date}T00:00:00`);
+        extraDate = Number.isNaN(parsed.getTime()) ? nextDateForWeekday(day) : parsed;
+      } else {
+        extraDate = nextDateForWeekday(day);
+      }
     }
 
     const teachersRes = await pool.request()
@@ -562,15 +727,7 @@ router.post("/deploy", async (req, res) => {
       return res.status(400).json({ error: "No students found in this region's schools" });
     }
 
-    // Overwrite: clear any existing assignments for these students in this session
     const studentIds = students.map((s) => Number(s.id)).filter(Number.isInteger);
-    await pool.request()
-      .input("sessionId", sessionId)
-      .query(`
-        DELETE FROM PracticumAssignments
-        WHERE sessionId = @sessionId
-        AND studentId IN (${studentIds.join(",")})
-      `);
 
     // Bucket into groups of MAX_PER_TEACHER, same school first
     const groups = [];
@@ -585,41 +742,46 @@ router.post("/deploy", async (req, res) => {
     if (bucket.length) groups.push(bucket);
 
     // Round-robin groups across the deployed teachers; each teacher's day is
-    // their own research day, or the shared extra day if this is an extra deployment
+    // their own research day, or the shared extra day if this is an extra deployment.
+    // deployDate is the real calendar date this specific deployment goes into
+    // effect: for a research day it's the next upcoming occurrence of that
+    // weekday (the standing arrangement then continues weekly from there —
+    // see the isExtra flag below, which is what date-based reports use to
+    // decide whether to treat a row as "every week" or "this date only").
     const rows = [];
     groups.forEach((group, i) => {
       const teacher = teachers[i % teachers.length];
       const teacherDay = isExtra ? day : teacher.researchDay || day || "Unscheduled";
+      const teacherDeployDate = isExtra ? extraDate : nextDateForWeekday(teacherDay);
       group.forEach((student) => {
         rows.push({
           sessionId, teacherId: teacher.id, studentId: student.id,
           schoolId: student.schoolId, regionId, day: teacherDay,
+          deployDate: teacherDeployDate, isExtra: !!isExtra,
         });
       });
     });
 
-    // One round trip per student (assignment + its 6 assessments together),
-    // fired in parallel instead of sequentially — this is what was making
-    // auto-assign/deploy feel slow.
-    await Promise.all(
-      rows.map((row) =>
-        pool.request()
-          .input("sessionId", row.sessionId)
-          .input("teacherId", row.teacherId)
-          .input("studentId", row.studentId)
-          .input("schoolId", row.schoolId)
-          .input("regionId", row.regionId)
-          .input("day", row.day)
+    // Delete-then-reinsert and the bulk insert both happen in ONE transaction,
+    // as a handful of chunked multi-row statements rather than one pooled
+    // connection per student — see bulkInsertAssignments() above for why.
+    await transaction.begin();
+    try {
+      if (studentIds.length) {
+        await new sql.Request(transaction)
+          .input("sessionId", sessionId)
           .query(`
-            INSERT INTO PracticumAssignments (sessionId, teacherId, studentId, schoolId, regionId, day)
-            VALUES (@sessionId, @teacherId, @studentId, @schoolId, @regionId, @day);
-            DECLARE @newAssignmentId INT = SCOPE_IDENTITY();
-            INSERT INTO PracticumAssessments (assignmentId, assessmentNumber)
-            VALUES (@newAssignmentId,1),(@newAssignmentId,2),(@newAssignmentId,3),
-                   (@newAssignmentId,4),(@newAssignmentId,5),(@newAssignmentId,6);
-          `)
-      )
-    );
+            DELETE FROM PracticumAssignments
+            WHERE sessionId = @sessionId
+            AND studentId IN (${studentIds.join(",")})
+          `);
+      }
+      await bulkInsertAssignments(transaction, rows);
+      await transaction.commit();
+    } catch (err) {
+      await transaction.rollback();
+      throw err;
+    }
 
     const deployedTeacherIds = new Set(rows.map((r) => r.teacherId));
     const deployedStudentIds = new Set(rows.map((r) => r.studentId));
@@ -702,7 +864,7 @@ router.get("/report/:sessionId", async (req, res) => {
       .input("sessionId", req.params.sessionId)
       .query(`
         SELECT
-          a.id AS assignmentId, a.day,
+          a.id AS assignmentId, a.day, a.deployDate, a.isExtra,
           t.name AS teacherName,
           st.name AS studentName,
           sc.name AS schoolName, r.name AS regionName,

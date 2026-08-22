@@ -344,7 +344,58 @@ async function ensureSchema(pool, sql) {
       ALTER TABLE Teachers ADD photoUrl NVARCHAR(500) NULL
     `);
 
-    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl)");
+    /* ---------------- leave_outs gate-verification columns ----------------
+       Once a leave reaches 'approved' or 'admin_granted', the approving
+       route generates a one-time gate_code. The Gate page (security desk)
+       verifies that code: first scan records exit_time, second scan
+       (same code) records reentry_time. gate_status tracks where in that
+       cycle the leave currently sits, purely for the Gate report/list —
+       the authoritative state is still exit_time/reentry_time being
+       null or not. */
+    const leaveGateColumns = [
+      ["gate_code", "NVARCHAR(12) NULL"],
+      ["gate_status", "NVARCHAR(20) NULL"], // 'not_out' | 'out' | 'returned'
+      ["exit_time", "DATETIME NULL"],
+      ["exit_verified_by_name", "NVARCHAR(200) NULL"],
+      ["reentry_time", "DATETIME NULL"],
+      ["reentry_verified_by_name", "NVARCHAR(200) NULL"],
+    ];
+    for (const [name, type] of leaveGateColumns) {
+      await pool.request().query(`
+        IF EXISTS (SELECT * FROM sysobjects WHERE name='leave_outs' AND xtype='U')
+        AND NOT EXISTS (
+          SELECT * FROM sys.columns
+          WHERE Name = N'${name}' AND Object_ID = Object_ID(N'leave_outs')
+        )
+        ALTER TABLE leave_outs ADD ${name} ${type}
+      `);
+    }
+
+    /* ---------------- meal_daily_codes table ----------------
+       3 single-use codes generated per student per calendar day
+       (breakfast/lunch/supper), shown on the student's meal card page
+       and typed in at the Kitchen page to verify + decrement the
+       student's meal_cards balance. A code can never be reused once
+       usedAt is set, and is unique across ALL students for that day so
+       kitchen staff can verify by code alone without also needing to
+       know whose it is. */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='meal_daily_codes' AND xtype='U')
+      CREATE TABLE meal_daily_codes (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        student_id INT NOT NULL,
+        meal_card_id INT NULL,
+        slot NVARCHAR(20) NOT NULL,
+        code NVARCHAR(10) NOT NULL,
+        code_date DATE NOT NULL,
+        usedAt DATETIME NULL,
+        usedByName NVARCHAR(200) NULL,
+        createdAt DATETIME NOT NULL DEFAULT GETDATE(),
+        CONSTRAINT UQ_meal_daily_codes_student_day_slot UNIQUE (student_id, code_date, slot)
+      )
+    `);
+
+    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, meal_daily_codes, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl)");
   } catch (err) {
     console.error("⚠️  Schema ensure failed:", err.message);
   }

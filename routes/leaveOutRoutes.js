@@ -88,6 +88,31 @@ module.exports = (poolPromise, sql) => {
     }
   };
 
+  /* ================= GATE CODE GENERATION =================
+     Called the moment a leave lands on 'approved' or 'admin_granted' —
+     a one-time code the Gate page (security desk) uses to record exit
+     and, later, reentry. 6 digits, retried on the rare collision
+     against any other currently-unresolved code (a leave whose
+     reentry_time is still null), since only unresolved codes are ever
+     looked up by the Gate verify endpoint.
+  */
+  const generateGateCode = async (pool, leaveId) => {
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const code = String(Math.floor(100000 + Math.random() * 900000));
+      const clash = await pool.request().input("code", sql.NVarChar, code).query(`
+        SELECT id FROM leave_outs WHERE gate_code = @code AND reentry_time IS NULL
+      `);
+      if (clash.recordset.length === 0) {
+        await pool.request()
+          .input("id", sql.Int, leaveId)
+          .input("code", sql.NVarChar, code)
+          .query(`UPDATE leave_outs SET gate_code = @code, gate_status = 'not_out' WHERE id = @id`);
+        return code;
+      }
+    }
+    return null;
+  };
+
   /* ================= CREATE LEAVE =================
      Student-only. The workflow's starting stage depends entirely on
      leave_type — this is the one place that decides it, so it can
@@ -281,16 +306,18 @@ module.exports = (poolPromise, sql) => {
           return res.status(409).json({ message: "This request was already processed." });
         }
 
+        const gateCode = await generateGateCode(pool, req.params.id);
+
         await notifyUsers(pool, [{ id: student_id, source: "Students" }], {
           title: "Long-Stay Leave Approved",
-          message: `Your Long-Stay Leave has been approved by ${actorName}.`,
+          message: `Your Long-Stay Leave has been approved by ${actorName}.${gateCode ? ` Gate code: ${gateCode} — present this at the gate on your way out.` : ""}`,
           type: "leave",
           createdBy: req.user.id,
           createdBySource: "Users",
           link: LEAVE_LINK_BY_SOURCE.Students,
         });
 
-        return res.json({ message: "Approved" });
+        return res.json({ message: "Approved", gate_code: gateCode });
       }
 
       /* ---------- EMERGENCY: Sub-Admin 2 (stage 1) then Sub-Admin 1 OR Admin (final) ---------- */
@@ -359,16 +386,18 @@ module.exports = (poolPromise, sql) => {
             return res.status(409).json({ message: "This request was already processed." });
           }
 
+          const gateCode = await generateGateCode(pool, req.params.id);
+
           await notifyUsers(pool, [{ id: student_id, source: "Students" }], {
             title: "Emergency Leave Approved",
-            message: `Your Emergency Leave has been approved by ${actorName}.`,
+            message: `Your Emergency Leave has been approved by ${actorName}.${gateCode ? ` Gate code: ${gateCode} — present this at the gate on your way out.` : ""}`,
             type: "leave",
             createdBy: req.user.id,
             createdBySource: "Users",
             link: LEAVE_LINK_BY_SOURCE.Students,
           });
 
-          return res.json({ message: "Approved" });
+          return res.json({ message: "Approved", gate_code: gateCode });
         }
 
         return res.status(409).json({ message: `This request is already ${status}.` });
@@ -398,16 +427,18 @@ module.exports = (poolPromise, sql) => {
         return res.status(409).json({ message: "This request was already processed." });
       }
 
+      const gateCode = await generateGateCode(pool, req.params.id);
+
       await notifyUsers(pool, [{ id: student_id, source: "Students" }], {
         title: "Leave Request Approved",
-        message: `Your ${LEAVE_TYPE_LABEL[leave_type] || "leave"} request has been approved by ${actorName}. You may print your leave permit from the Leave & Gate Pass page.`,
+        message: `Your ${LEAVE_TYPE_LABEL[leave_type] || "leave"} request has been approved by ${actorName}.${gateCode ? ` Gate code: ${gateCode} — present this at the gate on your way out.` : ""} You may print your leave permit from the Leave & Gate Pass page.`,
         type: "leave",
         createdBy: req.user.id,
         createdBySource: "Users",
         link: LEAVE_LINK_BY_SOURCE.Students,
       });
 
-      res.json({ message: "Approved" });
+      res.json({ message: "Approved", gate_code: gateCode });
 
     } catch (err) {
       console.log(err);
@@ -586,17 +617,18 @@ module.exports = (poolPromise, sql) => {
         `);
 
       const newId = inserted.recordset[0]?.id;
+      const gateCode = await generateGateCode(pool, newId);
 
       await notifyUsers(pool, [{ id: student_id, source: "Students" }], {
         title: "Leave Granted by Admin",
-        message: `You have been granted ${LEAVE_TYPE_LABEL[type] || "leave"} by ${adminName}.${reason ? ` Reason: ${reason}` : ""}`,
+        message: `You have been granted ${LEAVE_TYPE_LABEL[type] || "leave"} by ${adminName}.${reason ? ` Reason: ${reason}` : ""}${gateCode ? ` Gate code: ${gateCode} — present this at the gate on your way out.` : ""}`,
         type: "leave_admin_granted",
         createdBy: req.user.id,
         createdBySource: "Users",
         link: LEAVE_LINK_BY_SOURCE.Students,
       });
 
-      res.json({ message: "Leave granted", id: newId });
+      res.json({ message: "Leave granted", id: newId, gate_code: gateCode });
 
     } catch (err) {
       console.log(err);

@@ -27,6 +27,9 @@ const PAGE_KEYS = [
   "Reports",
   "Graduation",
   "Notifications",
+  "Student Council",
+  "Gate",
+  "Kitchen",
 ];
 
 /* Keep only valid, de-duplicated page keys from whatever was submitted. */

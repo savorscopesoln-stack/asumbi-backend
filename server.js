@@ -29,6 +29,8 @@ const authRoutes = require("./routes/auth");
 const practicumRoutes = require("./routes/practicum");
 const leaveOutRoutes = require("./routes/leaveOutRoutes")(poolPromise, sql);
 const mealRoutes = require("./routes/mealRoutes");
+const gateRoutes = require("./routes/gate");
+const kitchenRoutes = require("./routes/kitchen");
 const attendanceRoutes = require("./routes/attendance");
 const eAssessmentRoutes = require("./routes/eAssessments");
 const metaRoutes = require("./routes/meta.routes");
@@ -150,6 +152,8 @@ app.use("/api/leave-outs", protect, leaveOutRoutes);
 app.use("/analytics", protect, analyticsRoute);
 app.use("/api/register", registerRoutes);
 app.use("/api/meals", protect, mealRoutes);
+app.use("/api/gate", protect, gateRoutes);
+app.use("/api/kitchen", protect, kitchenRoutes);
 app.use("/api/attendance", protect, attendanceRoutes);
 app.use("/api/e-assessments", eAssessmentRoutes); // already protects internally
 app.use("/api/fees", protect, feesRoutes);
@@ -291,21 +295,52 @@ app.get("/api/subjects", protect, async (req, res) => {
 ========================================================= */
 const RECORD_TABLES = { teachers: "Teachers", users: "Users", students: "Students" };
 
+// Columns that must never reach the client, regardless of table —
+// checked case-insensitively against whatever the DB schema reports.
+const RECORD_SENSITIVE_COLUMNS = new Set(["password"]);
+
+// Per-table column list is discovered from the DB schema itself (via
+// INFORMATION_SCHEMA.COLUMNS) rather than hand-maintained here, so a
+// column added to a table later (e.g. Teachers.photoUrl) shows up
+// automatically instead of silently disappearing from this endpoint.
+// Cached per table for the life of the process — schema changes only
+// happen via migrations/deploys, not at runtime.
+const recordColumnsCache = new Map();
+
+async function getRecordColumns(pool, table) {
+  if (recordColumnsCache.has(table)) return recordColumnsCache.get(table);
+
+  const result = await pool
+    .request()
+    .input("table", sql.NVarChar, table)
+    .query(`
+      SELECT COLUMN_NAME
+      FROM INFORMATION_SCHEMA.COLUMNS
+      WHERE TABLE_NAME = @table
+      ORDER BY ORDINAL_POSITION
+    `);
+
+  const columns = result.recordset
+    .map((r) => r.COLUMN_NAME)
+    .filter((col) => !RECORD_SENSITIVE_COLUMNS.has(col.toLowerCase()));
+
+  recordColumnsCache.set(table, columns);
+  return columns;
+}
+
 app.get("/api/records", protect, adminOnly, async (req, res) => {
   try {
     const pool = req.pool;
     const table = RECORD_TABLES[req.query.type] || "Students";
 
-    // Never return password hashes to the client — Students/Teachers/Users
-    // all store a `password` column, so SELECT * is not safe here.
-    const RECORD_COLUMNS = {
-      Users: "id, username, email, role, mustChangePassword",
-      Students: "id, name, admissionNo, studentClass, gender, status, yearOfStudy, username, role, Phone, assessmentNumber, mustChangePassword",
-      Teachers: "id, name, staffId, subject, phone, email, username, role, mustChangePassword",
-    };
-    const columns = RECORD_COLUMNS[table] || "*";
+    const columns = await getRecordColumns(pool, table);
+    if (!columns.length) {
+      return res.status(500).json({ message: `No columns found for ${table}` });
+    }
 
-    const result = await pool.request().query(`SELECT ${columns} FROM ${table}`);
+    const result = await pool
+      .request()
+      .query(`SELECT ${columns.map((c) => `[${c}]`).join(", ")} FROM ${table}`);
     res.json({ records: result.recordset });
   } catch (err) {
     console.log("RECORDS ERROR:", err);
@@ -352,10 +387,19 @@ app.post("/api/update-records", protect, adminOnly, async (req, res) => {
           WHERE id = @id
         `);
       } else if (table === "Teachers") {
-        request.input("subject", row.subject || "");
+        request
+          .input("subject", row.subject || "")
+          .input("staffId", row.staffId || "")
+          .input("phone", row.phone || "")
+          .input("email", row.email || null)
+          .input("username", row.username || "")
+          .input("role", row.role || "teacher");
+
         await request.query(`
           UPDATE Teachers
-          SET name = @name, status = @status, subject = @subject
+          SET name = @name, status = @status, subject = @subject,
+              staffId = @staffId, phone = @phone, email = @email,
+              username = @username, role = @role
           WHERE id = @id
         `);
       } else if (table === "Users") {

@@ -344,4 +344,81 @@ router.delete("/delete-all", async (req, res) => {
     });
   }
 });
+/* ================= DAILY MEAL CODES (Kitchen verification) =================
+   3 single-use codes per student per day — breakfast/lunch/supper.
+   Called by the student's meal card page; generates today's 3 codes
+   the first time they're requested each day (idempotent afterwards —
+   calling this again the same day just returns the same codes, it
+   never regenerates ones already issued), then returns them along
+   with whether each has been used yet.
+================================================================= */
+router.get("/my/:studentId/daily-codes", async (req, res) => {
+  const studentId = Number(req.params.studentId);
+  const SLOTS = ["breakfast", "lunch", "supper"];
+
+  try {
+    const pool = await getPool();
+    const today = new Date().toISOString().slice(0, 10);
+
+    const cardRes = await pool.request().input("sid", sql.Int, studentId).query(`
+      SELECT id, status FROM meal_cards WHERE student_id = @sid
+    `);
+    const card = cardRes.recordset[0];
+    if (!card || card.status !== "active") {
+      return res.status(400).json({ message: "No active meal card for this student" });
+    }
+
+    const existing = await pool.request()
+      .input("sid", sql.Int, studentId)
+      .input("today", sql.Date, today)
+      .query(`
+        SELECT slot, code, usedAt FROM meal_daily_codes
+        WHERE student_id = @sid AND code_date = @today
+      `);
+
+    const bySlot = {};
+    (existing.recordset || []).forEach((r) => { bySlot[r.slot] = r; });
+
+    for (const slot of SLOTS) {
+      if (bySlot[slot]) continue;
+
+      let code = null;
+      for (let attempt = 0; attempt < 8 && !code; attempt++) {
+        const candidate = String(Math.floor(100000 + Math.random() * 900000));
+        const clash = await pool.request()
+          .input("code", sql.NVarChar, candidate)
+          .input("today", sql.Date, today)
+          .query(`SELECT id FROM meal_daily_codes WHERE code = @code AND code_date = @today`);
+        if (clash.recordset.length === 0) code = candidate;
+      }
+      if (!code) continue; // extremely unlikely; that slot just won't have a code today
+
+      await pool.request()
+        .input("sid", sql.Int, studentId)
+        .input("cardId", sql.Int, card.id)
+        .input("slot", sql.NVarChar, slot)
+        .input("code", sql.NVarChar, code)
+        .input("today", sql.Date, today)
+        .query(`
+          INSERT INTO meal_daily_codes (student_id, meal_card_id, slot, code, code_date)
+          VALUES (@sid, @cardId, @slot, @code, @today)
+        `);
+
+      bySlot[slot] = { slot, code, usedAt: null };
+    }
+
+    res.json({
+      date: today,
+      codes: SLOTS.map((slot) => ({
+        slot,
+        code: bySlot[slot]?.code || null,
+        used: !!bySlot[slot]?.usedAt,
+      })),
+    });
+  } catch (err) {
+    console.log("DAILY CODES ERROR:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 module.exports = router;
