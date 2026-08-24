@@ -123,6 +123,32 @@ async function bulkInsertAssignments(transaction, rows) {
 }
 
 /* ============================================================================
+   DEADLOCK RETRY HELPER
+
+   SQL Server error 1205 ("deadlocked on lock resources ... chosen as the
+   deadlock victim") is expected to happen occasionally under concurrency
+   even with well-designed transactions — it's SQL Server's normal way of
+   breaking a deadlock cycle, not a sign of corruption. The standard fix is
+   to retry the whole transaction a few times with a short backoff. This
+   wraps any of our transactional handlers so a transient deadlock doesn't
+   surface as a hard failure to the user.
+============================================================================ */
+async function withDeadlockRetry(fn, retries = 3) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const isDeadlock = err?.number === 1205 || err?.originalError?.info?.number === 1205;
+      if (isDeadlock && attempt < retries) {
+        await new Promise((res) => setTimeout(res, 150 * attempt)); // simple backoff
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+/* ============================================================================
    META — regions, schools, teachers, students in a single round trip
 ============================================================================ */
 router.get("/meta", async (req, res) => {
@@ -326,6 +352,74 @@ router.post("/students", async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to create student" });
+  }
+});
+
+/* ----------------------------------------------------------------------
+   BULK STUDENT UPDATE — used by Automatic Placement (randomizePlacement).
+
+   IMPORTANT: this must be declared BEFORE "PUT /students/:id" below.
+   Express matches routes top-to-bottom, and ":id" matches literally any
+   path segment — including the word "bulk". With the old ordering,
+   PUT /students/bulk hit the ":id" handler first, req.params.id came out
+   as the string "bulk", and SQL Server threw:
+     "Conversion failed when converting the nvarchar value 'bulk' to
+     data type int."
+   because that route does `.input("id", req.params.id)` into a query
+   with `WHERE id = @id` against an int column. Moving the specific
+   "/students/bulk" route above the generic "/students/:id" route fixes
+   this — Express now matches the exact path first.
+
+   The frontend used to fire one PUT /students/:id per placed student, all
+   in parallel via Promise.all. Same problem auto-assign/deploy had before
+   they were fixed: dozens of concurrent UPDATE Students statements each
+   fire trg_UpdateClassesFromStudents, and those overlapping transactions
+   collide on whatever summary row(s) the trigger maintains, producing
+   "deadlocked on lock resources ... chosen as the deadlock victim"
+   (error 1205) — the errors visible repeatedly in the server logs.
+
+   Fixed the same way auto-assign/deploy were: do every update inside ONE
+   transaction (sequential requests on that transaction, not N separate
+   pooled connections racing each other), wrapped in a deadlock retry for
+   the rare case a transient 1205 still slips through under heavy load.
+   If anything fails after retries, the whole batch rolls back and it's
+   safe for the client to just try again.
+---------------------------------------------------------------------- */
+router.put("/students/bulk", async (req, res) => {
+  const pool = req.pool;
+  const { updates } = req.body; // [{ id, name, admissionNo, schoolId }, ...]
+
+  if (!Array.isArray(updates) || !updates.length) {
+    return res.status(400).json({ error: "updates array is required" });
+  }
+
+  try {
+    await withDeadlockRetry(async () => {
+      const transaction = new sql.Transaction(pool);
+      await transaction.begin();
+      try {
+        for (const u of updates) {
+          await new sql.Request(transaction)
+            .input("id", u.id)
+            .input("name", u.name)
+            .input("admissionNo", u.admissionNo || null)
+            .input("schoolId", u.schoolId || null)
+            .query(`
+              UPDATE Students SET name = @name, admissionNo = @admissionNo, schoolId = @schoolId
+              WHERE id = @id
+            `);
+        }
+        await transaction.commit();
+      } catch (err) {
+        await transaction.rollback();
+        throw err;
+      }
+    });
+
+    res.json({ message: "updated", count: updates.length });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Bulk student update failed" });
   }
 });
 
@@ -540,7 +634,6 @@ router.delete("/:sessionId", async (req, res) => {
 router.post("/auto-assign/:sessionId", async (req, res) => {
   const pool = req.pool;
   const sessionId = req.params.sessionId;
-  const transaction = new sql.Transaction(pool);
 
   try {
     const [teachersRes, studentsRes, existingRes] = await Promise.all([
@@ -610,14 +703,17 @@ router.post("/auto-assign/:sessionId", async (req, res) => {
       });
     });
 
-    await transaction.begin();
-    try {
-      await bulkInsertAssignments(transaction, rows);
-      await transaction.commit();
-    } catch (err) {
-      await transaction.rollback();
-      throw err;
-    }
+    await withDeadlockRetry(async () => {
+      const transaction = new sql.Transaction(pool);
+      await transaction.begin();
+      try {
+        await bulkInsertAssignments(transaction, rows);
+        await transaction.commit();
+      } catch (err) {
+        await transaction.rollback();
+        throw err;
+      }
+    });
 
     const notifiedTeacherIds = new Set(rows.map((r) => r.teacherId));
     const notifiedStudentIds = new Set(rows.map((r) => r.studentId));
@@ -683,7 +779,6 @@ router.get("/assign/:sessionId", async (req, res) => {
   }
 });
 
-// Manual override — reassign one student to a different teacher.
 // Manual override — reassign one student to a different teacher.
 // If the destination teacher is already at (or over) the MAX_PER_TEACHER
 // cap for that day, this is a "manual addition" beyond the normal
@@ -770,10 +865,10 @@ router.delete("/assign/session/:sessionId", async (req, res) => {
     res.status(500).json({ error: "Failed to reset assignments" });
   }
 });
+
 router.post("/deploy", async (req, res) => {
   const pool = req.pool;
   const { sessionId, regionId, isExtra, day, date, teacherIds } = req.body;
-  const transaction = new sql.Transaction(pool);
 
   try {
     if (!sessionId || !regionId || !Array.isArray(teacherIds) || !teacherIds.length) {
@@ -857,23 +952,28 @@ router.post("/deploy", async (req, res) => {
     // Delete-then-reinsert and the bulk insert both happen in ONE transaction,
     // as a handful of chunked multi-row statements rather than one pooled
     // connection per student — see bulkInsertAssignments() above for why.
-    await transaction.begin();
-    try {
-      if (studentIds.length) {
-        await new sql.Request(transaction)
-          .input("sessionId", sessionId)
-          .query(`
-            DELETE FROM PracticumAssignments
-            WHERE sessionId = @sessionId
-            AND studentId IN (${studentIds.join(",")})
-          `);
+    // Wrapped in withDeadlockRetry so a transient 1205 under heavy load is
+    // retried automatically instead of surfacing as a failed deployment.
+    await withDeadlockRetry(async () => {
+      const transaction = new sql.Transaction(pool);
+      await transaction.begin();
+      try {
+        if (studentIds.length) {
+          await new sql.Request(transaction)
+            .input("sessionId", sessionId)
+            .query(`
+              DELETE FROM PracticumAssignments
+              WHERE sessionId = @sessionId
+              AND studentId IN (${studentIds.join(",")})
+            `);
+        }
+        await bulkInsertAssignments(transaction, rows);
+        await transaction.commit();
+      } catch (err) {
+        await transaction.rollback();
+        throw err;
       }
-      await bulkInsertAssignments(transaction, rows);
-      await transaction.commit();
-    } catch (err) {
-      await transaction.rollback();
-      throw err;
-    }
+    });
 
     const deployedTeacherIds = new Set(rows.map((r) => r.teacherId));
     const deployedStudentIds = new Set(rows.map((r) => r.studentId));
@@ -898,6 +998,7 @@ router.post("/deploy", async (req, res) => {
     res.status(500).json({ error: "Deployment failed" });
   }
 });
+
 /* ============================================================================
    ASSESSMENTS (1-6 per assignment)
 ============================================================================ */
