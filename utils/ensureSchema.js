@@ -503,7 +503,32 @@ async function ensureSchema(pool, sql) {
       }
     }
 
-    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, PortalPageSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, leave_outs code-verification columns, meal_daily_codes, leave_auto_approve, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl, Students.profileCompleted)");
+    /* ---------------- student_profile_change_requests table ----------------
+       After a student's very first profile save (right after their
+       forced password change), every later edit is queued here for
+       admin approval instead of being applied immediately — see
+       backend/routes/profileChangeRequests.js and
+       PUT /api/student/profile's profileCompleted check. */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='student_profile_change_requests' AND xtype='U')
+      CREATE TABLE student_profile_change_requests (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        student_id INT NOT NULL,
+        requested_studentClass NVARCHAR(100) NULL,
+        requested_gender NVARCHAR(20) NULL,
+        requested_email NVARCHAR(200) NULL,
+        requested_phone NVARCHAR(30) NULL,
+        requested_assessmentNumber NVARCHAR(100) NULL,
+        status NVARCHAR(20) NOT NULL DEFAULT 'pending',
+        requested_at DATETIME NOT NULL DEFAULT GETDATE(),
+        reviewed_by_id INT NULL,
+        reviewed_by_name NVARCHAR(200) NULL,
+        reviewed_at DATETIME NULL,
+        rejection_reason NVARCHAR(500) NULL
+      )
+    `);
+
+    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, PortalPageSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, leave_outs code-verification columns, meal_daily_codes, leave_auto_approve, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl, Students.profileCompleted, student_profile_change_requests)");
   } catch (err) {
     console.error("⚠️  Schema ensure failed:", err.message);
   }

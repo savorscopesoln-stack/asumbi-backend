@@ -39,6 +39,7 @@ const metaRoutes = require("./routes/meta.routes");
 const feesRoutes = require("./routes/fees");
 const leaveRoutes = require("./routes/leave");
 const searchRoutes = require("./routes/searchRecords");
+const profileChangeRequestsRoutes = require("./routes/profileChangeRequests");
 const notificationsRoutes = require("./routes/notifications");
 const broadcastNotificationsRoutes = require("./routes/broadcastNotifications");
 const notificationSettingsRoutes = require("./routes/notificationSettings");
@@ -177,6 +178,10 @@ app.use("/api/notification-settings", protect, adminOnly, notificationSettingsRo
 
 // Student Council Voting System — router applies protect/role checks per-route internally
 app.use("/api/student-council", studentCouncilRoutes);
+
+// Student profile change-request queue — router applies protect/role
+// checks per-route internally (student submit/check vs admin review).
+app.use("/api/student/profile-change-requests", profileChangeRequestsRoutes);
 app.use("/", metaRoutes);
 
 // Sweeps ScheduledNotifications once a minute for anything due and sends
@@ -713,22 +718,42 @@ app.get("/api/student/profile", protect, async (req, res) => {
 });
 
 /* =========================================================
-   STUDENT PROFILE — SELF-SERVICE UPDATE
-   A student can fill in / update every column on their own
-   Students row EXCEPT name and admissionNo (those stay
-   staff-managed, set at registration). Always acts on the
-   logged-in student's own id from the token — never a
-   studentId in the body — so one student can never edit
-   another's record through this endpoint.
+   STUDENT PROFILE — SELF-SERVICE UPDATE (FIRST TIME ONLY)
+   A student can fill in every column on their own Students row
+   EXCEPT name and admissionNo (those stay staff-managed, set at
+   registration) — but only the very first time, right after their
+   forced password change. Always acts on the logged-in student's
+   own id from the token — never a studentId in the body — so one
+   student can never edit another's record through this endpoint.
 
-   Saving here also flips profileCompleted to 1, which is what
-   clears the "complete your profile" step enforced right after
-   a student's first password change (see authMiddleware.js).
+   Any save AFTER the first one is rejected here (409) and must go
+   through POST /api/student/profile-change-requests instead, which
+   queues it for admin approval rather than applying it directly —
+   see routes/profileChangeRequests.js.
+
+   This first save is also what flips profileCompleted to 1, which
+   clears the "complete your profile" step enforced right after a
+   student's first password change (see authMiddleware.js) — and
+   from that point on is exactly the flag that routes every future
+   save into the approval queue above.
 ========================================================= */
 app.put("/api/student/profile", protect, authorize("student"), async (req, res) => {
   try {
     const pool = req.pool;
     const studentId = req.user.id;
+
+    const existing = await pool
+      .request()
+      .input("id", sql.Int, studentId)
+      .query(`SELECT profileCompleted FROM Students WHERE id = @id`);
+
+    if (existing.recordset[0]?.profileCompleted) {
+      return res.status(409).json({
+        code: "PROFILE_ALREADY_COMPLETED",
+        message:
+          "Your profile is already set up. Further changes need admin approval — submit a change request instead.",
+      });
+    }
 
     let { studentClass, gender, email, phone, assessmentNumber } = req.body;
 

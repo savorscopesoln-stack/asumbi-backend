@@ -30,6 +30,7 @@ const PAGE_KEYS = [
   "Student Council",
   "Gate",
   "Kitchen",
+  "Profile Change Requests",
 ];
 
 /* Keep only valid, de-duplicated page keys from whatever was submitted. */
