@@ -42,7 +42,8 @@ router.post("/verify", authorize(...GATE_STAFF_ROLES), async (req, res) => {
     const result = await pool.request().input("code", sql.NVarChar, code).query(`
       SELECT lo.id, lo.student_id, lo.leave_type, lo.status, lo.reason, lo.duration,
              lo.exit_time, lo.reentry_time,
-             s.name AS student_name, s.admissionNo, s.studentClass
+             s.name AS student_name, s.admissionNo, s.studentClass,
+             s.gender, s.phone, s.email, s.yearOfStudy, s.status AS studentStatus
       FROM leave_outs lo
       LEFT JOIN Students s ON s.id = lo.student_id
       WHERE lo.gate_code = @code
@@ -103,6 +104,11 @@ router.post("/verify", authorize(...GATE_STAFF_ROLES), async (req, res) => {
           student_name: leave.student_name,
           admissionNo: leave.admissionNo,
           studentClass: leave.studentClass,
+          gender: leave.gender,
+          phone: leave.phone,
+          email: leave.email,
+          yearOfStudy: leave.yearOfStudy,
+          studentStatus: leave.studentStatus,
           exit_time: now.toISOString(),
           expected_return: expectedReturn.toISOString(),
           verified_by: actorName,
@@ -140,6 +146,11 @@ router.post("/verify", authorize(...GATE_STAFF_ROLES), async (req, res) => {
         student_name: leave.student_name,
         admissionNo: leave.admissionNo,
         studentClass: leave.studentClass,
+        gender: leave.gender,
+        phone: leave.phone,
+        email: leave.email,
+        yearOfStudy: leave.yearOfStudy,
+        studentStatus: leave.studentStatus,
         exit_time: leave.exit_time,
         reentry_time: now.toISOString(),
         expected_return: expectedReturn ? expectedReturn.toISOString() : null,
@@ -169,7 +180,8 @@ router.get("/report", authorize(...GATE_STAFF_ROLES), async (req, res) => {
       SELECT lo.id, lo.leave_type, lo.reason, lo.duration, lo.gate_code, lo.gate_status,
              lo.exit_time, lo.exit_verified_by_name,
              lo.reentry_time, lo.reentry_verified_by_name,
-             s.name AS student_name, s.admissionNo, s.studentClass
+             s.name AS student_name, s.admissionNo, s.studentClass,
+             s.gender, s.phone, s.email, s.yearOfStudy, s.status AS studentStatus
       FROM leave_outs lo
       LEFT JOIN Students s ON s.id = lo.student_id
       WHERE lo.gate_code IS NOT NULL

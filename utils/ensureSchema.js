@@ -167,6 +167,14 @@ async function ensureSchema(pool, sql) {
 
       ["submitted_by_name", "NVARCHAR(200) NULL"],
       ["end_date", "DATETIME NULL"],
+
+      // Flags a leave that skipped the Sub-Admin 2 review stage because
+      // the student was on the Sub-Admin 2 auto-approve list at submit
+      // time — see leave_auto_approve below. subadmin2_approver_name is
+      // still populated (with a "(Auto-Approved)" label) so the existing
+      // ApprovalHistory UI needs no changes; this flag is just for a
+      // clear badge on the request itself.
+      ["subadmin2_auto_approved", "BIT NOT NULL CONSTRAINT DF_leave_outs_subadmin2_auto_approved DEFAULT 0"],
     ];
 
     for (const [name, type] of leaveOutColumns) {
@@ -442,7 +450,26 @@ async function ensureSchema(pool, sql) {
       )
     `);
 
-    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, PortalPageSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, leave_outs code-verification columns, meal_daily_codes, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl)");
+    /* ---------------- leave_auto_approve table ----------------
+       Sub-Admin 2's pre-approved list (Admin can manage it too). A
+       student_id in this table has any Emergency Leave they submit
+       skip the Sub-Admin 2 review stage entirely — it's created
+       already sitting at 'pending_final', ready for Sub-Admin 1 /
+       Admin's final sign-off, instead of waiting in Sub-Admin 2's
+       queue. See leaveOutRoutes.js for where this is read/written. */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='leave_auto_approve' AND xtype='U')
+      CREATE TABLE leave_auto_approve (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        student_id INT NOT NULL,
+        added_by_id INT NULL,
+        added_by_name NVARCHAR(200) NULL,
+        added_at DATETIME NOT NULL DEFAULT GETDATE(),
+        CONSTRAINT UQ_leave_auto_approve_student UNIQUE (student_id)
+      )
+    `);
+
+    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, PortalPageSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, leave_outs code-verification columns, meal_daily_codes, leave_auto_approve, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl)");
   } catch (err) {
     console.error("⚠️  Schema ensure failed:", err.message);
   }

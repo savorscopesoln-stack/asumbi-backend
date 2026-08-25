@@ -97,6 +97,20 @@ module.exports = (poolPromise, sql) => {
     }
   };
 
+  /* ================= AUTO-APPROVE LIST HELPER =================
+     Is this student pre-approved for automatic Sub-Admin 2 sign-off?
+     Checked at Emergency Leave submission time only — see POST /. */
+  const isAutoApproveStudent = async (pool, studentId) => {
+    try {
+      const r = await pool.request().input("id", sql.Int, studentId)
+        .query(`SELECT id FROM leave_auto_approve WHERE student_id = @id`);
+      return r.recordset.length > 0;
+    } catch (err) {
+      console.log("AUTO-APPROVE CHECK ERROR:", err.message);
+      return false;
+    }
+  };
+
   /* ================= CODE GENERATION =================
      Generated the moment a leave is SUBMITTED (not on approval) —
      this one code now serves three purposes end-to-end:
@@ -164,8 +178,14 @@ module.exports = (poolPromise, sql) => {
       const type = VALID_LEAVE_TYPES.includes(leave_type) ? leave_type : "short_stay";
       const finalDuration = duration || DEFAULT_DURATION_BY_TYPE[type];
 
+      // Emergency requests from a student on Sub-Admin 2's auto-approve
+      // list skip straight past the pending_subadmin2 stage — there's
+      // nothing left for Sub-Admin 2 to review, so the request is
+      // created already sitting at pending_final.
+      const autoApproved = type === "emergency" && await isAutoApproveStudent(pool, student_id);
+
       const initialStatus =
-        type === "emergency" ? "pending_subadmin2" :
+        type === "emergency" ? (autoApproved ? "pending_final" : "pending_subadmin2") :
         type === "long" ? "pending_admin" :
         "pending";
 
@@ -193,10 +213,38 @@ module.exports = (poolPromise, sql) => {
       // hand to Sub-Admin 1 in person, and later use at the gate.
       const code = await generateGateCode(pool, newId);
 
+      if (autoApproved) {
+        await pool.request()
+          .input("id", sql.Int, newId)
+          .query(`
+            UPDATE leave_outs
+            SET subadmin2_auto_approved = 1,
+                subadmin2_approver_name = 'Auto-Approved (Pre-Approved List)',
+                subadmin2_approved_at = GETDATE()
+            WHERE id = @id
+          `);
+      }
+
       // Notify whoever owns the next approval stage. Short-stay keeps
       // its existing (no-notification-on-submit) behavior — Sub-Admin 1
       // finds it in their list and unlocks it with the code directly.
-      if (type === "emergency") {
+      if (type === "emergency" && autoApproved) {
+        // Same recipients / message shape as the normal stage-1 ->
+        // stage-2 transition in PUT /:id/approve, since this request
+        // is created already at that stage.
+        const recipients = [
+          ...(await getUsersByRole(pool, "sub_admin")),
+          ...(await getUsersByRole(pool, "admin")),
+        ];
+        await notifyUsers(pool, recipients, {
+          title: "Emergency Leave Awaiting Final Approval",
+          message: `Emergency Leave for ${studentName} was auto-approved (pre-approved list) and is awaiting final approval.`,
+          type: "leave_emergency_stage2",
+          createdBy: student_id,
+          createdBySource: "Students",
+          link: LEAVE_LINK_BY_SOURCE.Users,
+        });
+      } else if (type === "emergency") {
         const recipients = await getUsersByRole(pool, "sub_admin_2");
         await notifyUsers(pool, recipients, {
           title: "New Emergency Leave Request",
@@ -223,6 +271,74 @@ module.exports = (poolPromise, sql) => {
     } catch (err) {
       console.log(err);
       res.status(500).json({ message: "Failed to submit leave" });
+    }
+  });
+
+  /* ================= AUTO-APPROVE LIST (Sub-Admin 2) =================
+     Sub-Admin 2's pre-approved list — Admin can manage it too. Any
+     student on this list has their Emergency Leave requests skip the
+     Sub-Admin 2 review stage automatically (see isAutoApproveStudent
+     in POST / above). Resolved against Students here so the frontend
+     gets a ready-to-render name/admissionNo, not just a bare id. */
+  router.get("/auto-approve-list", authorize("sub_admin_2", "admin"), async (req, res) => {
+    try {
+      const pool = await poolPromise;
+      const result = await pool.request().query(`
+        SELECT l.student_id, l.added_by_name, l.added_at,
+               s.name AS student_name, s.admissionNo, s.studentClass
+        FROM leave_auto_approve l
+        LEFT JOIN Students s ON s.id = l.student_id
+        ORDER BY l.added_at DESC
+      `);
+      res.json(result.recordset || []);
+    } catch (err) {
+      console.log("AUTO-APPROVE LIST ERROR:", err.message);
+      res.status(500).json([]);
+    }
+  });
+
+  router.post("/auto-approve-list", authorize("sub_admin_2", "admin"), async (req, res) => {
+    try {
+      const pool = await poolPromise;
+      const studentId = Number(req.body.student_id);
+      if (!studentId) {
+        return res.status(400).json({ message: "student_id is required" });
+      }
+
+      const already = await pool.request().input("id", sql.Int, studentId)
+        .query(`SELECT id FROM leave_auto_approve WHERE student_id = @id`);
+      if (already.recordset.length) {
+        return res.status(409).json({ message: "This student is already on the auto-approve list." });
+      }
+
+      const actorName = await getActorDisplayName(pool, req.user);
+
+      await pool.request()
+        .input("studentId", sql.Int, studentId)
+        .input("addedById", sql.Int, req.user.id)
+        .input("addedByName", sql.NVarChar, actorName)
+        .query(`
+          INSERT INTO leave_auto_approve (student_id, added_by_id, added_by_name)
+          VALUES (@studentId, @addedById, @addedByName)
+        `);
+
+      res.json({ message: "Added to auto-approve list" });
+    } catch (err) {
+      console.log("AUTO-APPROVE ADD ERROR:", err.message);
+      res.status(500).json({ message: "Failed to add to auto-approve list" });
+    }
+  });
+
+  router.delete("/auto-approve-list/:studentId", authorize("sub_admin_2", "admin"), async (req, res) => {
+    try {
+      const pool = await poolPromise;
+      await pool.request()
+        .input("id", sql.Int, req.params.studentId)
+        .query(`DELETE FROM leave_auto_approve WHERE student_id = @id`);
+      res.json({ message: "Removed from auto-approve list" });
+    } catch (err) {
+      console.log("AUTO-APPROVE REMOVE ERROR:", err.message);
+      res.status(500).json({ message: "Failed to remove from auto-approve list" });
     }
   });
 
