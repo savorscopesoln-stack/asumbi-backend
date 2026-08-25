@@ -179,13 +179,14 @@ module.exports = (poolPromise, sql) => {
       const finalDuration = duration || DEFAULT_DURATION_BY_TYPE[type];
 
       // Emergency requests from a student on Sub-Admin 2's auto-approve
-      // list skip straight past the pending_subadmin2 stage — there's
-      // nothing left for Sub-Admin 2 to review, so the request is
-      // created already sitting at pending_final.
+      // list bypass the entire review workflow — created already fully
+      // 'approved', gate code active immediately, no manual step for
+      // anyone. This is a full auto-approval, not just a skipped stage.
       const autoApproved = type === "emergency" && await isAutoApproveStudent(pool, student_id);
 
       const initialStatus =
-        type === "emergency" ? (autoApproved ? "pending_final" : "pending_subadmin2") :
+        autoApproved ? "approved" :
+        type === "emergency" ? "pending_subadmin2" :
         type === "long" ? "pending_admin" :
         "pending";
 
@@ -216,11 +217,15 @@ module.exports = (poolPromise, sql) => {
       if (autoApproved) {
         await pool.request()
           .input("id", sql.Int, newId)
+          .input("approvedAt", sql.DateTime, new Date())
           .query(`
             UPDATE leave_outs
             SET subadmin2_auto_approved = 1,
                 subadmin2_approver_name = 'Auto-Approved (Pre-Approved List)',
-                subadmin2_approved_at = GETDATE()
+                subadmin2_approved_at = GETDATE(),
+                final_approver_name = 'Auto-Approved (Pre-Approved List)',
+                final_approved_at = GETDATE(),
+                approved_at = @approvedAt
             WHERE id = @id
           `);
       }
@@ -229,20 +234,15 @@ module.exports = (poolPromise, sql) => {
       // its existing (no-notification-on-submit) behavior — Sub-Admin 1
       // finds it in their list and unlocks it with the code directly.
       if (type === "emergency" && autoApproved) {
-        // Same recipients / message shape as the normal stage-1 ->
-        // stage-2 transition in PUT /:id/approve, since this request
-        // is created already at that stage.
-        const recipients = [
-          ...(await getUsersByRole(pool, "sub_admin")),
-          ...(await getUsersByRole(pool, "admin")),
-        ];
-        await notifyUsers(pool, recipients, {
-          title: "Emergency Leave Awaiting Final Approval",
-          message: `Emergency Leave for ${studentName} was auto-approved (pre-approved list) and is awaiting final approval.`,
-          type: "leave_emergency_stage2",
+        // Fully auto-approved — nothing for staff to act on, so only
+        // the student is notified, same as a normal approval.
+        await notifyUsers(pool, [{ id: student_id, source: "Students" }], {
+          title: "Emergency Leave Approved",
+          message: `Your Emergency Leave was automatically approved (pre-approved list).${code ? ` Your code ${code} is now valid at the gate.` : ""}`,
+          type: "leave",
           createdBy: student_id,
           createdBySource: "Students",
-          link: LEAVE_LINK_BY_SOURCE.Users,
+          link: LEAVE_LINK_BY_SOURCE.Students,
         });
       } else if (type === "emergency") {
         const recipients = await getUsersByRole(pool, "sub_admin_2");

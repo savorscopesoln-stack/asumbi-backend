@@ -168,12 +168,12 @@ async function ensureSchema(pool, sql) {
       ["submitted_by_name", "NVARCHAR(200) NULL"],
       ["end_date", "DATETIME NULL"],
 
-      // Flags a leave that skipped the Sub-Admin 2 review stage because
+      // Flags a leave that bypassed the entire approval workflow because
       // the student was on the Sub-Admin 2 auto-approve list at submit
-      // time — see leave_auto_approve below. subadmin2_approver_name is
-      // still populated (with a "(Auto-Approved)" label) so the existing
-      // ApprovalHistory UI needs no changes; this flag is just for a
-      // clear badge on the request itself.
+      // time — see leave_auto_approve below. subadmin2_approver_name /
+      // final_approver_name are still populated (with an "Auto-Approved"
+      // label) so the existing ApprovalHistory UI needs no changes; this
+      // flag is just for a clear badge on the request itself.
       ["subadmin2_auto_approved", "BIT NOT NULL CONSTRAINT DF_leave_outs_subadmin2_auto_approved DEFAULT 0"],
     ];
 
@@ -453,10 +453,10 @@ async function ensureSchema(pool, sql) {
     /* ---------------- leave_auto_approve table ----------------
        Sub-Admin 2's pre-approved list (Admin can manage it too). A
        student_id in this table has any Emergency Leave they submit
-       skip the Sub-Admin 2 review stage entirely — it's created
-       already sitting at 'pending_final', ready for Sub-Admin 1 /
-       Admin's final sign-off, instead of waiting in Sub-Admin 2's
-       queue. See leaveOutRoutes.js for where this is read/written. */
+       bypass the entire approval workflow — created already fully
+       'approved', gate code active immediately, no manual step
+       needed from Sub-Admin 2, Sub-Admin 1, or Admin. See
+       leaveOutRoutes.js for where this is read/written. */
     await pool.request().query(`
       IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='leave_auto_approve' AND xtype='U')
       CREATE TABLE leave_auto_approve (
