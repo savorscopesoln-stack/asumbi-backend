@@ -209,6 +209,28 @@ async function ensureSchema(pool, sql) {
       ALTER TABLE Notifications ADD link NVARCHAR(300) NULL
     `);
 
+    /* ---------------- PortalPageSettings ----------------
+       Admin-controlled on/off switch for individual pages inside the
+       Student and Teacher portals. Keyed by (portal, page_key) where
+       page_key is just that page's route (e.g. "/student/meals") —
+       an open key/value store, not a fixed enum, so any page added
+       to a portal's nav array in the future is automatically
+       controllable here with zero backend changes. A page with no
+       row yet is treated as enabled by default (see the route
+       handler) — only explicit rows turn a page off. */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='PortalPageSettings' AND xtype='U')
+      CREATE TABLE PortalPageSettings (
+        portal NVARCHAR(20) NOT NULL,
+        page_key NVARCHAR(200) NOT NULL,
+        enabled BIT NOT NULL DEFAULT 1,
+        updated_by_id INT NULL,
+        updated_by_name NVARCHAR(200) NULL,
+        updated_at DATETIME NOT NULL DEFAULT GETDATE(),
+        CONSTRAINT PK_PortalPageSettings PRIMARY KEY (portal, page_key)
+      )
+    `);
+
     /* ---------------- mustChangePassword (Users / Students / Teachers) ----------------
        Drives the "must change password on next login" flow: set to 1 whenever an
        admin creates an account or resets a password to the default, cleared back
@@ -420,7 +442,7 @@ async function ensureSchema(pool, sql) {
       )
     `);
 
-    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, leave_outs code-verification columns, meal_daily_codes, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl)");
+    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, PortalPageSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, leave_outs code-verification columns, meal_daily_codes, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl)");
   } catch (err) {
     console.error("⚠️  Schema ensure failed:", err.message);
   }
