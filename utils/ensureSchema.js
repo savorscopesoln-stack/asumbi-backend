@@ -371,6 +371,31 @@ async function ensureSchema(pool, sql) {
       `);
     }
 
+    /* ---------------- leave_outs code-verification columns (Sub-Admin 1 gate) ----------------
+       gate_code is now generated the moment a leave is SUBMITTED, not
+       just on approval (see leaveOutRoutes.js) — the student hands that
+       same code to Sub-Admin 1 in person. Sub-Admin 1 can't see a
+       request's reason or act on it until they've entered the correct
+       code via PUT /:id/verify-code, which flips code_verified to 1
+       permanently for that one request. Admin is never subject to this
+       gate (GET / never redacts anything for admin), and once verified
+       a request stays unlocked — there's no need to re-enter the code. */
+    const leaveCodeGateColumns = [
+      ["code_verified", "BIT NOT NULL CONSTRAINT DF_leave_outs_code_verified DEFAULT 0"],
+      ["code_verified_by_name", "NVARCHAR(200) NULL"],
+      ["code_verified_at", "DATETIME NULL"],
+    ];
+    for (const [name, type] of leaveCodeGateColumns) {
+      await pool.request().query(`
+        IF EXISTS (SELECT * FROM sysobjects WHERE name='leave_outs' AND xtype='U')
+        AND NOT EXISTS (
+          SELECT * FROM sys.columns
+          WHERE Name = N'${name}' AND Object_ID = Object_ID(N'leave_outs')
+        )
+        ALTER TABLE leave_outs ADD ${name} ${type}
+      `);
+    }
+
     /* ---------------- meal_daily_codes table ----------------
        3 single-use codes generated per student per calendar day
        (breakfast/lunch/supper), shown on the student's meal card page
@@ -395,7 +420,7 @@ async function ensureSchema(pool, sql) {
       )
     `);
 
-    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, meal_daily_codes, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl)");
+    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, leave_outs code-verification columns, meal_daily_codes, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl)");
   } catch (err) {
     console.error("⚠️  Schema ensure failed:", err.message);
   }

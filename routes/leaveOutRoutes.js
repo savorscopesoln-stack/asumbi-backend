@@ -22,6 +22,15 @@ const LEAVE_TYPE_LABEL = {
 // Roles allowed to open the Leave-out admin dashboard at all.
 const LEAVE_STAFF_ROLES = ["admin", "sub_admin", "sub_admin_2"];
 
+// The specific (status, leave_type) combinations where Sub-Admin 1
+// ("sub_admin") is the one expected to act next — this is exactly
+// where the code-gate applies. Once a leave has moved past this
+// stage, there's nothing left to gate: the review already happened.
+const isSubAdmin1GateStage = (row) =>
+  (row.leave_type !== "long") &&
+  ((row.status === "pending" && row.leave_type === "short_stay") ||
+   (row.status === "pending_final" && row.leave_type === "emergency"));
+
 // The in-app route the notification's "click through" should land on.
 // Every role has its own leave page, so pick the right one per source.
 const LEAVE_LINK_BY_SOURCE = {
@@ -88,13 +97,22 @@ module.exports = (poolPromise, sql) => {
     }
   };
 
-  /* ================= GATE CODE GENERATION =================
-     Called the moment a leave lands on 'approved' or 'admin_granted' —
-     a one-time code the Gate page (security desk) uses to record exit
-     and, later, reentry. 6 digits, retried on the rare collision
-     against any other currently-unresolved code (a leave whose
-     reentry_time is still null), since only unresolved codes are ever
-     looked up by the Gate verify endpoint.
+  /* ================= CODE GENERATION =================
+     Generated the moment a leave is SUBMITTED (not on approval) —
+     this one code now serves three purposes end-to-end:
+       1. The student shares it with Sub-Admin 1 in person; Sub-Admin 1
+          must enter it correctly before they can see the request's
+          reason or act on it (see isSubAdmin1GateStage / the
+          /verify-code route / the GET / redaction below).
+       2. It's the same code shown on the approved permit.
+       3. It's the code the Gate page verifies for exit/reentry —
+          gate.js's /verify route reads this exact gate_code column
+          unchanged, so nothing there needed to change; it now just
+          additionally requires the leave to be approved first (see
+          the note in DEBUG_REPORT / gate.js).
+     6 digits, retried on the rare collision against any other
+     currently-unresolved code (a leave whose reentry_time is still
+     null), since only unresolved codes are ever looked up at the gate.
   */
   const generateGateCode = async (pool, leaveId) => {
     for (let attempt = 0; attempt < 8; attempt++) {
@@ -111,6 +129,15 @@ module.exports = (poolPromise, sql) => {
       }
     }
     return null;
+  };
+
+  // Fallback for any leave that somehow doesn't have a code yet (rows
+  // created before this feature existed) — approve/force-grant call
+  // this instead of unconditionally generating a fresh one, since the
+  // code normally already exists from submission time.
+  const ensureGateCode = async (pool, leaveId, existingCode) => {
+    if (existingCode) return existingCode;
+    return generateGateCode(pool, leaveId);
   };
 
   /* ================= CREATE LEAVE =================
@@ -162,8 +189,13 @@ module.exports = (poolPromise, sql) => {
 
       const newId = inserted.recordset[0]?.id;
 
+      // Generate the code right away — this is what the student will
+      // hand to Sub-Admin 1 in person, and later use at the gate.
+      const code = await generateGateCode(pool, newId);
+
       // Notify whoever owns the next approval stage. Short-stay keeps
-      // its existing (no-notification-on-submit) behavior.
+      // its existing (no-notification-on-submit) behavior — Sub-Admin 1
+      // finds it in their list and unlocks it with the code directly.
       if (type === "emergency") {
         const recipients = await getUsersByRole(pool, "sub_admin_2");
         await notifyUsers(pool, recipients, {
@@ -186,7 +218,7 @@ module.exports = (poolPromise, sql) => {
         });
       }
 
-      res.json({ message: "Leave request submitted", id: newId, status: initialStatus });
+      res.json({ message: "Leave request submitted", id: newId, status: initialStatus, code });
 
     } catch (err) {
       console.log(err);
@@ -225,10 +257,18 @@ module.exports = (poolPromise, sql) => {
   });
 
   /* ================= ADMIN GET ALL =================
-     admin sees every leave. sub_admin never sees Long-Stay Leave.
-     sub_admin_2 is scoped even tighter — it's an Emergency-only
-     reviewer role, so it must never see short_stay or long leaves,
-     only 'emergency'.
+     admin sees every leave, fully. sub_admin never sees Long-Stay
+     Leave. sub_admin_2 is scoped even tighter — Emergency-only.
+
+     Sub-Admin 1 ("sub_admin") additionally gets its "reason" field
+     (and student_id, so the row can't be reasoned-out) blanked out —
+     replaced with `locked: true` — for any request still sitting at
+     the stage where sub_admin is expected to act, until they've
+     entered that leave's code via /:id/verify-code. Everything else
+     (student name isn't sent here at all — the frontend resolves it
+     from its own /students list — status, leave type) stays visible
+     so the row is still findable in the list; only the sensitive
+     "why" and the ability to approve/reject are gated.
   */
   router.get("/", authorize(...LEAVE_STAFF_ROLES), async (req, res) => {
     try {
@@ -246,11 +286,71 @@ module.exports = (poolPromise, sql) => {
         ORDER BY id DESC
       `);
 
-      res.json(result.recordset || []);
+      let rows = result.recordset || [];
+
+      if (role === "sub_admin") {
+        rows = rows.map((row) => {
+          if (isSubAdmin1GateStage(row) && !row.code_verified) {
+            return { ...row, reason: null, locked: true };
+          }
+          return { ...row, locked: false };
+        });
+      }
+
+      res.json(rows);
 
     } catch (err) {
       console.log(err);
       res.status(500).json([]);
+    }
+  });
+
+  /* ================= VERIFY CODE (Sub-Admin 1 unlock) =================
+     Sub-Admin 1 enters the code the student handed them. Correct code
+     permanently unlocks this one request for every sub_admin from
+     then on (no need to re-enter it) — the check is per-leave, not
+     per-session, matching "can only see a leave after they have typed
+     in the approval code". Admin can also call this (harmless no-op
+     for them since GET / never redacts anything for admin anyway).
+  */
+  router.put("/:id/verify-code", authorize("sub_admin", "admin"), async (req, res) => {
+    try {
+      const pool = await poolPromise;
+      const code = String(req.body.code || "").trim();
+      if (!code) return res.status(400).json({ message: "Code is required" });
+
+      const existing = await pool.request().input("id", sql.Int, req.params.id)
+        .query(`SELECT * FROM leave_outs WHERE id=@id`);
+
+      if (!existing.recordset.length) {
+        return res.status(404).json({ message: "Leave not found" });
+      }
+
+      const row = existing.recordset[0];
+
+      if (!row.gate_code) {
+        return res.status(400).json({ message: "No code has been generated for this request." });
+      }
+      if (String(row.gate_code) !== code) {
+        return res.status(400).json({ message: "Incorrect code." });
+      }
+
+      const actorName = await getActorDisplayName(pool, req.user);
+
+      await pool.request()
+        .input("id", sql.Int, req.params.id)
+        .input("name", sql.NVarChar, actorName)
+        .query(`
+          UPDATE leave_outs
+          SET code_verified = 1, code_verified_by_name = @name, code_verified_at = GETDATE()
+          WHERE id = @id
+        `);
+
+      res.json({ message: "Code verified", leave: { ...row, reason: row.reason, locked: false, code_verified: true } });
+
+    } catch (err) {
+      console.log(err);
+      res.status(500).json({ message: "Verification failed" });
     }
   });
 
@@ -268,15 +368,22 @@ module.exports = (poolPromise, sql) => {
 
       const existing = await pool.request()
         .input("id", sql.Int, req.params.id)
-        .query(`SELECT student_id, leave_type, status FROM leave_outs WHERE id=@id`);
+        .query(`SELECT student_id, leave_type, status, gate_code, code_verified FROM leave_outs WHERE id=@id`);
 
       if (!existing.recordset.length) {
         return res.status(404).json({ message: "Leave not found" });
       }
 
-      const { student_id, leave_type, status } = existing.recordset[0];
+      const { student_id, leave_type, status, gate_code, code_verified } = existing.recordset[0];
       const actorName = await getActorDisplayName(pool, req.user);
       const finalDuration = duration || DEFAULT_DURATION_BY_TYPE[leave_type] || 120;
+
+      // Sub-Admin 1 must have unlocked this specific request with its
+      // code before they can approve it — mirrors the GET / redaction
+      // so the API can't be called directly to skip the gate.
+      if (role === "sub_admin" && isSubAdmin1GateStage({ leave_type, status }) && !code_verified) {
+        return res.status(403).json({ message: "Enter this request's code before approving it." });
+      }
 
       /* ---------- LONG-STAY: Admin only, single stage ---------- */
       if (leave_type === "long") {
@@ -306,18 +413,18 @@ module.exports = (poolPromise, sql) => {
           return res.status(409).json({ message: "This request was already processed." });
         }
 
-        const gateCode = await generateGateCode(pool, req.params.id);
+        const code = await ensureGateCode(pool, req.params.id, gate_code);
 
         await notifyUsers(pool, [{ id: student_id, source: "Students" }], {
           title: "Long-Stay Leave Approved",
-          message: `Your Long-Stay Leave has been approved by ${actorName}.${gateCode ? ` Gate code: ${gateCode} — present this at the gate on your way out.` : ""}`,
+          message: `Your Long-Stay Leave has been approved by ${actorName}.${code ? ` Your code ${code} is now valid at the gate.` : ""}`,
           type: "leave",
           createdBy: req.user.id,
           createdBySource: "Users",
           link: LEAVE_LINK_BY_SOURCE.Students,
         });
 
-        return res.json({ message: "Approved", gate_code: gateCode });
+        return res.json({ message: "Approved", gate_code: code });
       }
 
       /* ---------- EMERGENCY: Sub-Admin 2 (stage 1) then Sub-Admin 1 OR Admin (final) ---------- */
@@ -386,18 +493,18 @@ module.exports = (poolPromise, sql) => {
             return res.status(409).json({ message: "This request was already processed." });
           }
 
-          const gateCode = await generateGateCode(pool, req.params.id);
+          const code = await ensureGateCode(pool, req.params.id, gate_code);
 
           await notifyUsers(pool, [{ id: student_id, source: "Students" }], {
             title: "Emergency Leave Approved",
-            message: `Your Emergency Leave has been approved by ${actorName}.${gateCode ? ` Gate code: ${gateCode} — present this at the gate on your way out.` : ""}`,
+            message: `Your Emergency Leave has been approved by ${actorName}.${code ? ` Your code ${code} is now valid at the gate.` : ""}`,
             type: "leave",
             createdBy: req.user.id,
             createdBySource: "Users",
             link: LEAVE_LINK_BY_SOURCE.Students,
           });
 
-          return res.json({ message: "Approved", gate_code: gateCode });
+          return res.json({ message: "Approved", gate_code: code });
         }
 
         return res.status(409).json({ message: `This request is already ${status}.` });
@@ -427,18 +534,18 @@ module.exports = (poolPromise, sql) => {
         return res.status(409).json({ message: "This request was already processed." });
       }
 
-      const gateCode = await generateGateCode(pool, req.params.id);
+      const code = await ensureGateCode(pool, req.params.id, gate_code);
 
       await notifyUsers(pool, [{ id: student_id, source: "Students" }], {
         title: "Leave Request Approved",
-        message: `Your ${LEAVE_TYPE_LABEL[leave_type] || "leave"} request has been approved by ${actorName}.${gateCode ? ` Gate code: ${gateCode} — present this at the gate on your way out.` : ""} You may print your leave permit from the Leave & Gate Pass page.`,
+        message: `Your ${LEAVE_TYPE_LABEL[leave_type] || "leave"} request has been approved by ${actorName}.${code ? ` Your code ${code} is now valid at the gate.` : ""} You may print your leave permit from the Leave & Gate Pass page.`,
         type: "leave",
         createdBy: req.user.id,
         createdBySource: "Users",
         link: LEAVE_LINK_BY_SOURCE.Students,
       });
 
-      res.json({ message: "Approved", gate_code: gateCode });
+      res.json({ message: "Approved", gate_code: code });
 
     } catch (err) {
       console.log(err);
@@ -460,13 +567,17 @@ module.exports = (poolPromise, sql) => {
 
       const existing = await pool.request()
         .input("id", sql.Int, req.params.id)
-        .query(`SELECT student_id, leave_type, status FROM leave_outs WHERE id=@id`);
+        .query(`SELECT student_id, leave_type, status, code_verified FROM leave_outs WHERE id=@id`);
 
       if (!existing.recordset.length) {
         return res.status(404).json({ message: "Leave not found" });
       }
 
-      const { student_id, leave_type, status } = existing.recordset[0];
+      const { student_id, leave_type, status, code_verified } = existing.recordset[0];
+
+      if (role === "sub_admin" && isSubAdmin1GateStage({ leave_type, status }) && !code_verified) {
+        return res.status(403).json({ message: "Enter this request's code before rejecting it." });
+      }
 
       // Which stages this leave_type can currently be rejected from, and
       // who's allowed to reject at that stage.
@@ -609,26 +720,28 @@ module.exports = (poolPromise, sql) => {
         .query(`
           INSERT INTO leave_outs
             (student_id, reason, request_date, duration, end_date, status, leave_type,
-             is_admin_granted, granted_by_id, granted_by_source, granted_by_name, granted_at, approved_at)
+             is_admin_granted, granted_by_id, granted_by_source, granted_by_name, granted_at, approved_at,
+             code_verified, code_verified_by_name, code_verified_at)
           OUTPUT INSERTED.id
           VALUES
             (@student_id, @reason, @request_date, @duration, @end_date, 'admin_granted', @leave_type,
-             1, @grantedById, @grantedBySource, @grantedByName, GETDATE(), GETDATE())
+             1, @grantedById, @grantedBySource, @grantedByName, GETDATE(), GETDATE(),
+             1, @grantedByName, GETDATE())
         `);
 
       const newId = inserted.recordset[0]?.id;
-      const gateCode = await generateGateCode(pool, newId);
+      const code = await generateGateCode(pool, newId);
 
       await notifyUsers(pool, [{ id: student_id, source: "Students" }], {
         title: "Leave Granted by Admin",
-        message: `You have been granted ${LEAVE_TYPE_LABEL[type] || "leave"} by ${adminName}.${reason ? ` Reason: ${reason}` : ""}${gateCode ? ` Gate code: ${gateCode} — present this at the gate on your way out.` : ""}`,
+        message: `You have been granted ${LEAVE_TYPE_LABEL[type] || "leave"} by ${adminName}.${reason ? ` Reason: ${reason}` : ""}${code ? ` Your gate code: ${code}.` : ""}`,
         type: "leave_admin_granted",
         createdBy: req.user.id,
         createdBySource: "Users",
         link: LEAVE_LINK_BY_SOURCE.Students,
       });
 
-      res.json({ message: "Leave granted", id: newId, gate_code: gateCode });
+      res.json({ message: "Leave granted", id: newId, gate_code: code });
 
     } catch (err) {
       console.log(err);
@@ -730,6 +843,39 @@ module.exports = (poolPromise, sql) => {
     } catch (err) {
       console.log(err);
       res.status(500).json({ message: "Expire failed" });
+    }
+  });
+
+  /* ================= APPROVED LEAVES (report / download) =================
+     Every approved / admin_granted leave, resolved to student name +
+     admission number server-side so the frontend's CSV export doesn't
+     need a second round trip against /students to fill those in.
+     Same role/type scoping as GET / (sub_admin never sees Long-Stay;
+     sub_admin_2 sees Emergency only) — but never redacted, since these
+     are already-resolved records, not pending review.
+  */
+  router.get("/approved", authorize(...LEAVE_STAFF_ROLES), async (req, res) => {
+    try {
+      const pool = await poolPromise;
+      const role = req.user.role;
+
+      let where = "WHERE lo.status IN ('approved','admin_granted')";
+      if (role === "sub_admin_2") where += " AND lo.leave_type = 'emergency'";
+      else if (role === "sub_admin") where += " AND lo.leave_type <> 'long'";
+
+      const result = await pool.request().query(`
+        SELECT lo.*, s.name AS student_name, s.admissionNo, s.studentClass
+        FROM leave_outs lo
+        LEFT JOIN Students s ON s.id = lo.student_id
+        ${where}
+        ORDER BY lo.approved_at DESC
+      `);
+
+      res.json(result.recordset || []);
+
+    } catch (err) {
+      console.log(err);
+      res.status(500).json([]);
     }
   });
 

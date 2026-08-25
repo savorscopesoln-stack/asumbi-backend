@@ -25,6 +25,13 @@ const getActorDisplayName = async (pool, user) => {
    already fully closed (both timestamps set) is rejected — it isn't
    reusable, so re-entering it again is treated as invalid rather than
    silently no-op'd, since that'd hide a real gate-desk mistake.
+
+   Gate codes are now generated the moment a leave is SUBMITTED (not
+   just on approval — see leaveOutRoutes.js), so a leave found by code
+   here might still be pending, or even rejected. This route must
+   confirm the leave is actually approved before recording anything;
+   otherwise a student could exit before anyone signed off on their
+   request just because they already have a code in hand.
 ========================================================= */
 router.post("/verify", authorize(...GATE_STAFF_ROLES), async (req, res) => {
   try {
@@ -33,7 +40,7 @@ router.post("/verify", authorize(...GATE_STAFF_ROLES), async (req, res) => {
     if (!code) return res.status(400).json({ message: "Code is required" });
 
     const result = await pool.request().input("code", sql.NVarChar, code).query(`
-      SELECT lo.id, lo.student_id, lo.leave_type, lo.reason, lo.duration,
+      SELECT lo.id, lo.student_id, lo.leave_type, lo.status, lo.reason, lo.duration,
              lo.exit_time, lo.reentry_time,
              s.name AS student_name, s.admissionNo, s.studentClass
       FROM leave_outs lo
@@ -46,6 +53,13 @@ router.post("/verify", authorize(...GATE_STAFF_ROLES), async (req, res) => {
     }
 
     const leave = result.recordset[0];
+
+    if (!["approved", "admin_granted"].includes(leave.status)) {
+      return res.status(400).json({
+        message: `This leave has not been approved yet (currently ${leave.status}). The code isn't valid at the gate until it's approved.`,
+      });
+    }
+
     const actorName = await getActorDisplayName(pool, req.user);
 
     if (leave.reentry_time) {
