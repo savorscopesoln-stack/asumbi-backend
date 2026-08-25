@@ -469,7 +469,41 @@ async function ensureSchema(pool, sql) {
       )
     `);
 
-    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, PortalPageSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, leave_outs code-verification columns, meal_daily_codes, leave_auto_approve, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl)");
+    /* ---------------- Students.profileCompleted ----------------
+       Drives the "complete your profile" step shown right after a
+       student's first (forced) password change — see
+       ForcePasswordChange.jsx and CompleteProfile.jsx on the
+       frontend. Set to 1 the moment PUT /api/student/profile is
+       saved successfully.
+
+       Backfill on first creation of the column: any student who has
+       *already* changed their password (mustChangePassword = 0) is
+       treated as already onboarded, so existing/active students are
+       never suddenly interrupted by this new step — only brand-new
+       accounts (mustChangePassword still 1, meaning they've never
+       even logged in yet) start with profileCompleted = 0. */
+    const studentsTableExists = await pool.request().query(`
+      SELECT * FROM sysobjects WHERE name='Students' AND xtype='U'
+    `);
+
+    if (studentsTableExists.recordset.length > 0) {
+      const hasProfileCompleted = await pool.request().query(`
+        SELECT * FROM sys.columns
+        WHERE Name = N'profileCompleted' AND Object_ID = Object_ID(N'Students')
+      `);
+
+      if (hasProfileCompleted.recordset.length === 0) {
+        await pool.request().query(`
+          ALTER TABLE Students ADD profileCompleted BIT NOT NULL CONSTRAINT DF_Students_profileCompleted DEFAULT 0
+        `);
+
+        await pool.request().query(`
+          UPDATE Students SET profileCompleted = 1 WHERE mustChangePassword = 0
+        `);
+      }
+    }
+
+    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, PortalPageSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, leave_outs code-verification columns, meal_daily_codes, leave_auto_approve, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl, Students.profileCompleted)");
   } catch (err) {
     console.error("⚠️  Schema ensure failed:", err.message);
   }

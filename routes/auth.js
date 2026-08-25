@@ -129,8 +129,13 @@ if (!user) {
       }
     }
 
-    /* ================= TOKEN ================= */
+    /* ================= TOKEN =================
+       profileIncomplete only ever applies to students (see
+       Students.profileCompleted in ensureSchema.js) — it drives the
+       "complete your profile" step shown right after their first
+       forced password change. */
     const mustChangePassword = !!user.mustChangePassword;
+    const profileIncomplete = source === "Students" && !user.profileCompleted;
 
     const token = jwt.sign(
       {
@@ -140,6 +145,7 @@ if (!user) {
         permissions,
         source,
         mustChangePassword,
+        profileIncomplete,
       },
       process.env.JWT_SECRET || "asumbi_secret",
       { expiresIn: "1d" }
@@ -158,6 +164,7 @@ if (!user) {
         subject: user.subject || null,
         photoUrl: user.photoUrl || null,
         mustChangePassword,
+        profileIncomplete,
       }
     });
 
@@ -203,7 +210,7 @@ router.put("/change-password", protect, async (req, res) => {
 
     const userRes = await pool.request()
       .input("id", sql.Int, req.user.id)
-      .query(`SELECT id, password FROM ${table} WHERE id = @id`);
+      .query(`SELECT * FROM ${table} WHERE id = @id`);
 
     const account = userRes.recordset[0];
 
@@ -224,7 +231,47 @@ router.put("/change-password", protect, async (req, res) => {
       .input("password", sql.NVarChar, hashed)
       .query(`UPDATE ${table} SET password = @password, mustChangePassword = 0 WHERE id = @id`);
 
-    return res.json({ message: "Password updated successfully" });
+    /* ================= REISSUE TOKEN =================
+       The old token still carries mustChangePassword: true baked in
+       from login, and `protect` reads that claim straight off the
+       token rather than re-querying the DB every request — so
+       without a fresh token every subsequent call would still get
+       blocked with PASSWORD_CHANGE_REQUIRED. Mint a new one here with
+       the flag cleared (and profileIncomplete carried over for
+       students) so the frontend can swap it in immediately. */
+    const profileIncomplete =
+      req.user.source === "Students" && !account.profileCompleted;
+
+    const newToken = jwt.sign(
+      {
+        id: account.id,
+        username: account.username,
+        role: req.user.role,
+        permissions: req.user.permissions,
+        source: req.user.source,
+        mustChangePassword: false,
+        profileIncomplete,
+      },
+      process.env.JWT_SECRET || "asumbi_secret",
+      { expiresIn: "1d" }
+    );
+
+    return res.json({
+      message: "Password updated successfully",
+      token: newToken,
+      user: {
+        id: account.id,
+        username: account.username,
+        name: account.name || "",
+        role: req.user.role,
+        permissions: req.user.permissions,
+        source: req.user.source,
+        subject: account.subject || null,
+        photoUrl: account.photoUrl || null,
+        mustChangePassword: false,
+        profileIncomplete,
+      },
+    });
 
   } catch (err) {
     console.log("CHANGE PASSWORD ERROR:", err);

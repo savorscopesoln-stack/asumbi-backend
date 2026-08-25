@@ -71,6 +71,7 @@ const protect = (req, res, next) => {
       exp: decoded?.exp || null,
 
       mustChangePassword: !!decoded?.mustChangePassword,
+      profileIncomplete: !!decoded?.profileIncomplete,
 
       /*
         EXAM-ONLY SESSION SCOPING
@@ -103,6 +104,32 @@ const protect = (req, res, next) => {
         success: false,
         code: "PASSWORD_CHANGE_REQUIRED",
         message: "You must change your password before continuing.",
+      });
+    }
+
+    /* =====================================================
+       MANDATORY PROFILE COMPLETION (students only)
+       Right after their first password change, a student must fill
+       in their profile details (see PUT /api/student/profile) before
+       anything else in the portal opens up. Every route is blocked
+       except the profile endpoints themselves (GET to load current
+       values, PUT to save, and the photo upload) and change-password
+       (in case they still need it).
+    ===================================================== */
+    const isStudentProfileRoute = req.originalUrl
+      .split("?")[0]
+      .replace(/\/+$/, "")
+      .includes("/api/student/profile");
+
+    if (
+      req.user.profileIncomplete &&
+      !isChangePasswordRoute &&
+      !isStudentProfileRoute
+    ) {
+      return res.status(403).json({
+        success: false,
+        code: "PROFILE_INCOMPLETE",
+        message: "Please complete your profile before continuing.",
       });
     }
 

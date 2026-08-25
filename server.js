@@ -6,6 +6,7 @@ const { Server } = require("socket.io");
 const multer = require("multer");
 const XLSX = require("xlsx");
 const bcrypt = require("bcrypt");
+const jwt = require("jsonwebtoken");
 
 const path = require("path");
 
@@ -698,7 +699,8 @@ app.get("/api/student/profile", protect, async (req, res) => {
       .request()
       .input("studentId", sql.Int, studentId)
       .query(`
-        SELECT id, name, admissionNo, studentClass, gender, yearOfStudy, status, photoUrl
+        SELECT id, name, admissionNo, studentClass, gender, yearOfStudy, status,
+               email, phone, assessmentNumber, photoUrl, profileCompleted
         FROM Students
         WHERE id = @studentId
       `);
@@ -707,6 +709,118 @@ app.get("/api/student/profile", protect, async (req, res) => {
   } catch (err) {
     console.log("STUDENT PROFILE ERROR:", err);
     res.status(500).json({});
+  }
+});
+
+/* =========================================================
+   STUDENT PROFILE — SELF-SERVICE UPDATE
+   A student can fill in / update every column on their own
+   Students row EXCEPT name and admissionNo (those stay
+   staff-managed, set at registration). Always acts on the
+   logged-in student's own id from the token — never a
+   studentId in the body — so one student can never edit
+   another's record through this endpoint.
+
+   Saving here also flips profileCompleted to 1, which is what
+   clears the "complete your profile" step enforced right after
+   a student's first password change (see authMiddleware.js).
+========================================================= */
+app.put("/api/student/profile", protect, authorize("student"), async (req, res) => {
+  try {
+    const pool = req.pool;
+    const studentId = req.user.id;
+
+    let { studentClass, gender, email, phone, assessmentNumber } = req.body;
+
+    studentClass = (studentClass || "").toString().trim();
+    gender = (gender || "").toString().trim();
+    email = (email || "").toString().trim();
+    phone = (phone || "").toString().trim();
+    assessmentNumber = (assessmentNumber || "").toString().trim();
+
+    if (!studentClass || !gender || !email || !phone) {
+      return res.status(400).json({
+        message: "Class, gender, email, and phone are required",
+      });
+    }
+
+    // Same "0xxxxxxxxx" -> "+254xxxxxxxxx" normalization used
+    // everywhere else students'/teachers' phone numbers are saved.
+    let cleanPhone = phone;
+    if (cleanPhone.startsWith("0")) {
+      cleanPhone = "+254" + cleanPhone.substring(1);
+    }
+
+    await pool
+      .request()
+      .input("id", sql.Int, studentId)
+      .input("studentClass", sql.NVarChar, studentClass)
+      .input("gender", sql.NVarChar, gender)
+      .input("email", sql.NVarChar, email)
+      .input("phone", sql.NVarChar, cleanPhone)
+      .input("assessmentNumber", sql.NVarChar, assessmentNumber || null)
+      .query(`
+        UPDATE Students
+        SET studentClass = @studentClass,
+            gender = @gender,
+            email = @email,
+            phone = @phone,
+            assessmentNumber = @assessmentNumber,
+            profileCompleted = 1
+        WHERE id = @id
+      `);
+
+    const updated = await pool
+      .request()
+      .input("id", sql.Int, studentId)
+      .query(`
+        SELECT id, name, admissionNo, studentClass, gender, yearOfStudy, status,
+               email, phone, assessmentNumber, photoUrl, profileCompleted
+        FROM Students
+        WHERE id = @id
+      `);
+
+    const profile = updated.recordset[0] || {};
+
+    /* ================= REISSUE TOKEN =================
+       Same reasoning as change-password: the token the student is
+       currently using still has profileIncomplete: true baked in
+       from login, and `protect` reads that straight off the token —
+       so a fresh one (with the flag cleared) has to go back to the
+       frontend for every route to unblock immediately. */
+    const newToken = jwt.sign(
+      {
+        id: profile.id,
+        username: req.user.username,
+        role: req.user.role,
+        permissions: req.user.permissions,
+        source: req.user.source,
+        mustChangePassword: false,
+        profileIncomplete: false,
+      },
+      process.env.JWT_SECRET || "asumbi_secret",
+      { expiresIn: "1d" }
+    );
+
+    res.json({
+      message: "Profile updated",
+      token: newToken,
+      profile,
+      user: {
+        id: profile.id,
+        username: req.user.username,
+        name: profile.name || "",
+        role: req.user.role,
+        permissions: req.user.permissions,
+        source: req.user.source,
+        photoUrl: profile.photoUrl || null,
+        mustChangePassword: false,
+        profileIncomplete: false,
+      },
+    });
+  } catch (err) {
+    console.log("STUDENT PROFILE UPDATE ERROR:", err);
+    res.status(500).json({ message: "Server error" });
   }
 });
 
