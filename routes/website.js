@@ -1,23 +1,32 @@
 const express = require("express");
 const router = express.Router();
 const { protect, requirePage } = require("../middleware/authMiddleware");
+const { runWebsiteImageUpload, websiteImageUrlFor, deleteWebsiteImageByUrl } = require("../middleware/websitePhotoUpload");
 
 /* =========================================================
    WEBSITE CONTENT
    Backs the public marketing site (the separate Next.js
-   "asumbi-website" project) so its copy — announcements, hero
-   text, the Principal's message, stats, milestones, news,
-   testimonials, FAQs — can be edited from this admin portal's
-   Website page instead of requiring a code change + redeploy.
+   "asumbi-website" project) so every piece of its copy AND
+   its images can be edited from this admin portal's Website
+   page instead of requiring a code change + redeploy.
 
    Storage: one row per section in website_content
    (section_key UNIQUE, content_json NVARCHAR(MAX)) — see
-   utils/ensureSchema.js for table creation + default seed.
+   utils/ensureSchema.js for table creation + default seed,
+   which mirrors exactly what's hardcoded in the site's source
+   today, so nothing changes on the live site until an admin
+   actually edits something.
 
    Read side is PUBLIC (no auth): the Next.js site fetches
    GET /api/website at build/request time and has no user
-   session to send. Write side is admin-portal-only, gated by
-   the "Website" page permission like any other grantable page.
+   session to send. Write side (including image upload) is
+   admin-portal-only, gated by the "Website" page permission
+   like any other grantable page.
+
+   NOT covered here (intentionally): site navigation structure
+   (which pages exist, the header/footer menu links, routing).
+   That's site architecture, not content — editing it wrong
+   breaks links across the whole site, so it stays a code change.
 ========================================================= */
 
 // Sections a caller is allowed to read/write. Keeps the JSON blob
@@ -32,6 +41,22 @@ const VALID_SECTIONS = [
   "news",
   "testimonials",
   "faqs",
+  "accreditations",
+  "departments",
+  "academicsIntro",
+  "quickLinks",
+  "whyUs",
+  "gallery",
+  "partners",
+  "visit",
+  "finalCta",
+  "siteMeta",
+  "aboutIntro",
+  "coreValues",
+  "admissionSteps",
+  "admissionRequirements",
+  "programmes",
+  "pageHeroes",
 ];
 
 module.exports = (poolPromise, sql) => {
@@ -77,6 +102,36 @@ module.exports = (poolPromise, sql) => {
       // just because this admin feature or the DB briefly hiccups.
       res.json({});
     }
+  });
+
+  /* ================= IMAGE UPLOAD (admin) =================
+     Used by every "image" field in the admin's Website page (hero
+     background, principal photo, news thumbnails, gallery photos,
+     testimonial photos, site logo, campus map). Returns a relative
+     URL that gets stored directly in that section's content_json;
+     the public website prefixes it with the backend's origin when
+     rendering <img>, since the two are separate deployments. */
+  router.post("/upload", protect, requirePage("Website"), async (req, res) => {
+    try {
+      await runWebsiteImageUpload(req, res);
+      if (!req.file) return res.status(400).json({ message: "No image file received" });
+
+      const url = websiteImageUrlFor(req.file.filename);
+      res.json({ url });
+    } catch (err) {
+      console.log("WEBSITE IMAGE UPLOAD ERROR:", err.message);
+      res.status(400).json({ message: err.message || "Upload failed" });
+    }
+  });
+
+  /* ================= DELETE AN UPLOADED IMAGE (admin) =================
+     Best-effort cleanup, called by the admin page when a field's image
+     is removed/replaced. Not load-bearing (an orphaned file on disk is
+     harmless), so failures are swallowed rather than surfaced. */
+  router.post("/delete-image", protect, requirePage("Website"), async (req, res) => {
+    const { url } = req.body || {};
+    deleteWebsiteImageByUrl(url);
+    res.json({ message: "OK" });
   });
 
   /* ================= GET ONE SECTION (admin — populates the edit form) ================= */

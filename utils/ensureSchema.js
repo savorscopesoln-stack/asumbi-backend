@@ -561,12 +561,14 @@ async function ensureSchema(pool, sql) {
         headline: "Forming the teachers\nwho form the nation.",
         subtitle:
           "A rigorous, faith-rooted college in Homa Bay County preparing Kenya's next generation of primary and ECDE teachers — in classroom craft, character, and calling.",
+        backgroundImage: null,
       },
       principal: {
         name: "Dr. [Principal's Name]",
         title: "Principal, Asumbi Teachers Training College · PhD Education Administration",
         yearsLabel: "15 yrs",
         quote: "We do not simply teach subjects. We form teachers.",
+        photo: null,
         bio: [
           "Welcome to Asumbi Teachers Training College. For over five decades, this institution has held to one conviction: that the quality of a nation's classrooms depends entirely on the quality of its teachers' preparation. Every tutor, every timetable, and every teaching-practice placement here is built around that conviction.",
           "Our graduates leave not only with sound pedagogical technique, but with the discipline, empathy, and moral seriousness that the profession demands. I invite you to explore what we do, visit our campus, and consider joining a college that takes the formation of teachers as seriously as you do.",
@@ -595,6 +597,7 @@ async function ensureSchema(pool, sql) {
           title: "2027 intake applications now open",
           excerpt: "Prospective students can now apply for the Diploma in Teacher Education and Certificate in ECDE for the January 2027 intake.",
           date: "24 July 2026",
+          image: null,
         },
         {
           tag: "Events",
@@ -602,6 +605,7 @@ async function ensureSchema(pool, sql) {
           title: "Founders' Day & graduation set for November",
           excerpt: "The College will mark 58 years of service alongside this year's graduating class on 14 November 2026.",
           date: "18 July 2026",
+          image: null,
         },
         {
           tag: "Facilities",
@@ -609,6 +613,7 @@ async function ensureSchema(pool, sql) {
           title: "New ICT Resource Centre now open",
           excerpt: "A fully equipped computer lab and digital learning space is now available to all students and staff.",
           date: "2 July 2026",
+          image: null,
         },
       ],
       testimonials: [
@@ -617,18 +622,21 @@ async function ensureSchema(pool, sql) {
           quote: "Teaching practice at Asumbi wasn't a formality — it's where I actually learned to run a classroom. I walked into my first posting already confident.",
           name: "Grace A.",
           detail: "Diploma in Teacher Education, 2022",
+          photo: null,
         },
         {
           initials: "BO",
           quote: "The tutors know your name and your weaknesses, and they don't let you graduate until both are addressed. That is rare, and it matters.",
           name: "Brian O.",
           detail: "Diploma in Teacher Education, 2021",
+          photo: null,
         },
         {
           initials: "FM",
           quote: "I came in unsure if teaching was really for me. I left certain of it, and with the classroom management skills to prove it.",
           name: "Faith M.",
           detail: "Certificate in ECDE, 2023",
+          photo: null,
         },
       ],
       faqs: [
@@ -649,6 +657,126 @@ async function ensureSchema(pool, sql) {
           a: "Teaching practice runs for 12 weeks in a supervised primary school placement, with a tutor visiting and assessing each student multiple times during the term.",
         },
       ],
+      accreditations: [
+        "TVETA Accredited",
+        "Ministry of Education Registered",
+        "Sponsored by the Diocese of Homa Bay",
+        "KNEC Examination Centre",
+      ],
+      // All 9 departments in one list — the homepage preview shows the
+      // first 6, the full Academics page shows all 9. Editing here
+      // updates both.
+      departments: [
+        { index: "01", name: "Languages & Literature", description: "English and Kiswahili methodology, literature, and communication skills for the primary classroom." },
+        { index: "02", name: "Sciences & Mathematics", description: "Integrated science, mathematics pedagogy, and practical laboratory-based teaching methods." },
+        { index: "03", name: "Education Foundations", description: "Educational psychology, philosophy, curriculum studies, and professional ethics." },
+        { index: "04", name: "ICT & Innovation", description: "Digital literacy, ICT integration in teaching, and modern classroom technology." },
+        { index: "05", name: "Home Science & Creative Arts", description: "Practical life skills, art, music, and creative pedagogy for holistic learner development." },
+        { index: "06", name: "Guidance & Counseling", description: "Learner support, pastoral care methods, and counseling skills for the classroom teacher." },
+        { index: "07", name: "Physical Education", description: "Sports pedagogy, games coaching, and health education for the primary curriculum." },
+        { index: "08", name: "Library & Information Science", description: "Information literacy and library-based learning support for trainee teachers." },
+        { index: "09", name: "Student Affairs & Administration", description: "Pastoral care, discipline, and welfare structures supporting student life." },
+      ],
+      academicsIntro: {
+        kicker: "Academic Excellence",
+        heading: "Departments built around the classroom",
+        intro: "Every department exists to answer one question: what does a first-year teacher actually need on day one in front of a class?",
+      },
+      quickLinks: [
+        { icon: "Compass", title: "Our Vision", text: "To be a centre of excellence in teacher education, recognised nationally for the quality, character, and competence of its graduates.", linkHref: "", linkLabel: "" },
+        { icon: "FileText", title: "Our Mission", text: "To train, mentor, and form competent, ethical, and reflective teachers equipped to serve Kenya's learners with skill and integrity.", linkHref: "", linkLabel: "" },
+        { icon: "Users", title: "Principal's Office", text: "A message on our history, our standards, and where the College is headed next.", linkHref: "/about#principal", linkLabel: "Read the message" },
+      ],
+      whyUs: {
+        kicker: "Why Asumbi TTC",
+        heading: "What sets our formation apart",
+        items: [
+          { num: "58", title: "Years of consistent formation", text: "A long, unbroken record of preparing teachers for Kenyan classrooms since 1968." },
+          { num: "12", title: "Weeks of supervised teaching practice", text: "Real classroom placements with structured supervision, not simulated practice alone." },
+          { num: "1:14", title: "Tutor-to-student ratio", text: "Small enough that no student passes through unnoticed or unmentored." },
+          { num: "92%", title: "Graduate placement rate", text: "Most graduates are teaching within a year of completing the programme." },
+        ],
+      },
+      gallery: [
+        { label: "Campus aerial view", image: null, tall: true, video: true },
+        { label: "Teaching practice session", image: null, tall: false, video: false },
+        { label: "Library reading hall", image: null, tall: false, video: false },
+        { label: "Graduation ceremony", image: null, tall: true, video: false },
+        { label: "ICT resource centre", image: null, tall: false, video: false },
+        { label: "Student sports day", image: null, tall: false, video: false },
+      ],
+      partners: ["Ministry of Education", "TSC Kenya", "Diocese of Homa Bay", "KICD", "TVETA", "County Government"],
+      visit: {
+        kicker: "Plan Your Visit",
+        heading: "Come see the campus for yourself",
+        intro: "Prospective students and parents are welcome on campus on weekdays — no appointment needed for a walking tour, though booking ahead means a tutor can meet you.",
+        mapImage: null,
+      },
+      finalCta: {
+        kicker: "2027 Intake Now Open",
+        heading: "Your classroom is waiting for you to be ready for it.",
+        primaryLabel: "Apply Now",
+        secondaryLabel: "Visit Campus",
+      },
+      // Shared by the Header (logo/name) and Footer (address/contact/social)
+      // so both stay in sync from one place instead of duplicated fields.
+      siteMeta: {
+        schoolName: "Asumbi TTC",
+        tagline: "Teachers Training College",
+        logoUrl: null,
+        addressLine1: "Asumbi Teachers Training College, Asumbi, Homa Bay County, Kenya",
+        addressLine2: "P.O. Box 000, Homa Bay County, Kenya",
+        officeHours: "Monday – Friday, 8:00 AM – 5:00 PM",
+        phone: "+254 700 000 000",
+        email: "info@asumbittc.ac.ke",
+        copyrightText: "© 2026 Asumbi Teachers Training College. All rights reserved.",
+        socialLinks: [
+          { platform: "F", url: "#" },
+          { platform: "X", url: "#" },
+          { platform: "Y", url: "#" },
+          { platform: "I", url: "#" },
+        ],
+      },
+      aboutIntro: {
+        visionHeading: "Our Vision",
+        visionText: "To be a centre of excellence in teacher education, recognised nationally for the quality, character, and competence of its graduates.",
+        missionHeading: "Our Mission",
+        missionText: "To train, mentor, and form competent, ethical, and reflective teachers equipped to serve Kenya's learners with skill and integrity.",
+      },
+      coreValues: [
+        { title: "Integrity", text: "We hold ourselves and our students to a consistent standard of honesty and professional ethics." },
+        { title: "Excellence", text: "We pursue rigorous academic and pedagogical standards in everything we teach." },
+        { title: "Service", text: "We form teachers who see the classroom as a place of vocation, not just employment." },
+        { title: "Community", text: "We build a close-knit college where staff and students know and support one another." },
+      ],
+      admissionSteps: [
+        { step: "1", title: "Check requirements", text: "Confirm your KCSE grade meets the minimum for your chosen programme." },
+        { step: "2", title: "Submit application", text: "Complete the online or paper application form with required documents." },
+        { step: "3", title: "Pay application fee", text: "Pay the non-refundable application fee via M-Pesa or bank deposit." },
+        { step: "4", title: "Receive admission letter", text: "Successful applicants receive an official admission letter with reporting date." },
+      ],
+      admissionRequirements: [
+        "Diploma in Teacher Education: KCSE mean grade C- (minus) or above",
+        "Certificate in ECDE: KCSE mean grade D+ (plus) or above",
+        "Certified copies of KCSE certificate and result slip",
+        "National ID or birth certificate",
+        "Two passport-size photographs",
+        "Completed medical examination form",
+      ],
+      programmes: [
+        { name: "Diploma in Teacher Education", duration: "2 years", entry: "KCSE mean grade C- (minus)" },
+        { name: "Certificate in ECDE", duration: "2 years", entry: "KCSE mean grade D+ (plus)" },
+        { name: "Teaching Practice", duration: "12 weeks (embedded)", entry: "Enrolled Diploma/Certificate students" },
+        { name: "Professional Development (Short Courses)", duration: "1–4 weeks", entry: "Serving teachers, open enrolment" },
+      ],
+      // One eyebrow/title/lead per inner page's banner (PageHero).
+      pageHeroes: {
+        about: { eyebrow: "About Asumbi TTC", title: "Fifty-eight years of forming teachers with purpose", lead: "A faith-rooted institution in Homa Bay County, built on one conviction: the quality of a nation's classrooms depends on the quality of its teachers' preparation." },
+        academics: { eyebrow: "Academics", title: "Nine departments, one classroom-first standard", lead: "Every course of study is built around what a first-year teacher actually needs on day one in front of a class." },
+        admissions: { eyebrow: "2027 Intake Now Open", title: "Start your journey to becoming a teacher", lead: "Applications for the January 2027 intake close on 15 September 2026. Early application is strongly encouraged." },
+        contact: { eyebrow: "Contact Us", title: "We'd love to hear from you", lead: "" },
+        news: { eyebrow: "News & Events", title: "What's happening at Asumbi TTC", lead: "" },
+      },
     };
 
     for (const [sectionKey, defaultContent] of Object.entries(websiteDefaults)) {
