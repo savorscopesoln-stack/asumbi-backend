@@ -528,7 +528,141 @@ async function ensureSchema(pool, sql) {
       )
     `);
 
-    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, PortalPageSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, leave_outs code-verification columns, meal_daily_codes, leave_auto_approve, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl, Students.profileCompleted, student_profile_change_requests)");
+    /* ---------------- website_content table ----------------
+       Backs the public marketing website's editable sections (see
+       routes/website.js + frontend Website.jsx admin page). One row
+       per named section ("hero", "announcements", "principal",
+       "stats", "milestones", "news", "testimonials", "faqs"); the
+       actual content is stored as a JSON blob per row so new fields
+       can be added on either side without a migration. Seeded with
+       the same defaults the public site ships with, so the site
+       renders identically before an admin ever touches this page. */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='website_content' AND xtype='U')
+      CREATE TABLE website_content (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        section_key NVARCHAR(50) NOT NULL UNIQUE,
+        content_json NVARCHAR(MAX) NOT NULL,
+        updated_by_id INT NULL,
+        updated_by_name NVARCHAR(200) NULL,
+        updated_at DATETIME NOT NULL DEFAULT GETDATE()
+      )
+    `);
+
+    const websiteDefaults = {
+      announcements: [
+        "2027 intake applications are now open — apply before 15 September",
+        "Founders' Day & Graduation Ceremony holds 14 November 2026",
+        "New ICT Resource Centre now open to all students",
+      ],
+      hero: {
+        kicker: "Karibu — welcome to Asumbi",
+        eyebrow: "Asumbi Teachers Training College · Est. 1968",
+        headline: "Forming the teachers\nwho form the nation.",
+        subtitle:
+          "A rigorous, faith-rooted college in Homa Bay County preparing Kenya's next generation of primary and ECDE teachers — in classroom craft, character, and calling.",
+      },
+      principal: {
+        name: "Dr. [Principal's Name]",
+        title: "Principal, Asumbi Teachers Training College · PhD Education Administration",
+        yearsLabel: "15 yrs",
+        quote: "We do not simply teach subjects. We form teachers.",
+        bio: [
+          "Welcome to Asumbi Teachers Training College. For over five decades, this institution has held to one conviction: that the quality of a nation's classrooms depends entirely on the quality of its teachers' preparation. Every tutor, every timetable, and every teaching-practice placement here is built around that conviction.",
+          "Our graduates leave not only with sound pedagogical technique, but with the discipline, empathy, and moral seriousness that the profession demands. I invite you to explore what we do, visit our campus, and consider joining a college that takes the formation of teachers as seriously as you do.",
+        ],
+      },
+      stats: [
+        { label: "Years Forming Teachers", value: 58 },
+        { label: "Students in Training", value: 1400 },
+        { label: "Graduates Serving Kenya", value: 6200 },
+        { label: "Teaching & Support Staff", value: 74 },
+        { label: "Academic Departments", value: 9 },
+      ],
+      milestones: [
+        { year: "1968", text: "Founded by the Diocese of Homa Bay as a teacher-training centre for the region." },
+        { year: "1985", text: "Awarded full Teachers Training College status by the Ministry of Education." },
+        { year: "2003", text: "Introduced the Diploma in Teacher Education alongside the founding Certificate track." },
+        { year: "2015", text: "Opened the ICT Resource Centre, bringing digital pedagogy into every department." },
+        { year: "2021", text: "Introduced the Certificate in Early Childhood Development & Education (ECDE)." },
+        { year: "2024", text: "TVETA accreditation renewed following an institutional quality audit." },
+        { year: "2026", text: "Over 6,200 graduates now teaching in classrooms across Kenya.", current: true },
+      ],
+      news: [
+        {
+          tag: "Admissions",
+          tagColor: "maroon",
+          title: "2027 intake applications now open",
+          excerpt: "Prospective students can now apply for the Diploma in Teacher Education and Certificate in ECDE for the January 2027 intake.",
+          date: "24 July 2026",
+        },
+        {
+          tag: "Events",
+          tagColor: "green",
+          title: "Founders' Day & graduation set for November",
+          excerpt: "The College will mark 58 years of service alongside this year's graduating class on 14 November 2026.",
+          date: "18 July 2026",
+        },
+        {
+          tag: "Facilities",
+          tagColor: "gold",
+          title: "New ICT Resource Centre now open",
+          excerpt: "A fully equipped computer lab and digital learning space is now available to all students and staff.",
+          date: "2 July 2026",
+        },
+      ],
+      testimonials: [
+        {
+          initials: "GA",
+          quote: "Teaching practice at Asumbi wasn't a formality — it's where I actually learned to run a classroom. I walked into my first posting already confident.",
+          name: "Grace A.",
+          detail: "Diploma in Teacher Education, 2022",
+        },
+        {
+          initials: "BO",
+          quote: "The tutors know your name and your weaknesses, and they don't let you graduate until both are addressed. That is rare, and it matters.",
+          name: "Brian O.",
+          detail: "Diploma in Teacher Education, 2021",
+        },
+        {
+          initials: "FM",
+          quote: "I came in unsure if teaching was really for me. I left certain of it, and with the classroom management skills to prove it.",
+          name: "Faith M.",
+          detail: "Certificate in ECDE, 2023",
+        },
+      ],
+      faqs: [
+        {
+          q: "What qualifications do I need to apply?",
+          a: "A minimum KCSE mean grade of C- (minus) for the Diploma programme, or D+ for Certificate programmes, meeting the specific subject requirements listed on our Admissions page.",
+        },
+        {
+          q: "When does the next intake begin?",
+          a: "Our next intake begins in January 2027. Applications close on 15 September 2026, and early application is strongly encouraged as placements are limited.",
+        },
+        {
+          q: "Is accommodation available on campus?",
+          a: "Yes. On-campus hostels are available for both male and female students on a first-come, first-served basis, with day-scholar options also available.",
+        },
+        {
+          q: "How long is the teaching practice placement?",
+          a: "Teaching practice runs for 12 weeks in a supervised primary school placement, with a tutor visiting and assessing each student multiple times during the term.",
+        },
+      ],
+    };
+
+    for (const [sectionKey, defaultContent] of Object.entries(websiteDefaults)) {
+      await pool.request()
+        .input("sectionKey", sql.NVarChar, sectionKey)
+        .input("contentJson", sql.NVarChar(sql.MAX), JSON.stringify(defaultContent))
+        .query(`
+          IF NOT EXISTS (SELECT 1 FROM website_content WHERE section_key = @sectionKey)
+          INSERT INTO website_content (section_key, content_json, updated_by_name, updated_at)
+          VALUES (@sectionKey, @contentJson, 'System (default)', GETDATE())
+        `);
+    }
+
+    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, PortalPageSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, leave_outs code-verification columns, meal_daily_codes, leave_auto_approve, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl, Students.profileCompleted, student_profile_change_requests, website_content)");
   } catch (err) {
     console.error("⚠️  Schema ensure failed:", err.message);
   }

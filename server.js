@@ -30,6 +30,7 @@ const authRoutes = require("./routes/auth");
 const practicumRoutes = require("./routes/practicum");
 const leaveOutRoutes = require("./routes/leaveOutRoutes")(poolPromise, sql);
 const portalPagesRoutes = require("./routes/portalPages")(poolPromise, sql);
+const websiteRoutes = require("./routes/website")(poolPromise, sql);
 const mealRoutes = require("./routes/mealRoutes");
 const gateRoutes = require("./routes/gate");
 const kitchenRoutes = require("./routes/kitchen");
@@ -159,6 +160,11 @@ app.use("/api/assessments", protect, assessmentsRoutes);
 app.use("/api/practicum", protect, practicumRoutes);
 app.use("/api/leave-outs", protect, leaveOutRoutes);
 app.use("/api/portal-pages", protect, portalPagesRoutes);
+// Not wrapped in global `protect` — GET /api/website is intentionally
+// public (the separate Next.js marketing site fetches it with no user
+// session). The admin-only read/write routes (GET/PUT /:section) apply
+// protect + requirePage("Website") internally in routes/website.js.
+app.use("/api/website", websiteRoutes);
 app.use("/analytics", protect, analyticsRoute);
 app.use("/api/register", registerRoutes);
 app.use("/api/meals", protect, mealRoutes);
