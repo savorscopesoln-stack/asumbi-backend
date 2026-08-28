@@ -31,6 +31,7 @@ const practicumRoutes = require("./routes/practicum");
 const leaveOutRoutes = require("./routes/leaveOutRoutes")(poolPromise, sql);
 const portalPagesRoutes = require("./routes/portalPages")(poolPromise, sql);
 const websiteRoutes = require("./routes/website")(poolPromise, sql);
+const contactRoutes = require("./routes/contact")(poolPromise, sql);
 const mealRoutes = require("./routes/mealRoutes");
 const gateRoutes = require("./routes/gate");
 const kitchenRoutes = require("./routes/kitchen");
@@ -55,11 +56,20 @@ const app = express();
 const server = http.createServer(app);
 
 /* =========================================================
-   ALLOWED ORIGINS (env-driven — set FRONTEND_URL in .env)
+   ALLOWED ORIGINS (env-driven — set FRONTEND_URL / WEBSITE_URL in .env)
    Comma-separate multiple origins, e.g.:
    FRONTEND_URL=https://asumbi.vercel.app,http://localhost:5173
+
+   These are TWO separate deployments hitting this same backend:
+   FRONTEND_URL is the admin portal (Vite/React, asumbi_system_fixed/frontend).
+   WEBSITE_URL is the public marketing site (Next.js, asumbi-website),
+   whose ContactForm/newsletter POSTs run client-side in the visitor's
+   browser — unlike its GET /api/website content fetch, which runs
+   server-side and never sends an Origin header, those two DO need an
+   allowed origin here or the browser blocks the response.
+   e.g. WEBSITE_URL=https://asumbittc.ac.ke,http://localhost:3000
 ========================================================= */
-const allowedOrigins = (process.env.FRONTEND_URL || "http://localhost:5173")
+const allowedOrigins = `${process.env.FRONTEND_URL || "http://localhost:5173"},${process.env.WEBSITE_URL || "http://localhost:3000"}`
   .split(",")
   .map((o) => o.trim())
   .filter(Boolean);
@@ -69,10 +79,12 @@ const corsOptions = {
     // allow non-browser tools (curl/Postman) which send no origin
     if (!origin) return callback(null, true);
 
-    // allow explicit origins from FRONTEND_URL
+    // allow explicit origins from FRONTEND_URL / WEBSITE_URL
     if (allowedOrigins.includes(origin)) return callback(null, true);
 
     // allow any Vercel preview/production deployment URL for this project
+    // (covers both the admin portal AND the public website when both are
+    // deployed under the same Vercel team/project naming pattern)
     if (/^https:\/\/asumbi(-[a-z0-9]+)?-savorscopesoln-stacks-projects\.vercel\.app$/.test(origin)) {
       return callback(null, true);
     }
@@ -165,6 +177,7 @@ app.use("/api/portal-pages", protect, portalPagesRoutes);
 // session). The admin-only read/write routes (GET/PUT /:section) apply
 // protect + requirePage("Website") internally in routes/website.js.
 app.use("/api/website", websiteRoutes);
+app.use("/api/contact", contactRoutes); // public POSTs (contact form + newsletter); GET/manage routes are protected internally
 app.use("/analytics", protect, analyticsRoute);
 app.use("/api/register", registerRoutes);
 app.use("/api/meals", protect, mealRoutes);

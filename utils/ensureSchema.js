@@ -790,7 +790,39 @@ async function ensureSchema(pool, sql) {
         `);
     }
 
-    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, PortalPageSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, leave_outs code-verification columns, meal_daily_codes, leave_auto_approve, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl, Students.profileCompleted, student_profile_change_requests, website_content)");
+    /* ---------------- contact_messages table ----------------
+       Backs POST /api/contact (public) — submissions from the public
+       marketing website's Contact page form. That form used to be a
+       client-side-only stub with no backend at all (see routes/contact.js);
+       this is where those submissions now actually land so an admin can
+       read them, instead of silently vanishing on every page refresh. */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='contact_messages' AND xtype='U')
+      CREATE TABLE contact_messages (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        name NVARCHAR(200) NOT NULL,
+        email NVARCHAR(200) NOT NULL,
+        phone NVARCHAR(50) NULL,
+        message NVARCHAR(MAX) NOT NULL,
+        isRead BIT NOT NULL DEFAULT 0,
+        createdAt DATETIME NOT NULL DEFAULT GETDATE()
+      )
+    `);
+
+    /* ---------------- newsletter_subscribers table ----------------
+       Backs POST /api/contact/newsletter (public) — the email field in
+       the public website's Footer, same "used to go nowhere" gap as
+       contact_messages above. */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='newsletter_subscribers' AND xtype='U')
+      CREATE TABLE newsletter_subscribers (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        email NVARCHAR(200) NOT NULL UNIQUE,
+        createdAt DATETIME NOT NULL DEFAULT GETDATE()
+      )
+    `);
+
+    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, PortalPageSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, leave_outs code-verification columns, meal_daily_codes, leave_auto_approve, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl, Students.profileCompleted, student_profile_change_requests, website_content, contact_messages, newsletter_subscribers)");
   } catch (err) {
     console.error("⚠️  Schema ensure failed:", err.message);
   }
