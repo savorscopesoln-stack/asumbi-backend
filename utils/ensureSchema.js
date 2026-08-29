@@ -61,6 +61,27 @@ async function ensureSchema(pool, sql) {
       ALTER TABLE e_assessments ADD questions_deadline DATETIME NULL
     `);
 
+    /* ---------------- e_assessments.year_of_study ----------------
+       Lets ONE assessment target every class in a year of study (1/2/3)
+       instead of needing one row per class. NULL (the default, and what
+       every pre-existing row has) means "targets exactly its class_id"
+       — unchanged old behavior. When set, class_id is still populated
+       with one representative class (so every existing query/join that
+       reads ea.class_id keeps working for display), but student
+       eligibility/notification is decided by Students.yearOfStudy
+       matching this value instead of a single class — see
+       toggleEAssessmentActive below. Kept as a plain INT (1/2/3) rather
+       than a class-name-parsing scheme, since Students.yearOfStudy is
+       already the school's authoritative year field. */
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='e_assessments' AND xtype='U')
+      AND NOT EXISTS (
+        SELECT * FROM sys.columns
+        WHERE Name = N'year_of_study' AND Object_ID = Object_ID(N'e_assessments')
+      )
+      ALTER TABLE e_assessments ADD year_of_study INT NULL
+    `);
+
     /* ---------------- Notifications table ---------------- */
     await pool.request().query(`
       IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='Notifications' AND xtype='U')

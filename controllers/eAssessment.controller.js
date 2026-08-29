@@ -27,17 +27,20 @@ const generateToken = () => {
 const createEAssessment = async (req, res) => {
   try {
     const pool = req.pool;
-    const { title, subject, class_id, duration_minutes, instructions, total_marks, exam_password, questions_deadline, question_setter_teacher_ids } = req.body;
+    const { title, subject, class_id, year_of_study, duration_minutes, instructions, total_marks, exam_password, questions_deadline, question_setter_teacher_ids } = req.body;
     const teacher_id = req.user?.id || null;
 
     if (!title || !subject || !class_id) {
       return res.status(400).json({ message: "Missing required fields" });
     }
 
+    const yearOfStudyVal = toInt(year_of_study) || null;
+
     const result = await pool.request()
       .input("title", sql.NVarChar, title)
       .input("subject", sql.NVarChar, subject)
       .input("class_id", sql.Int, class_id)
+      .input("year_of_study", sql.Int, yearOfStudyVal)
       .input("teacher_id", sql.Int, teacher_id)
       .input("duration_minutes", sql.Int, duration_minutes || 30)
       .input("total_marks", sql.Int, total_marks || 100)
@@ -46,11 +49,17 @@ const createEAssessment = async (req, res) => {
       .input("questions_deadline", sql.DateTime, questions_deadline ? new Date(questions_deadline) : null)
       .query(`
         INSERT INTO e_assessments
-          (title, subject, class_id, teacher_id, duration_minutes, total_marks, instructions, status, exam_password, questions_deadline)
+          (title, subject, class_id, year_of_study, teacher_id, duration_minutes, total_marks, instructions, status, active_status, exam_password, questions_deadline)
         OUTPUT INSERTED.id
         VALUES
-          (@title, @subject, @class_id, @teacher_id, @duration_minutes, @total_marks, @instructions, 'pending', @exam_password, @questions_deadline)
+          (@title, @subject, @class_id, @year_of_study, @teacher_id, @duration_minutes, @total_marks, @instructions, 'pending', 'Inactive', @exam_password, @questions_deadline)
       `);
+    // active_status starts explicitly 'Inactive' (never left NULL) so the
+    // admin's Start/Stop button and the isActive check on the frontend
+    // (a.active_status === "Active") always agree on a freshly-created
+    // assessment's state — previously this was left NULL, which the
+    // frontend read as "active" but the toggle endpoint read as
+    // "inactive", so the very first click looked like it did nothing.
 
     const assessmentId = result.recordset[0].id;
 
@@ -78,12 +87,14 @@ const updateEAssessment = async (req, res) => {
   try {
     const pool = req.pool;
     const id = toInt(req.params.id);
-    const { title, subject, class_id, duration_minutes, instructions, total_marks, exam_password, questions_deadline, question_setter_teacher_ids } = req.body;
+    const { title, subject, class_id, year_of_study, duration_minutes, instructions, total_marks, exam_password, questions_deadline, question_setter_teacher_ids } = req.body;
 
     if (!id) return res.status(400).json({ message: "Invalid assessment ID" });
     if (!title || !subject || !class_id) {
       return res.status(400).json({ message: "Missing required fields" });
     }
+
+    const yearOfStudyVal = toInt(year_of_study) || null;
 
     const existing = await pool.request().input("id", sql.Int, id)
       .query(`SELECT id FROM e_assessments WHERE id = @id`);
@@ -96,6 +107,7 @@ const updateEAssessment = async (req, res) => {
       .input("title", sql.NVarChar, title)
       .input("subject", sql.NVarChar, subject)
       .input("class_id", sql.Int, class_id)
+      .input("year_of_study", sql.Int, yearOfStudyVal)
       .input("duration_minutes", sql.Int, duration_minutes || 30)
       .input("total_marks", sql.Int, total_marks || 100)
       .input("instructions", sql.NVarChar, instructions || "")
@@ -106,6 +118,7 @@ const updateEAssessment = async (req, res) => {
         SET title = @title,
             subject = @subject,
             class_id = @class_id,
+            year_of_study = @year_of_study,
             duration_minutes = @duration_minutes,
             total_marks = @total_marks,
             instructions = @instructions,
@@ -165,12 +178,22 @@ const getEAssessments = async (req, res) => {
     // submission for an exam nobody has taken. Without (b)/(c) a teacher
     // who isn't the creator has no way to ever find the assessment.
     // Admin and sub_admin still see everything (needed for review/
-    // approval), and students see everything for their class
-    // (redactForRole strips the exam password for them).
+    // approval). A student sees only assessments that actually target
+    // them: either their own class directly (ea.class_id, matched via
+    // Classes.name = Students.studentClass — the same name-matching
+    // already used for the "assessment now open" notification), or a
+    // whole-year assessment (ea.year_of_study matching their own
+    // Students.yearOfStudy — see the ClassMultiSelect/year-of-study
+    // work on the admin side). Before this, every student saw every
+    // assessment ever created regardless of class — StudentEAssessments
+    // and TakeAssessmentPicker only ever filtered by approval status,
+    // never by class, because the API handed them everyone's exams.
     const isTeacher = req.user?.role === "teacher";
+    const isStudent = req.user?.role === "student";
 
     const request = pool.request();
     if (isTeacher) request.input("teacherId", sql.Int, toInt(req.user.id));
+    if (isStudent) request.input("studentId", sql.Int, toInt(req.user.id));
 
     const result = await request.query(`
       SELECT ea.*, t.name AS teacher_name, c.name AS class_name,
@@ -190,7 +213,13 @@ const getEAssessments = async (req, res) => {
          OR EXISTS (
               SELECT 1 FROM e_assessment_question_setters qs
               WHERE qs.e_assessment_id = ea.id AND qs.teacher_id = @teacherId
-            )` : ""}
+            )` : isStudent ? `
+      WHERE ea.class_id IN (
+              SELECT c2.id FROM Classes c2
+              JOIN Students st ON st.studentClass = c2.name
+              WHERE st.id = @studentId
+            )
+         OR ea.year_of_study = (SELECT yearOfStudy FROM Students WHERE id = @studentId)` : ""}
       ORDER BY ea.id DESC
     `);
     const rows = (result.recordset || []).map((r) => redactForRole(r, req.user?.role));
@@ -250,6 +279,32 @@ const getEAssessmentById = async (req, res) => {
     }
     const assessment = redactForRole(assessmentResult.recordset[0], req.user?.role);
 
+    // A student taking the exam gets their TRUE remaining time here,
+    // computed server-side from when their session was first activated
+    // — not the assessment's nominal duration. Without this, the
+    // frontend's countdown has no way to know how much time has
+    // already elapsed, and (see TakeEAssessment.jsx's enterActive())
+    // would reset to the full duration on every refresh or resume —
+    // letting a student reset their exam clock indefinitely just by
+    // reloading the page or getting locked/unlocked.
+    let remaining_seconds = null;
+    if (req.user?.role === "student" && req.user.examOnly && req.user.examAssessmentId === assessmentId) {
+      const sessionResult = await pool.request()
+        .input("aid", sql.Int, assessmentId)
+        .input("sid", sql.Int, req.user.id)
+        .query(`SELECT activated_at FROM e_assessment_exam_sessions WHERE e_assessment_id = @aid AND student_id = @sid`);
+      const activatedAt = sessionResult.recordset[0]?.activated_at;
+      const totalSeconds = (assessment.duration_minutes || 30) * 60;
+      if (activatedAt) {
+        const elapsedSeconds = Math.floor((Date.now() - new Date(activatedAt).getTime()) / 1000);
+        remaining_seconds = Math.max(0, totalSeconds - elapsedSeconds);
+      } else {
+        // Not activated yet (shouldn't normally happen — this endpoint
+        // is only called after activation) — fall back to full duration.
+        remaining_seconds = totalSeconds;
+      }
+    }
+
     const questionResult = await pool.request()
       .input("id", sql.Int, assessmentId)
       .query(`
@@ -282,7 +337,7 @@ const getEAssessmentById = async (req, res) => {
       }
     });
 
-    res.json({ assessment, questions: Object.values(map) });
+    res.json({ assessment, questions: Object.values(map), remaining_seconds });
   } catch (err) {
     console.error("GET ASSESSMENT ERROR:", err);
     res.status(500).json({ message: "Server Error" });
@@ -1083,22 +1138,30 @@ const toggleEAssessmentActive = async (req, res) => {
     const id = toInt(req.params.id);
 
     const current = await pool.request().input("id", sql.Int, id)
-      .query(`SELECT active_status, class_id, title FROM e_assessments WHERE id = @id`);
+      .query(`SELECT active_status, class_id, year_of_study, title FROM e_assessments WHERE id = @id`);
     if (!current.recordset.length) return res.status(404).json({ message: "Assessment not found" });
 
-    const { class_id, title } = current.recordset[0];
+    const { class_id, year_of_study, title } = current.recordset[0];
     const next = current.recordset[0].active_status === "Active" ? "Inactive" : "Active";
     await pool.request().input("id", sql.Int, id).input("active_status", sql.NVarChar(20), next)
       .query(`UPDATE e_assessments SET active_status = @active_status WHERE id = @id`);
 
-    if (next === "Active" && class_id) {
-      const students = await pool.request().input("classId", sql.Int, class_id)
-        .query(`
-          SELECT st.id
-          FROM Students st
-          JOIN Classes c ON c.id = @classId
-          WHERE st.studentClass = c.name
-        `);
+    if (next === "Active" && (class_id || year_of_study)) {
+      // A year-wide assessment (year_of_study set) targets every student
+      // in that year of study directly via Students.yearOfStudy, rather
+      // than the single class_id it also carries for backward-compat
+      // display — that class_id is only a "representative" class, not
+      // the whole audience, once year_of_study is set.
+      const students = year_of_study
+        ? await pool.request().input("year", sql.Int, year_of_study)
+            .query(`SELECT id FROM Students WHERE yearOfStudy = @year`)
+        : await pool.request().input("classId", sql.Int, class_id)
+            .query(`
+              SELECT st.id
+              FROM Students st
+              JOIN Classes c ON c.id = @classId
+              WHERE st.studentClass = c.name
+            `);
       await notifyUsers(
         pool,
         (students.recordset || []).map((s) => ({ id: s.id, source: "Students" })),
