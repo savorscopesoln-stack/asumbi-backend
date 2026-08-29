@@ -57,6 +57,8 @@ const VALID_SECTIONS = [
   "admissionRequirements",
   "programmes",
   "pageHeroes",
+  "events",
+  "admissionsExternal",
 ];
 
 module.exports = (poolPromise, sql) => {

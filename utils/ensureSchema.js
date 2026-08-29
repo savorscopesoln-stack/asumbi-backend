@@ -613,26 +613,32 @@ async function ensureSchema(pool, sql) {
       ],
       news: [
         {
+          slug: "2027-intake-applications-now-open",
           tag: "Admissions",
           tagColor: "maroon",
           title: "2027 intake applications now open",
           excerpt: "Prospective students can now apply for the Diploma in Teacher Education and Certificate in ECDE for the January 2027 intake.",
+          body: "Prospective students can now apply for the Diploma in Teacher Education and Certificate in ECDE for the January 2027 intake. See the Admissions page for entry requirements and how to reach the official admissions channel.",
           date: "24 July 2026",
           image: null,
         },
         {
+          slug: "founders-day-graduation-set-for-november",
           tag: "Events",
           tagColor: "green",
           title: "Founders' Day & graduation set for November",
           excerpt: "The College will mark 58 years of service alongside this year's graduating class on 14 November 2026.",
+          body: "The College will mark 58 years of service alongside this year's graduating class on 14 November 2026. Further details on the programme of events will be published closer to the date.",
           date: "18 July 2026",
           image: null,
         },
         {
+          slug: "new-ict-resource-centre-now-open",
           tag: "Facilities",
           tagColor: "gold",
           title: "New ICT Resource Centre now open",
           excerpt: "A fully equipped computer lab and digital learning space is now available to all students and staff.",
+          body: "A fully equipped computer lab and digital learning space is now available to all students and staff, supporting digital literacy and ICT integration across every department.",
           date: "2 July 2026",
           image: null,
         },
@@ -688,15 +694,15 @@ async function ensureSchema(pool, sql) {
       // first 6, the full Academics page shows all 9. Editing here
       // updates both.
       departments: [
-        { index: "01", name: "Languages & Literature", description: "English and Kiswahili methodology, literature, and communication skills for the primary classroom." },
-        { index: "02", name: "Sciences & Mathematics", description: "Integrated science, mathematics pedagogy, and practical laboratory-based teaching methods." },
-        { index: "03", name: "Education Foundations", description: "Educational psychology, philosophy, curriculum studies, and professional ethics." },
-        { index: "04", name: "ICT & Innovation", description: "Digital literacy, ICT integration in teaching, and modern classroom technology." },
-        { index: "05", name: "Home Science & Creative Arts", description: "Practical life skills, art, music, and creative pedagogy for holistic learner development." },
-        { index: "06", name: "Guidance & Counseling", description: "Learner support, pastoral care methods, and counseling skills for the classroom teacher." },
-        { index: "07", name: "Physical Education", description: "Sports pedagogy, games coaching, and health education for the primary curriculum." },
-        { index: "08", name: "Library & Information Science", description: "Information literacy and library-based learning support for trainee teachers." },
-        { index: "09", name: "Student Affairs & Administration", description: "Pastoral care, discipline, and welfare structures supporting student life." },
+        { index: "01", slug: "languages-literature", name: "Languages & Literature", description: "English and Kiswahili methodology, literature, and communication skills for the primary classroom.", overview: "English and Kiswahili methodology, literature, and communication skills for the primary classroom." },
+        { index: "02", slug: "sciences-mathematics", name: "Sciences & Mathematics", description: "Integrated science, mathematics pedagogy, and practical laboratory-based teaching methods.", overview: "Integrated science, mathematics pedagogy, and practical laboratory-based teaching methods." },
+        { index: "03", slug: "education-foundations", name: "Education Foundations", description: "Educational psychology, philosophy, curriculum studies, and professional ethics.", overview: "Educational psychology, philosophy, curriculum studies, and professional ethics." },
+        { index: "04", slug: "ict-innovation", name: "ICT & Innovation", description: "Digital literacy, ICT integration in teaching, and modern classroom technology.", overview: "Digital literacy, ICT integration in teaching, and modern classroom technology." },
+        { index: "05", slug: "home-science-creative-arts", name: "Home Science & Creative Arts", description: "Practical life skills, art, music, and creative pedagogy for holistic learner development.", overview: "Practical life skills, art, music, and creative pedagogy for holistic learner development." },
+        { index: "06", slug: "guidance-counseling", name: "Guidance & Counseling", description: "Learner support, pastoral care methods, and counseling skills for the classroom teacher.", overview: "Learner support, pastoral care methods, and counseling skills for the classroom teacher." },
+        { index: "07", slug: "physical-education", name: "Physical Education", description: "Sports pedagogy, games coaching, and health education for the primary curriculum.", overview: "Sports pedagogy, games coaching, and health education for the primary curriculum." },
+        { index: "08", slug: "library-information-science", name: "Library & Information Science", description: "Information literacy and library-based learning support for trainee teachers.", overview: "Information literacy and library-based learning support for trainee teachers." },
+        { index: "09", slug: "student-affairs-administration", name: "Student Affairs & Administration", description: "Pastoral care, discipline, and welfare structures supporting student life.", overview: "Pastoral care, discipline, and welfare structures supporting student life." },
       ],
       academicsIntro: {
         kicker: "Academic Excellence",
@@ -736,7 +742,9 @@ async function ensureSchema(pool, sql) {
       finalCta: {
         kicker: "2027 Intake Now Open",
         heading: "Your classroom is waiting for you to be ready for it.",
-        primaryLabel: "Apply Now",
+        // "Prospective Students", not "Apply Now" — Asumbi doesn't
+        // process applications directly (see admissionsExternal).
+        primaryLabel: "Prospective Students",
         secondaryLabel: "Visit Campus",
       },
       // Shared by the Header (logo/name) and Footer (address/contact/social)
@@ -770,11 +778,14 @@ async function ensureSchema(pool, sql) {
         { title: "Service", text: "We form teachers who see the classroom as a place of vocation, not just employment." },
         { title: "Community", text: "We build a close-knit college where staff and students know and support one another." },
       ],
+      // Deliberately informational, not transactional — Asumbi does not
+      // process applications directly (see admissionsExternal below).
+      // No "submit application" / "pay application fee" steps here.
       admissionSteps: [
         { step: "1", title: "Check requirements", text: "Confirm your KCSE grade meets the minimum for your chosen programme." },
-        { step: "2", title: "Submit application", text: "Complete the online or paper application form with required documents." },
-        { step: "3", title: "Pay application fee", text: "Pay the non-refundable application fee via M-Pesa or bank deposit." },
-        { step: "4", title: "Receive admission letter", text: "Successful applicants receive an official admission letter with reporting date." },
+        { step: "2", title: "Prepare your documents", text: "Gather your KCSE certificate, result slip, ID/birth certificate, and passport photos ahead of applying." },
+        { step: "3", title: "Apply through the official channel", text: "Applications and placement are handled by the relevant official admissions authority — use the link below to apply." },
+        { step: "4", title: "Await your admission outcome", text: "Successful applicants receive an official admission letter with reporting date from the admissions authority." },
       ],
       admissionRequirements: [
         "Diploma in Teacher Education: KCSE mean grade C- (minus) or above",
@@ -785,10 +796,46 @@ async function ensureSchema(pool, sql) {
         "Completed medical examination form",
       ],
       programmes: [
-        { name: "Diploma in Teacher Education", duration: "2 years", entry: "KCSE mean grade C- (minus)" },
-        { name: "Certificate in ECDE", duration: "2 years", entry: "KCSE mean grade D+ (plus)" },
-        { name: "Teaching Practice", duration: "12 weeks (embedded)", entry: "Enrolled Diploma/Certificate students" },
-        { name: "Professional Development (Short Courses)", duration: "1–4 weeks", entry: "Serving teachers, open enrolment" },
+        {
+          slug: "diploma-in-teacher-education",
+          name: "Diploma in Teacher Education",
+          duration: "2 years",
+          entry: "KCSE mean grade C- (minus)",
+          overview: "A two-year programme preparing primary-school teachers in classroom craft, pedagogy, and professional practice.",
+          subjects: "",
+          careerPathways: "",
+          entryRequirements: "KCSE mean grade C- (minus) or above",
+        },
+        {
+          slug: "certificate-in-ecde",
+          name: "Certificate in ECDE",
+          duration: "2 years",
+          entry: "KCSE mean grade D+ (plus)",
+          overview: "A two-year programme in Early Childhood Development & Education, preparing teachers for the pre-primary classroom.",
+          subjects: "",
+          careerPathways: "",
+          entryRequirements: "KCSE mean grade D+ (plus) or above",
+        },
+        {
+          slug: "teaching-practice",
+          name: "Teaching Practice",
+          duration: "12 weeks (embedded)",
+          entry: "Enrolled Diploma/Certificate students",
+          overview: "A supervised classroom placement embedded within the Diploma and Certificate programmes.",
+          subjects: "",
+          careerPathways: "",
+          entryRequirements: "Enrolled Diploma/Certificate students",
+        },
+        {
+          slug: "professional-development-short-courses",
+          name: "Professional Development (Short Courses)",
+          duration: "1–4 weeks",
+          entry: "Serving teachers, open enrolment",
+          overview: "Short, focused courses for serving teachers looking to update their classroom skills.",
+          subjects: "",
+          careerPathways: "",
+          entryRequirements: "Open enrolment for serving teachers",
+        },
       ],
       // One eyebrow/title/lead per inner page's banner (PageHero).
       pageHeroes: {
@@ -797,6 +844,19 @@ async function ensureSchema(pool, sql) {
         admissions: { eyebrow: "2027 Intake Now Open", title: "Start your journey to becoming a teacher", lead: "Applications for the January 2027 intake close on 15 September 2026. Early application is strongly encouraged." },
         contact: { eyebrow: "Contact Us", title: "We'd love to hear from you", lead: "" },
         news: { eyebrow: "News & Events", title: "What's happening at Asumbi TTC", lead: "" },
+      },
+      // Empty by default — real, dated events are entered by an admin
+      // rather than fabricated. The public Events page simply shows
+      // nothing until one is added.
+      events: [],
+      // Asumbi does not process applications directly (see master
+      // instructions). `url` starts blank rather than pointing at an
+      // invented admissions body — the Admissions page hides the
+      // button (shows only the note) until an admin sets a real URL.
+      admissionsExternal: {
+        url: "",
+        label: "Official Admissions Information",
+        note: "Applications and placement are handled through the relevant official admissions authority. Please use the official admissions channel for current application and placement information.",
       },
     };
 
@@ -810,6 +870,63 @@ async function ensureSchema(pool, sql) {
           VALUES (@sectionKey, @contentJson, 'System (default)', GETDATE())
         `);
     }
+
+    /* ---------------- website_content additive migration ----------------
+       "programmes", "departments" and "news" gained new fields (slug,
+       overview, subjects, careerPathways, entryRequirements, body) for
+       the detail pages. The seed loop above only inserts a section that
+       doesn't exist at all — a DB that already had these sections from
+       before keeps its old shape forever otherwise. This patches ONLY
+       the missing keys onto each existing item, so anything an admin
+       already edited is left exactly as they left it. Runs every boot
+       but is a no-op once every row has caught up. */
+    const slugify = (s) =>
+      String(s || "").toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
+
+    const patchMissingFields = async (sectionKey, defaultsFor) => {
+      try {
+        const existing = await pool.request()
+          .input("sectionKey", sql.NVarChar, sectionKey)
+          .query(`SELECT content_json FROM website_content WHERE section_key=@sectionKey`);
+        const row = existing.recordset[0];
+        if (!row) return;
+
+        let items;
+        try { items = JSON.parse(row.content_json); } catch { return; }
+        if (!Array.isArray(items)) return;
+
+        let changed = false;
+        const patched = items.map((item) => {
+          const merged = { ...defaultsFor(item), ...item }; // existing fields always win
+          if (JSON.stringify(merged) !== JSON.stringify(item)) changed = true;
+          return merged;
+        });
+        if (!changed) return;
+
+        await pool.request()
+          .input("sectionKey", sql.NVarChar, sectionKey)
+          .input("contentJson", sql.NVarChar(sql.MAX), JSON.stringify(patched))
+          .query(`UPDATE website_content SET content_json=@contentJson WHERE section_key=@sectionKey`);
+      } catch (err) {
+        console.log(`WEBSITE CONTENT MIGRATION (${sectionKey}) ERROR:`, err.message);
+      }
+    };
+
+    await patchMissingFields("programmes", (p) => ({
+      slug: slugify(p.name),
+      overview: "",
+      subjects: "",
+      careerPathways: "",
+      entryRequirements: p.entry || "",
+    }));
+    await patchMissingFields("departments", (d) => ({
+      slug: slugify(d.name),
+      overview: d.description || "",
+    }));
+    await patchMissingFields("news", (n) => ({
+      slug: slugify(n.title),
+      body: n.excerpt || "",
+    }));
 
     /* ---------------- contact_messages table ----------------
        Backs POST /api/contact (public) — submissions from the public
