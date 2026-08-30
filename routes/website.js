@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const { protect, requirePage } = require("../middleware/authMiddleware");
 const { runWebsiteImageUpload, websiteImageUrlFor, deleteWebsiteImageByUrl } = require("../middleware/websitePhotoUpload");
+const { runWebsiteFileUpload, websiteFileUrlFor, deleteWebsiteFileByUrl } = require("../middleware/websiteFileUpload");
 
 /* =========================================================
    WEBSITE CONTENT
@@ -59,6 +60,8 @@ const VALID_SECTIONS = [
   "pageHeroes",
   "events",
   "admissionsExternal",
+  "downloads",
+  "leadership",
 ];
 
 module.exports = (poolPromise, sql) => {
@@ -133,6 +136,30 @@ module.exports = (poolPromise, sql) => {
   router.post("/delete-image", protect, requirePage("Website"), async (req, res) => {
     const { url } = req.body || {};
     deleteWebsiteImageByUrl(url);
+    res.json({ message: "OK" });
+  });
+
+  /* ================= FILE UPLOAD (admin) =================
+     Used by the "file" field type in the admin's Downloads section
+     (prospectuses, handbooks, forms, policies — PDF/Word/Excel).
+     Same pattern as image upload, separate directory/MIME allowlist. */
+  router.post("/upload-file", protect, requirePage("Website"), async (req, res) => {
+    try {
+      await runWebsiteFileUpload(req, res);
+      if (!req.file) return res.status(400).json({ message: "No file received" });
+
+      const url = websiteFileUrlFor(req.file.filename);
+      res.json({ url, originalName: req.file.originalname, size: req.file.size });
+    } catch (err) {
+      console.log("WEBSITE FILE UPLOAD ERROR:", err.message);
+      res.status(400).json({ message: err.message || "Upload failed" });
+    }
+  });
+
+  /* ================= DELETE AN UPLOADED FILE (admin) ================= */
+  router.post("/delete-file", protect, requirePage("Website"), async (req, res) => {
+    const { url } = req.body || {};
+    deleteWebsiteFileByUrl(url);
     res.json({ message: "OK" });
   });
 

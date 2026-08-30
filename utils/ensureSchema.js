@@ -844,6 +844,12 @@ async function ensureSchema(pool, sql) {
         admissions: { eyebrow: "2027 Intake Now Open", title: "Start your journey to becoming a teacher", lead: "Applications for the January 2027 intake close on 15 September 2026. Early application is strongly encouraged." },
         contact: { eyebrow: "Contact Us", title: "We'd love to hear from you", lead: "" },
         news: { eyebrow: "News & Events", title: "What's happening at Asumbi TTC", lead: "" },
+        programmes: { eyebrow: "Academic Programmes", title: "Choose your path", lead: "Every course of study is built around what a first-year teacher actually needs on day one in front of a class." },
+        departments: { eyebrow: "Academic Departments", title: "Nine departments, one classroom-first standard", lead: "Every department exists to answer one question: what does a first-year teacher actually need on day one in front of a class?" },
+        gallery: { eyebrow: "Campus Life", title: "Campus Gallery", lead: "A look at life on campus — teaching practice, facilities, and student activities." },
+        events: { eyebrow: "Events", title: "What's on at Asumbi TTC", lead: "Upcoming college events, ceremonies, and open days." },
+        downloads: { eyebrow: "Resources", title: "Downloads & Documents", lead: "Prospectuses, forms, policies, and other official documents." },
+        leadership: { eyebrow: "Leadership", title: "College Leadership", lead: "The people leading Asumbi Teachers Training College." },
       },
       // Empty by default — real, dated events are entered by an admin
       // rather than fabricated. The public Events page simply shows
@@ -858,6 +864,10 @@ async function ensureSchema(pool, sql) {
         label: "Official Admissions Information",
         note: "Applications and placement are handled through the relevant official admissions authority. Please use the official admissions channel for current application and placement information.",
       },
+      // Both empty by default — real files/profiles are added by an
+      // admin rather than fabricated.
+      downloads: [],
+      leadership: [],
     };
 
     for (const [sectionKey, defaultContent] of Object.entries(websiteDefaults)) {
@@ -922,11 +932,49 @@ async function ensureSchema(pool, sql) {
     await patchMissingFields("departments", (d) => ({
       slug: slugify(d.name),
       overview: d.description || "",
+      staff: "",
     }));
     await patchMissingFields("news", (n) => ({
       slug: slugify(n.title),
       body: n.excerpt || "",
     }));
+
+    // pageHeroes is a single object (not an array of items), so it
+    // needs its own patcher: fill in only the new page keys that
+    // don't exist yet on an already-deployed DB, leaving any edited
+    // existing page heroes untouched.
+    const patchMissingObjectKeys = async (sectionKey, extraKeys) => {
+      try {
+        const existing = await pool.request()
+          .input("sectionKey", sql.NVarChar, sectionKey)
+          .query(`SELECT content_json FROM website_content WHERE section_key=@sectionKey`);
+        const row = existing.recordset[0];
+        if (!row) return;
+
+        let content;
+        try { content = JSON.parse(row.content_json); } catch { return; }
+        if (!content || typeof content !== "object" || Array.isArray(content)) return;
+
+        const merged = { ...extraKeys, ...content };
+        if (JSON.stringify(merged) === JSON.stringify(content)) return;
+
+        await pool.request()
+          .input("sectionKey", sql.NVarChar, sectionKey)
+          .input("contentJson", sql.NVarChar(sql.MAX), JSON.stringify(merged))
+          .query(`UPDATE website_content SET content_json=@contentJson WHERE section_key=@sectionKey`);
+      } catch (err) {
+        console.log(`WEBSITE CONTENT MIGRATION (${sectionKey}) ERROR:`, err.message);
+      }
+    };
+
+    await patchMissingObjectKeys("pageHeroes", {
+      programmes: { eyebrow: "Academic Programmes", title: "Choose your path", lead: "Every course of study is built around what a first-year teacher actually needs on day one in front of a class." },
+      departments: { eyebrow: "Academic Departments", title: "Nine departments, one classroom-first standard", lead: "Every department exists to answer one question: what does a first-year teacher actually need on day one in front of a class?" },
+      gallery: { eyebrow: "Campus Life", title: "Campus Gallery", lead: "A look at life on campus — teaching practice, facilities, and student activities." },
+      events: { eyebrow: "Events", title: "What's on at Asumbi TTC", lead: "Upcoming college events, ceremonies, and open days." },
+      downloads: { eyebrow: "Resources", title: "Downloads & Documents", lead: "Prospectuses, forms, policies, and other official documents." },
+      leadership: { eyebrow: "Leadership", title: "College Leadership", lead: "The people leading Asumbi Teachers Training College." },
+    });
 
     /* ---------------- contact_messages table ----------------
        Backs POST /api/contact (public) — submissions from the public
