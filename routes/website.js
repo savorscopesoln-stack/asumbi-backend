@@ -62,6 +62,7 @@ const VALID_SECTIONS = [
   "admissionsExternal",
   "downloads",
   "leadership",
+  "staff",
 ];
 
 module.exports = (poolPromise, sql) => {
@@ -212,10 +213,11 @@ module.exports = (poolPromise, sql) => {
 
       const pool = await poolPromise;
       const actorName = await getActorDisplayName(pool, req.user);
+      const contentJson = JSON.stringify(content);
 
       await pool.request()
         .input("sectionKey", sql.NVarChar, section)
-        .input("contentJson", sql.NVarChar(sql.MAX), JSON.stringify(content))
+        .input("contentJson", sql.NVarChar(sql.MAX), contentJson)
         .input("updatedById", sql.Int, req.user.id)
         .input("updatedByName", sql.NVarChar, actorName)
         .query(`
@@ -229,10 +231,148 @@ module.exports = (poolPromise, sql) => {
             VALUES (@sectionKey, @contentJson, @updatedById, @updatedByName, GETDATE());
         `);
 
+      // Version history / audit trail — append-only snapshot of this
+      // save. Best-effort: a failure here must never block the actual
+      // content save above, which is why it's in its own try/catch
+      // rather than sharing the outer one.
+      try {
+        await pool.request()
+          .input("sectionKey", sql.NVarChar, section)
+          .input("contentJson", sql.NVarChar(sql.MAX), contentJson)
+          .input("updatedById", sql.Int, req.user.id)
+          .input("updatedByName", sql.NVarChar, actorName)
+          .query(`
+            INSERT INTO website_content_history (section_key, content_json, updated_by_id, updated_by_name, updated_at)
+            VALUES (@sectionKey, @contentJson, @updatedById, @updatedByName, GETDATE())
+          `);
+
+        // Keep at most the 20 most recent versions per section so the
+        // table doesn't grow unbounded — an editable CMS field gets
+        // saved a lot over a site's lifetime.
+        await pool.request()
+          .input("sectionKey", sql.NVarChar, section)
+          .query(`
+            DELETE FROM website_content_history
+            WHERE section_key=@sectionKey
+              AND id NOT IN (
+                SELECT TOP 20 id FROM website_content_history
+                WHERE section_key=@sectionKey
+                ORDER BY updated_at DESC
+              )
+          `);
+      } catch (histErr) {
+        console.log("WEBSITE CONTENT HISTORY WRITE ERROR:", histErr.message);
+      }
+
       res.json({ message: "Saved", section_key: section });
     } catch (err) {
       console.log("WEBSITE SAVE SECTION ERROR:", err);
       res.status(500).json({ message: "Failed to save section" });
+    }
+  });
+
+  /* ================= VERSION HISTORY (admin) =================
+     Returns up to the 20 most recent saved snapshots for a section,
+     newest first — who changed it and when (master instructions
+     §50, audit log), and enough to restore an earlier version (§49,
+     content versioning). Snapshot content itself is included so the
+     admin page can show a preview/diff without a second round trip. */
+  router.get("/:section/history", protect, requirePage("Website"), async (req, res) => {
+    try {
+      const section = String(req.params.section || "");
+      if (!VALID_SECTIONS.includes(section)) {
+        return res.status(400).json({ message: "Unknown section" });
+      }
+
+      const pool = await poolPromise;
+      const result = await pool.request()
+        .input("sectionKey", sql.NVarChar, section)
+        .query(`
+          SELECT TOP 20 id, content_json, updated_by_name, updated_at
+          FROM website_content_history
+          WHERE section_key=@sectionKey
+          ORDER BY updated_at DESC
+        `);
+
+      const versions = (result.recordset || []).map((row) => {
+        let content = null;
+        try { content = JSON.parse(row.content_json); } catch { content = null; }
+        return { id: row.id, content, updated_by_name: row.updated_by_name, updated_at: row.updated_at };
+      });
+
+      res.json({ section_key: section, versions });
+    } catch (err) {
+      console.log("WEBSITE HISTORY GET ERROR:", err);
+      res.status(500).json({ message: "Failed to load history" });
+    }
+  });
+
+  /* ================= RESTORE A VERSION (admin) =================
+     Re-saves an earlier snapshot as the current content — implemented
+     as a normal save (through the same MERGE + history-append as
+     PUT /:section above) rather than a special-cased update, so a
+     restore is itself just another entry in the history, and can in
+     turn be undone the same way. */
+  router.post("/:section/restore/:historyId", protect, requirePage("Website"), async (req, res) => {
+    try {
+      const section = String(req.params.section || "");
+      const historyId = parseInt(req.params.historyId, 10);
+      if (!VALID_SECTIONS.includes(section)) {
+        return res.status(400).json({ message: "Unknown section" });
+      }
+      if (!Number.isInteger(historyId)) {
+        return res.status(400).json({ message: "Invalid history id" });
+      }
+
+      const pool = await poolPromise;
+      const found = await pool.request()
+        .input("id", sql.Int, historyId)
+        .input("sectionKey", sql.NVarChar, section)
+        .query(`SELECT content_json FROM website_content_history WHERE id=@id AND section_key=@sectionKey`);
+
+      const row = found.recordset[0];
+      if (!row) return res.status(404).json({ message: "Version not found" });
+
+      let content;
+      try { content = JSON.parse(row.content_json); } catch { return res.status(500).json({ message: "Stored version is corrupt" }); }
+
+      const actorName = await getActorDisplayName(pool, req.user);
+      const contentJson = JSON.stringify(content);
+
+      await pool.request()
+        .input("sectionKey", sql.NVarChar, section)
+        .input("contentJson", sql.NVarChar(sql.MAX), contentJson)
+        .input("updatedById", sql.Int, req.user.id)
+        .input("updatedByName", sql.NVarChar, actorName)
+        .query(`
+          MERGE website_content AS target
+          USING (SELECT @sectionKey AS section_key) AS src
+          ON target.section_key = src.section_key
+          WHEN MATCHED THEN
+            UPDATE SET content_json=@contentJson, updated_by_id=@updatedById, updated_by_name=@updatedByName, updated_at=GETDATE()
+          WHEN NOT MATCHED THEN
+            INSERT (section_key, content_json, updated_by_id, updated_by_name, updated_at)
+            VALUES (@sectionKey, @contentJson, @updatedById, @updatedByName, GETDATE());
+        `);
+
+      try {
+        await pool.request()
+          .input("sectionKey", sql.NVarChar, section)
+          .input("contentJson", sql.NVarChar(sql.MAX), contentJson)
+          .input("updatedById", sql.Int, req.user.id)
+          .input("updatedByName", sql.NVarChar, `${actorName} (restored)`)
+          .query(`
+            INSERT INTO website_content_history (section_key, content_json, updated_by_id, updated_by_name, updated_at)
+            VALUES (@sectionKey, @contentJson, @updatedById, @updatedByName, GETDATE())
+          `);
+      } catch (histErr) {
+        console.log("WEBSITE CONTENT HISTORY WRITE ERROR:", histErr.message);
+      }
+
+      res.json({ message: "Restored", section_key: section, content });
+    } catch (err) {
+      console.log("WEBSITE RESTORE ERROR:", err);
+      res.status(500).json({ message: "Failed to restore version" });
     }
   });
 

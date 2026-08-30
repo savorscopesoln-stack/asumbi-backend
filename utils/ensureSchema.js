@@ -570,6 +570,30 @@ async function ensureSchema(pool, sql) {
       )
     `);
 
+    /* ---------------- website_content_history ----------------
+       Version history + audit trail for the website CMS (master
+       instructions §49/§50): every successful save of a section
+       appends a snapshot here, in addition to updating the live row
+       in website_content above. Lets an admin see who changed a
+       section and when, and roll back to an earlier version. Never
+       pruned automatically — see the trim step in the PUT handler
+       for how it's kept bounded per section instead. */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='website_content_history' AND xtype='U')
+      CREATE TABLE website_content_history (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        section_key NVARCHAR(50) NOT NULL,
+        content_json NVARCHAR(MAX) NOT NULL,
+        updated_by_id INT NULL,
+        updated_by_name NVARCHAR(200) NULL,
+        updated_at DATETIME NOT NULL DEFAULT GETDATE()
+      )
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='IX_website_content_history_section')
+      CREATE INDEX IX_website_content_history_section ON website_content_history (section_key, updated_at DESC)
+    `);
+
     const websiteDefaults = {
       announcements: [
         "2027 intake applications are now open — apply before 15 September",
@@ -850,6 +874,7 @@ async function ensureSchema(pool, sql) {
         events: { eyebrow: "Events", title: "What's on at Asumbi TTC", lead: "Upcoming college events, ceremonies, and open days." },
         downloads: { eyebrow: "Resources", title: "Downloads & Documents", lead: "Prospectuses, forms, policies, and other official documents." },
         leadership: { eyebrow: "Leadership", title: "College Leadership", lead: "The people leading Asumbi Teachers Training College." },
+        faqs: { eyebrow: "Common Questions", title: "Frequently Asked Questions", lead: "" },
       },
       // Empty by default — real, dated events are entered by an admin
       // rather than fabricated. The public Events page simply shows
@@ -868,6 +893,11 @@ async function ensureSchema(pool, sql) {
       // admin rather than fabricated.
       downloads: [],
       leadership: [],
+      // Department teaching staff — kept as its own flat section
+      // (rather than nested inside each department) so each profile
+      // can have its own photo; `department` matches a department's
+      // name to group them on that department's page.
+      staff: [],
     };
 
     for (const [sectionKey, defaultContent] of Object.entries(websiteDefaults)) {
@@ -938,6 +968,15 @@ async function ensureSchema(pool, sql) {
       slug: slugify(n.title),
       body: n.excerpt || "",
     }));
+    await patchMissingFields("events", () => ({
+      images: [],
+    }));
+    await patchMissingFields("leadership", () => ({
+      size: "medium",
+    }));
+    await patchMissingFields("staff", () => ({
+      size: "medium",
+    }));
 
     // pageHeroes is a single object (not an array of items), so it
     // needs its own patcher: fill in only the new page keys that
@@ -974,6 +1013,7 @@ async function ensureSchema(pool, sql) {
       events: { eyebrow: "Events", title: "What's on at Asumbi TTC", lead: "Upcoming college events, ceremonies, and open days." },
       downloads: { eyebrow: "Resources", title: "Downloads & Documents", lead: "Prospectuses, forms, policies, and other official documents." },
       leadership: { eyebrow: "Leadership", title: "College Leadership", lead: "The people leading Asumbi Teachers Training College." },
+      faqs: { eyebrow: "Common Questions", title: "Frequently Asked Questions", lead: "" },
     });
 
     /* ---------------- contact_messages table ----------------
