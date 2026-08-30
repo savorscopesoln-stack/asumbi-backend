@@ -63,6 +63,7 @@ const VALID_SECTIONS = [
   "downloads",
   "leadership",
   "staff",
+  "theme",
 ];
 
 module.exports = (poolPromise, sql) => {

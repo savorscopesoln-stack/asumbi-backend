@@ -898,6 +898,11 @@ async function ensureSchema(pool, sql) {
       // can have its own photo; `department` matches a department's
       // name to group them on that department's page.
       staff: [],
+      // Which of the presets in asumbi-website-main/lib/theme-presets.ts
+      // is currently applied to the public site. "default" is the
+      // original Maroon & Gold look — the admin's Theme editor's
+      // "Reset to Default" button just writes this value back.
+      theme: { presetKey: "default" },
     };
 
     for (const [sectionKey, defaultContent] of Object.entries(websiteDefaults)) {
