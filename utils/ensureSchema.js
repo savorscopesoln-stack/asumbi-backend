@@ -861,20 +861,23 @@ async function ensureSchema(pool, sql) {
           entryRequirements: "Open enrolment for serving teachers",
         },
       ],
-      // One eyebrow/title/lead per inner page's banner (PageHero).
+      // One eyebrow/title/lead/background per inner page's banner (PageHero).
+      // background is optional (null by default) and accepts either a photo
+      // or a short video clip — same upload pipeline as every other media
+      // field on this page (see middleware/websitePhotoUpload.js).
       pageHeroes: {
-        about: { eyebrow: "About Asumbi TTC", title: "Fifty-eight years of forming teachers with purpose", lead: "A faith-rooted institution in Homa Bay County, built on one conviction: the quality of a nation's classrooms depends on the quality of its teachers' preparation." },
-        academics: { eyebrow: "Academics", title: "Nine departments, one classroom-first standard", lead: "Every course of study is built around what a first-year teacher actually needs on day one in front of a class." },
-        admissions: { eyebrow: "2027 Intake Now Open", title: "Start your journey to becoming a teacher", lead: "Applications for the January 2027 intake close on 15 September 2026. Early application is strongly encouraged." },
-        contact: { eyebrow: "Contact Us", title: "We'd love to hear from you", lead: "" },
-        news: { eyebrow: "News & Events", title: "What's happening at Asumbi TTC", lead: "" },
-        programmes: { eyebrow: "Academic Programmes", title: "Choose your path", lead: "Every course of study is built around what a first-year teacher actually needs on day one in front of a class." },
-        departments: { eyebrow: "Academic Departments", title: "Nine departments, one classroom-first standard", lead: "Every department exists to answer one question: what does a first-year teacher actually need on day one in front of a class?" },
-        gallery: { eyebrow: "Campus Life", title: "Campus Gallery", lead: "A look at life on campus — teaching practice, facilities, and student activities." },
-        events: { eyebrow: "Events", title: "What's on at Asumbi TTC", lead: "Upcoming college events, ceremonies, and open days." },
-        downloads: { eyebrow: "Resources", title: "Downloads & Documents", lead: "Prospectuses, forms, policies, and other official documents." },
-        leadership: { eyebrow: "Leadership", title: "College Leadership", lead: "The people leading Asumbi Teachers Training College." },
-        faqs: { eyebrow: "Common Questions", title: "Frequently Asked Questions", lead: "" },
+        about: { eyebrow: "About Asumbi TTC", title: "Fifty-eight years of forming teachers with purpose", lead: "A faith-rooted institution in Homa Bay County, built on one conviction: the quality of a nation's classrooms depends on the quality of its teachers' preparation.", background: null },
+        academics: { eyebrow: "Academics", title: "Nine departments, one classroom-first standard", lead: "Every course of study is built around what a first-year teacher actually needs on day one in front of a class.", background: null },
+        admissions: { eyebrow: "2027 Intake Now Open", title: "Start your journey to becoming a teacher", lead: "Applications for the January 2027 intake close on 15 September 2026. Early application is strongly encouraged.", background: null },
+        contact: { eyebrow: "Contact Us", title: "We'd love to hear from you", lead: "", background: null },
+        news: { eyebrow: "News & Events", title: "What's happening at Asumbi TTC", lead: "", background: null },
+        programmes: { eyebrow: "Academic Programmes", title: "Choose your path", lead: "Every course of study is built around what a first-year teacher actually needs on day one in front of a class.", background: null },
+        departments: { eyebrow: "Academic Departments", title: "Nine departments, one classroom-first standard", lead: "Every department exists to answer one question: what does a first-year teacher actually need on day one in front of a class?", background: null },
+        gallery: { eyebrow: "Campus Life", title: "Campus Gallery", lead: "A look at life on campus — teaching practice, facilities, and student activities.", background: null },
+        events: { eyebrow: "Events", title: "What's on at Asumbi TTC", lead: "Upcoming college events, ceremonies, and open days.", background: null },
+        downloads: { eyebrow: "Resources", title: "Downloads & Documents", lead: "Prospectuses, forms, policies, and other official documents.", background: null },
+        leadership: { eyebrow: "Leadership", title: "College Leadership", lead: "The people leading Asumbi Teachers Training College.", background: null },
+        faqs: { eyebrow: "Common Questions", title: "Frequently Asked Questions", lead: "", background: null },
       },
       // Empty by default — real, dated events are entered by an admin
       // rather than fabricated. The public Events page simply shows

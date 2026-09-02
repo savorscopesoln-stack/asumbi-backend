@@ -3,7 +3,6 @@ const router = express.Router();
 const { protect, requirePage } = require("../middleware/authMiddleware");
 const { runWebsiteImageUpload, websiteImageUrlFor, deleteWebsiteImageByUrl } = require("../middleware/websitePhotoUpload");
 const { runWebsiteFileUpload, websiteFileUrlFor, deleteWebsiteFileByUrl } = require("../middleware/websiteFileUpload");
-const { runWebsiteVideoUpload, websiteVideoUrlFor, deleteWebsiteVideoByUrl } = require("../middleware/websiteVideoUpload");
 
 /* =========================================================
    WEBSITE CONTENT
@@ -112,13 +111,16 @@ module.exports = (poolPromise, sql) => {
     }
   });
 
-  /* ================= IMAGE UPLOAD (admin) =================
+  /* ================= IMAGE/VIDEO UPLOAD (admin) =================
      Used by every "image" field in the admin's Website page (hero
      background, principal photo, news thumbnails, gallery photos,
-     testimonial photos, site logo, campus map). Returns a relative
-     URL that gets stored directly in that section's content_json;
-     the public website prefixes it with the backend's origin when
-     rendering <img>, since the two are separate deployments. */
+     testimonial photos, site logo, campus map, gallery video clips,
+     event photos, leadership/staff photos). Accepts a photo OR a
+     short video clip — same field, same endpoint, so video is
+     available wherever a photo is. Returns a relative URL that gets
+     stored directly in that section's content_json; the public
+     website prefixes it with the backend's origin when rendering
+     <img>/<video>, since the two are separate deployments. */
   router.post("/upload", protect, requirePage("Website"), async (req, res) => {
     try {
       await runWebsiteImageUpload(req, res);
@@ -163,33 +165,6 @@ module.exports = (poolPromise, sql) => {
   router.post("/delete-file", protect, requirePage("Website"), async (req, res) => {
     const { url } = req.body || {};
     deleteWebsiteFileByUrl(url);
-    res.json({ message: "OK" });
-  });
-
-  /* ================= VIDEO UPLOAD (admin) =================
-     Used by the "video" field type — currently the Gallery section's
-     "Watch tour" tiles, which used to be a bare checkbox with no
-     actual clip behind it. Same pattern as image upload: returns a
-     relative URL stored directly in that section's content_json,
-     which the public website prefixes with the backend's origin when
-     rendering <video>. */
-  router.post("/upload-video", protect, requirePage("Website"), async (req, res) => {
-    try {
-      await runWebsiteVideoUpload(req, res);
-      if (!req.file) return res.status(400).json({ message: "No video file received" });
-
-      const url = websiteVideoUrlFor(req.file.filename);
-      res.json({ url, originalName: req.file.originalname, size: req.file.size });
-    } catch (err) {
-      console.log("WEBSITE VIDEO UPLOAD ERROR:", err.message);
-      res.status(400).json({ message: err.message || "Upload failed" });
-    }
-  });
-
-  /* ================= DELETE AN UPLOADED VIDEO (admin) ================= */
-  router.post("/delete-video", protect, requirePage("Website"), async (req, res) => {
-    const { url } = req.body || {};
-    deleteWebsiteVideoByUrl(url);
     res.json({ message: "OK" });
   });
 
