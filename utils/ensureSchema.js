@@ -749,12 +749,12 @@ async function ensureSchema(pool, sql) {
         ],
       },
       gallery: [
-        { label: "Campus aerial view", image: null, tall: true, video: true },
-        { label: "Teaching practice session", image: null, tall: false, video: false },
-        { label: "Library reading hall", image: null, tall: false, video: false },
-        { label: "Graduation ceremony", image: null, tall: true, video: false },
-        { label: "ICT resource centre", image: null, tall: false, video: false },
-        { label: "Student sports day", image: null, tall: false, video: false },
+        { label: "Campus aerial view", image: null, tall: true, video: null },
+        { label: "Teaching practice session", image: null, tall: false, video: null },
+        { label: "Library reading hall", image: null, tall: false, video: null },
+        { label: "Graduation ceremony", image: null, tall: true, video: null },
+        { label: "ICT resource centre", image: null, tall: false, video: null },
+        { label: "Student sports day", image: null, tall: false, video: null },
       ],
       partners: ["Ministry of Education", "TSC Kenya", "Diocese of Homa Bay", "KICD", "TVETA", "County Government"],
       visit: {
