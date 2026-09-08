@@ -1,7 +1,12 @@
 const sql = require("mssql");
 const crypto = require("crypto");
 const jwt = require("jsonwebtoken");
+const fs = require("fs");
+const path = require("path");
+const mammoth = require("mammoth");
 const { notifyUsers, notifyOne } = require("../utils/notify");
+const { coverPageUrlFor, deleteCoverPageByUrl } = require("../middleware/coverPageUpload");
+const { QUESTION_IMAGES_DIR, questionImageUrlFor, deleteQuestionImageByUrl } = require("../middleware/questionImageUpload");
 
 /* =========================================================================
    HELPERS
@@ -150,6 +155,80 @@ const updateEAssessment = async (req, res) => {
   } catch (err) {
     console.error("UPDATE E-ASSESSMENT ERROR:", err);
     res.status(500).json({ message: "Update failed", error: err.message });
+  }
+};
+
+/* =========================================================================
+   COVER PAGE (per-exam PDF)
+   ─────────────────────────
+   Each assessment can carry its own cover page — shown to students
+   before they start that specific exam (see TakeEAssessment.jsx's
+   "reveal" screen). Uploaded/replaced/removed independently of the
+   title/subject/etc. fields above since it's a file, not a form field.
+========================================================================= */
+const uploadCoverPage = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const id = toInt(req.params.id);
+    if (!id) return res.status(400).json({ message: "Invalid assessment ID" });
+    if (!req.file) return res.status(400).json({ message: "No PDF uploaded" });
+
+    const permission = await canManageAssessmentQuestions(pool, req, id);
+    if (!permission.ok) {
+      return res.status(permission.status).json({ message: permission.message });
+    }
+
+    const existing = await pool.request().input("id", sql.Int, id)
+      .query(`SELECT cover_page_url FROM e_assessments WHERE id = @id`);
+    if (!existing.recordset.length) {
+      return res.status(404).json({ message: "Assessment not found" });
+    }
+
+    const newUrl = coverPageUrlFor(req.file.filename);
+    await pool.request()
+      .input("id", sql.Int, id)
+      .input("cover_page_url", sql.NVarChar(500), newUrl)
+      .query(`UPDATE e_assessments SET cover_page_url = @cover_page_url WHERE id = @id`);
+
+    // Replacing an existing cover page — clean up the old file now that
+    // the DB row points at the new one.
+    const oldUrl = existing.recordset[0].cover_page_url;
+    if (oldUrl && oldUrl !== newUrl) deleteCoverPageByUrl(oldUrl);
+
+    res.json({ success: true, cover_page_url: newUrl });
+  } catch (err) {
+    console.error("UPLOAD COVER PAGE ERROR:", err);
+    res.status(500).json({ success: false, message: err.message || "Cover page upload failed" });
+  }
+};
+
+const deleteCoverPage = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const id = toInt(req.params.id);
+    if (!id) return res.status(400).json({ message: "Invalid assessment ID" });
+
+    const permission = await canManageAssessmentQuestions(pool, req, id);
+    if (!permission.ok) {
+      return res.status(permission.status).json({ message: permission.message });
+    }
+
+    const existing = await pool.request().input("id", sql.Int, id)
+      .query(`SELECT cover_page_url FROM e_assessments WHERE id = @id`);
+    if (!existing.recordset.length) {
+      return res.status(404).json({ message: "Assessment not found" });
+    }
+
+    await pool.request().input("id", sql.Int, id)
+      .query(`UPDATE e_assessments SET cover_page_url = NULL WHERE id = @id`);
+
+    const oldUrl = existing.recordset[0].cover_page_url;
+    if (oldUrl) deleteCoverPageByUrl(oldUrl);
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("DELETE COVER PAGE ERROR:", err);
+    res.status(500).json({ success: false, message: err.message || "Cover page removal failed" });
   }
 };
 
@@ -316,6 +395,23 @@ const getEAssessmentById = async (req, res) => {
         ORDER BY q.id, o.option_label
       `);
 
+    // Diagrams/photos attached to each question — fetched as a separate
+    // query (like options above, joining it in directly would multiply
+    // rows against the options join) and merged into the map below.
+    const imageResult = await pool.request()
+      .input("id", sql.Int, assessmentId)
+      .query(`
+        SELECT qi.question_id, qi.id, qi.image_url
+        FROM e_assessment_question_images qi
+        INNER JOIN e_assessment_questions q ON q.id = qi.question_id
+        WHERE q.e_assessment_id = @id
+        ORDER BY qi.question_id, qi.sort_order, qi.id
+      `);
+    const imagesByQuestion = {};
+    imageResult.recordset.forEach((row) => {
+      (imagesByQuestion[row.question_id] ||= []).push({ id: row.id, image_url: row.image_url });
+    });
+
     // Students taking the exam must never receive the answer key —
     // only admin/teacher (building/marking the assessment) get it.
     const includeAnswers = STAFF_ROLES.includes(req.user?.role);
@@ -330,6 +426,7 @@ const getEAssessmentById = async (req, res) => {
           ...(includeAnswers ? { correct_answer: row.correct_answer } : {}),
           question_type: row.question_type || "mcq",
           options: [],
+          images: imagesByQuestion[row.question_id] || [],
         };
       }
       if (row.option_label) {
@@ -492,11 +589,69 @@ async function canManageAssessmentQuestions(pool, req, e_assessmentId) {
   };
 }
 
+// Shared insert logic behind addEAssessmentQuestion (one question, typed
+// in by hand) and bulkAddQuestions (many questions at once, from the Word
+// document importer) — both need exactly the same question-row + options
+// + images insert, just called a different number of times.
+async function insertQuestionRow(pool, e_assessmentId, payload) {
+  const { question_text, marks, options, correct_answer, question_type, time_limit, marking_guide, images } = payload;
+  const type = question_type === "essay" ? "essay" : "mcq";
+
+  const questionResult = await pool.request()
+    .input("e_assessment_id", sql.Int, e_assessmentId)
+    .input("question_text", sql.NVarChar(sql.MAX), question_text)
+    .input("marks", sql.Int, marks || 1)
+    .input("correct_answer", sql.NVarChar(sql.MAX), type === "mcq" ? correct_answer || null : null)
+    .input("marking_guide", sql.NVarChar(sql.MAX), type === "essay" ? marking_guide || null : null)
+    .input("question_type", sql.NVarChar(50), type)
+    .input("time_limit", sql.Int, time_limit || 60)
+    .query(`
+      INSERT INTO e_assessment_questions
+        (e_assessment_id, question_text, question_type, marks, time_limit, correct_answer, marking_guide)
+      OUTPUT INSERTED.id
+      VALUES
+        (@e_assessment_id, @question_text, @question_type, @marks, @time_limit, @correct_answer, @marking_guide)
+    `);
+
+  const questionId = questionResult.recordset[0].id;
+
+  if (type === "mcq" && Array.isArray(options)) {
+    for (const o of options) {
+      await pool.request()
+        .input("question_id", sql.Int, questionId)
+        .input("option_label", sql.NVarChar(10), o.label || o.option_label)
+        .input("option_text", sql.NVarChar(sql.MAX), o.text || o.option_text)
+        .query(`
+          INSERT INTO e_assessment_options (question_id, option_label, option_text)
+          VALUES (@question_id, @option_label, @option_text)
+        `);
+    }
+  }
+
+  if (Array.isArray(images)) {
+    let sortOrder = 0;
+    for (const img of images) {
+      const url = typeof img === "string" ? img : img?.image_url || img?.url;
+      if (!url) continue;
+      await pool.request()
+        .input("question_id", sql.Int, questionId)
+        .input("image_url", sql.NVarChar(500), url)
+        .input("sort_order", sql.Int, sortOrder++)
+        .query(`
+          INSERT INTO e_assessment_question_images (question_id, image_url, sort_order)
+          VALUES (@question_id, @image_url, @sort_order)
+        `);
+    }
+  }
+
+  return { questionId, type };
+}
+
 const addEAssessmentQuestion = async (req, res) => {
   try {
     const pool = req.pool;
     const e_assessmentId = toInt(req.params.id);
-    const { question_text, marks, options, correct_answer, question_type, time_limit, marking_guide } = req.body;
+    const { question_text } = req.body;
 
     if (!e_assessmentId || !question_text) {
       return res.status(400).json({ message: "Missing required fields" });
@@ -522,43 +677,358 @@ const addEAssessmentQuestion = async (req, res) => {
       });
     }
 
-    const type = question_type === "essay" ? "essay" : "mcq";
-
-    const questionResult = await pool.request()
-      .input("e_assessment_id", sql.Int, e_assessmentId)
-      .input("question_text", sql.NVarChar(sql.MAX), question_text)
-      .input("marks", sql.Int, marks || 1)
-      .input("correct_answer", sql.NVarChar(sql.MAX), type === "mcq" ? correct_answer || null : null)
-      .input("marking_guide", sql.NVarChar(sql.MAX), type === "essay" ? marking_guide || null : null)
-      .input("question_type", sql.NVarChar(50), type)
-      .input("time_limit", sql.Int, time_limit || 60)
-      .query(`
-        INSERT INTO e_assessment_questions
-          (e_assessment_id, question_text, question_type, marks, time_limit, correct_answer, marking_guide)
-        OUTPUT INSERTED.id
-        VALUES
-          (@e_assessment_id, @question_text, @question_type, @marks, @time_limit, @correct_answer, @marking_guide)
-      `);
-
-    const questionId = questionResult.recordset[0].id;
-
-    if (type === "mcq" && Array.isArray(options)) {
-      for (const o of options) {
-        await pool.request()
-          .input("question_id", sql.Int, questionId)
-          .input("option_label", sql.NVarChar(10), o.label || o.option_label)
-          .input("option_text", sql.NVarChar(sql.MAX), o.text || o.option_text)
-          .query(`
-            INSERT INTO e_assessment_options (question_id, option_label, option_text)
-            VALUES (@question_id, @option_label, @option_text)
-          `);
-      }
-    }
+    const { questionId, type } = await insertQuestionRow(pool, e_assessmentId, req.body);
 
     res.json({ success: true, question_id: questionId, question_type: type });
   } catch (err) {
     console.error("ADD QUESTION ERROR:", err);
     res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// Bulk version of the above — used by the "Import from Word Document"
+// flow in AddQuestions.jsx. The teacher previews/edits the parsed
+// questions client-side first (parseQuestionsDocx never writes to the
+// e_assessment_questions table itself, only to disk for images), then
+// this endpoint saves the reviewed list in one call. Same deadline gate
+// as addEAssessmentQuestion, checked once up front rather than per
+// question.
+const bulkAddQuestions = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const e_assessmentId = toInt(req.params.id);
+    const questions = Array.isArray(req.body.questions) ? req.body.questions : [];
+
+    if (!e_assessmentId || !questions.length) {
+      return res.status(400).json({ message: "No questions to import" });
+    }
+
+    const permission = await canManageAssessmentQuestions(pool, req, e_assessmentId);
+    if (!permission.ok) {
+      return res.status(permission.status).json({ message: permission.message });
+    }
+
+    const deadlineCheck = await pool.request().input("id", sql.Int, e_assessmentId)
+      .query(`SELECT questions_deadline FROM e_assessments WHERE id = @id`);
+    if (!deadlineCheck.recordset.length) {
+      return res.status(404).json({ message: "Assessment not found" });
+    }
+    const deadline = deadlineCheck.recordset[0].questions_deadline;
+    if (deadline && new Date(deadline) < new Date()) {
+      return res.status(403).json({
+        message: `The deadline to add questions to this assessment passed on ${new Date(deadline).toLocaleString()}.`,
+      });
+    }
+
+    let imported = 0;
+    for (const q of questions) {
+      if (!q || !String(q.question_text || "").trim()) continue;
+      await insertQuestionRow(pool, e_assessmentId, q);
+      imported++;
+    }
+
+    res.json({ success: true, imported });
+  } catch (err) {
+    console.error("BULK ADD QUESTIONS ERROR:", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+/* =========================================================================
+   QUESTION IMAGES (diagrams/photos attached to a single question)
+========================================================================= */
+const uploadQuestionImages = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const questionId = toInt(req.params.questionId);
+    if (!questionId) return res.status(400).json({ message: "Invalid question ID" });
+    if (!req.files || !req.files.length) {
+      return res.status(400).json({ message: "No images uploaded" });
+    }
+
+    const parent = await pool.request().input("id", sql.Int, questionId)
+      .query(`SELECT e_assessment_id FROM e_assessment_questions WHERE id = @id`);
+    if (!parent.recordset.length) {
+      return res.status(404).json({ success: false, message: "Question not found" });
+    }
+    const permission = await canManageAssessmentQuestions(pool, req, parent.recordset[0].e_assessment_id);
+    if (!permission.ok) {
+      return res.status(permission.status).json({ success: false, message: permission.message });
+    }
+
+    const countResult = await pool.request().input("id", sql.Int, questionId)
+      .query(`SELECT COUNT(*) AS c, ISNULL(MAX(sort_order), -1) AS maxOrder FROM e_assessment_question_images WHERE question_id = @id`);
+    let sortOrder = countResult.recordset[0].maxOrder + 1;
+
+    const inserted = [];
+    for (const file of req.files) {
+      const url = questionImageUrlFor(file.filename);
+      const result = await pool.request()
+        .input("question_id", sql.Int, questionId)
+        .input("image_url", sql.NVarChar(500), url)
+        .input("sort_order", sql.Int, sortOrder++)
+        .query(`
+          INSERT INTO e_assessment_question_images (question_id, image_url, sort_order)
+          OUTPUT INSERTED.id
+          VALUES (@question_id, @image_url, @sort_order)
+        `);
+      inserted.push({ id: result.recordset[0].id, image_url: url });
+    }
+
+    res.json({ success: true, images: inserted });
+  } catch (err) {
+    console.error("UPLOAD QUESTION IMAGES ERROR:", err);
+    res.status(500).json({ success: false, message: err.message || "Image upload failed" });
+  }
+};
+
+const deleteQuestionImage = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const questionId = toInt(req.params.questionId);
+    const imageId = toInt(req.params.imageId);
+    if (!questionId || !imageId) return res.status(400).json({ message: "Invalid ID" });
+
+    const parent = await pool.request().input("id", sql.Int, questionId)
+      .query(`SELECT e_assessment_id FROM e_assessment_questions WHERE id = @id`);
+    if (!parent.recordset.length) {
+      return res.status(404).json({ success: false, message: "Question not found" });
+    }
+    const permission = await canManageAssessmentQuestions(pool, req, parent.recordset[0].e_assessment_id);
+    if (!permission.ok) {
+      return res.status(permission.status).json({ success: false, message: permission.message });
+    }
+
+    const imgResult = await pool.request()
+      .input("id", sql.Int, imageId)
+      .input("qid", sql.Int, questionId)
+      .query(`SELECT image_url FROM e_assessment_question_images WHERE id = @id AND question_id = @qid`);
+    if (!imgResult.recordset.length) {
+      return res.status(404).json({ success: false, message: "Image not found" });
+    }
+
+    await pool.request().input("id", sql.Int, imageId)
+      .query(`DELETE FROM e_assessment_question_images WHERE id = @id`);
+
+    deleteQuestionImageByUrl(imgResult.recordset[0].image_url);
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("DELETE QUESTION IMAGE ERROR:", err);
+    res.status(500).json({ success: false, message: err.message || "Image removal failed" });
+  }
+};
+
+/* =========================================================================
+   IMPORT QUESTIONS FROM A WORD DOCUMENT (.docx)
+   ─────────────────────────────────────────────
+   Lets a teacher upload a question paper they already have as a Word
+   document instead of retyping every question by hand. This endpoint
+   only PARSES the document and returns the result for the teacher to
+   review/edit on the frontend — nothing is saved to
+   e_assessment_questions until they confirm via POST .../questions/bulk
+   (bulkAddQuestions above). Any diagrams embedded in the document ARE
+   written to disk immediately (uploads/question-images) so the preview
+   can show them; if the teacher discards a parsed question before
+   importing, its image file is simply left orphaned on disk — the same
+   trade-off this codebase already accepts elsewhere for uploaded files
+   that end up unused.
+
+   Expected document format (plain text, one question per block):
+
+     Q1: What is the capital of France? (2 marks)
+     A) Paris
+     B) London
+     C) Berlin
+     D) Madrid
+     Answer: A
+
+     Q2: Explain the water cycle shown below. (5 marks)
+     [Essay]
+     Marking guide: Should mention evaporation, condensation, precipitation.
+
+   - A line starting "Q<number>" (optionally "Question") starts a new
+     question. A trailing "(N marks)" on that line sets its marks.
+   - Lines "A) ..." / "B. ..." etc. become MCQ options.
+   - A line "Answer: <letter>" sets the correct option and marks the
+     question as MCQ.
+   - A line "[Essay]" forces the question to be treated as essay even if
+     it has option-like lines.
+   - A line "Marking guide: ..." sets the essay marking guide.
+   - Any image in a paragraph is attached to whichever question that
+     paragraph falls under.
+
+   Questions that come out MCQ with no recognised "Answer:" line are
+   still returned (flagged with needs_review) rather than dropped, so
+   the teacher can fix them in the preview instead of silently losing
+   a question.
+========================================================================= */
+const QUESTION_LINE_RE = /^Q(?:uestion)?\s*\.?\s*(\d+)[:.)\-]?\s*(.*)$/i;
+const OPTION_LINE_RE = /^([A-Za-z])[).]\s+(.*)$/;
+const ANSWER_LINE_RE = /^Answer\s*[:\-]?\s*([A-Za-z])\b/i;
+const ESSAY_MARKER_RE = /^\[?\s*Essay\s*\]?$/i;
+const MARKING_GUIDE_RE = /^Marking\s*guide\s*[:\-]?\s*(.*)$/i;
+const TRAILING_MARKS_RE = /\(\s*(\d+)\s*marks?\s*\)\s*$/i;
+const IMG_SRC_RE = /<img[^>]*src="([^"]+)"[^>]*>/gi;
+
+function decodeHtmlEntities(str) {
+  return String(str || "")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, "\"")
+    .replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g, " ");
+}
+
+function finalizeParsedQuestion(q) {
+  if (!q) return null;
+  const hasOptions = q.options.length >= 2;
+  let type = q.forceType || (hasOptions ? "mcq" : "essay");
+  let needs_review = false;
+
+  if (type === "mcq" && !q.correct_answer) {
+    needs_review = true; // parsed as MCQ but no "Answer:" line found
+  }
+  if (type === "mcq" && !hasOptions) {
+    // marked essay-with-answer-line by mistake, or malformed — fall back
+    type = "essay";
+  }
+
+  return {
+    question_text: q.textParts.join(" ").trim() || "(untitled question)",
+    question_type: type,
+    marks: q.marks || 1,
+    options: type === "mcq" ? q.options : [],
+    correct_answer: type === "mcq" ? (q.correct_answer || null) : null,
+    marking_guide: type === "essay" ? (q.markingGuideParts.join(" ").trim() || null) : null,
+    images: q.images,
+    needs_review,
+  };
+}
+
+const parseQuestionsDocx = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const e_assessmentId = toInt(req.params.id);
+    if (!e_assessmentId) return res.status(400).json({ message: "Invalid assessment ID" });
+    if (!req.file) return res.status(400).json({ message: "No document uploaded" });
+
+    const permission = await canManageAssessmentQuestions(pool, req, e_assessmentId);
+    if (!permission.ok) {
+      return res.status(permission.status).json({ message: permission.message });
+    }
+
+    fs.mkdirSync(QUESTION_IMAGES_DIR, { recursive: true });
+    const extByType = {
+      "image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg",
+      "image/gif": ".gif", "image/bmp": ".bmp", "image/webp": ".webp",
+    };
+
+    const mammothOptions = {
+      convertImage: mammoth.images.imgElement((image) =>
+        image.read().then((buffer) => {
+          const ext = extByType[image.contentType] || ".png";
+          const filename = `${Date.now()}-${crypto.randomInt(0, 1e9)}${ext}`;
+          fs.writeFileSync(path.join(QUESTION_IMAGES_DIR, filename), buffer);
+          return { src: questionImageUrlFor(filename) };
+        })
+      ),
+    };
+
+    const result = await mammoth.convertToHtml({ buffer: req.file.buffer }, mammothOptions);
+    const html = result.value || "";
+
+    // Walk the document's paragraphs/list items in order — each becomes
+    // one "line" of text plus any images it contains.
+    const blocks = [...html.matchAll(/<p[^>]*>([\s\S]*?)<\/p>|<li[^>]*>([\s\S]*?)<\/li>/gi)]
+      .map((m) => m[1] ?? m[2] ?? "");
+
+    const questions = [];
+    let current = null;
+    let inMarkingGuide = false;
+
+    for (const block of blocks) {
+      const images = [...block.matchAll(IMG_SRC_RE)].map((m) => m[1]);
+      const text = decodeHtmlEntities(block.replace(/<[^>]+>/g, "")).trim();
+
+      const qMatch = text.match(QUESTION_LINE_RE);
+      if (qMatch) {
+        if (current) questions.push(current);
+        let stem = qMatch[2] || "";
+        let marks = 1;
+        const marksMatch = stem.match(TRAILING_MARKS_RE);
+        if (marksMatch) {
+          marks = toInt(marksMatch[1]) || 1;
+          stem = stem.replace(TRAILING_MARKS_RE, "").trim();
+        }
+        current = {
+          textParts: stem ? [stem] : [],
+          marks,
+          options: [],
+          correct_answer: null,
+          forceType: null,
+          markingGuideParts: [],
+          images: [...images],
+        };
+        inMarkingGuide = false;
+        continue;
+      }
+
+      if (!current) continue; // stray text before the first "Q..." line — ignore
+
+      if (images.length) current.images.push(...images);
+
+      if (ESSAY_MARKER_RE.test(text)) {
+        current.forceType = "essay";
+        continue;
+      }
+
+      const answerMatch = text.match(ANSWER_LINE_RE);
+      if (answerMatch) {
+        current.correct_answer = answerMatch[1].toUpperCase();
+        inMarkingGuide = false;
+        continue;
+      }
+
+      const guideMatch = text.match(MARKING_GUIDE_RE);
+      if (guideMatch) {
+        inMarkingGuide = true;
+        if (guideMatch[1]) current.markingGuideParts.push(guideMatch[1]);
+        continue;
+      }
+
+      const optMatch = !inMarkingGuide && text.match(OPTION_LINE_RE);
+      if (optMatch && current.forceType !== "essay") {
+        current.options.push({ label: optMatch[1].toUpperCase(), text: optMatch[2].trim() });
+        continue;
+      }
+
+      if (!text) continue; // blank separator line
+
+      if (inMarkingGuide) {
+        current.markingGuideParts.push(text);
+      } else if (!current.options.length) {
+        // continuation of a multi-line question stem
+        current.textParts.push(text);
+      }
+      // stray lines after options have started (and before "Answer:")
+      // are otherwise ignored — safest default for an unrecognised format
+    }
+    if (current) questions.push(current);
+
+    const parsed = questions.map(finalizeParsedQuestion).filter(Boolean);
+
+    res.json({
+      success: true,
+      questions: parsed,
+      warning: parsed.length === 0
+        ? "No questions were recognised in this document. Make sure each question starts with \"Q1:\", \"Q2:\", etc."
+        : undefined,
+    });
+  } catch (err) {
+    console.error("PARSE QUESTIONS DOCX ERROR:", err);
+    res.status(500).json({ success: false, message: err.message || "Failed to read that document" });
   }
 };
 
@@ -578,6 +1048,20 @@ const getAssessmentQuestions = async (req, res) => {
         ORDER BY q.id
       `);
 
+    const imageResult = await pool.request()
+      .input("assessmentId", sql.Int, assessmentId)
+      .query(`
+        SELECT qi.question_id, qi.id, qi.image_url
+        FROM e_assessment_question_images qi
+        INNER JOIN e_assessment_questions q ON q.id = qi.question_id
+        WHERE q.e_assessment_id = @assessmentId
+        ORDER BY qi.question_id, qi.sort_order, qi.id
+      `);
+    const imagesByQuestion = {};
+    imageResult.recordset.forEach((row) => {
+      (imagesByQuestion[row.question_id] ||= []).push({ id: row.id, image_url: row.image_url });
+    });
+
     const map = {};
     result.recordset.forEach((row) => {
       if (!map[row.id]) {
@@ -589,6 +1073,7 @@ const getAssessmentQuestions = async (req, res) => {
           marking_guide: row.marking_guide,
           question_type: row.question_type || "mcq",
           options: [],
+          images: imagesByQuestion[row.id] || [],
         };
       }
       if (row.option_label) {
@@ -1893,6 +2378,13 @@ module.exports = {
   // core
   createEAssessment, updateEAssessment, getEAssessments, getEAssessmentById,
   addEAssessmentQuestion, getAssessmentQuestions, updateQuestion, deleteQuestion,
+  bulkAddQuestions, parseQuestionsDocx,
+
+  // cover page (per-exam PDF)
+  uploadCoverPage, deleteCoverPage,
+
+  // question images (diagrams/photos)
+  uploadQuestionImages, deleteQuestionImage,
 
   // standalone exam-password login (no portal account session)
   examLogin,

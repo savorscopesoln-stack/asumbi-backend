@@ -5,6 +5,13 @@ const {
   // core
   createEAssessment, updateEAssessment, getEAssessments, getEAssessmentById,
   addEAssessmentQuestion, getAssessmentQuestions, updateQuestion, deleteQuestion,
+  bulkAddQuestions, parseQuestionsDocx,
+
+  // cover page (per-exam PDF)
+  uploadCoverPage, deleteCoverPage,
+
+  // question images (diagrams/photos)
+  uploadQuestionImages, deleteQuestionImage,
 
   // standalone exam-password login (no portal account session)
   examLogin,
@@ -35,6 +42,25 @@ const {
 } = require("../controllers/eAssessment.controller");
 
 const { protect, authorize, requirePage } = require("../middleware/authMiddleware");
+const { runCoverPageUpload } = require("../middleware/coverPageUpload");
+const { runQuestionImageUpload } = require("../middleware/questionImageUpload");
+const { runQuestionDocUpload } = require("../middleware/questionDocUpload");
+
+// Wrap the promise-based multer runners (see photoUpload.js's runPhotoUpload
+// for the pattern this follows) so a bad file (wrong type/too large) comes
+// back as a normal JSON 400 instead of an unhandled multer error.
+const coverPageMiddleware = async (req, res, next) => {
+  try { await runCoverPageUpload(req, res); next(); }
+  catch (err) { res.status(400).json({ message: err.message || "Upload failed" }); }
+};
+const questionImageMiddleware = async (req, res, next) => {
+  try { await runQuestionImageUpload(req, res); next(); }
+  catch (err) { res.status(400).json({ message: err.message || "Upload failed" }); }
+};
+const questionDocMiddleware = async (req, res, next) => {
+  try { await runQuestionDocUpload(req, res); next(); }
+  catch (err) { res.status(400).json({ message: err.message || "Upload failed" }); }
+};
 
 /* =========================================================================
    HEALTH CHECK
@@ -133,6 +159,24 @@ router.post("/:id/questions", protect, authorize("teacher"), addEAssessmentQuest
 router.get("/:id/questions", protect, getAssessmentQuestions);
 router.put("/questions/:questionId", protect, authorize("teacher"), updateQuestion);
 router.delete("/questions/:questionId", protect, authorize("teacher"), deleteQuestion);
+
+/* =========================================================================
+   COVER PAGE — per-exam PDF, shown to students before they start
+========================================================================= */
+router.post("/:id/cover-page", protect, authorize("teacher"), coverPageMiddleware, uploadCoverPage);
+router.delete("/:id/cover-page", protect, authorize("teacher"), deleteCoverPage);
+
+/* =========================================================================
+   QUESTIONS FROM A WORD DOCUMENT — parse-then-review-then-bulk-save
+========================================================================= */
+router.post("/:id/questions/import-docx", protect, authorize("teacher"), questionDocMiddleware, parseQuestionsDocx);
+router.post("/:id/questions/bulk", protect, authorize("teacher"), bulkAddQuestions);
+
+/* =========================================================================
+   QUESTION IMAGES — diagrams/photos attached to a single question
+========================================================================= */
+router.post("/questions/:questionId/images", protect, authorize("teacher"), questionImageMiddleware, uploadQuestionImages);
+router.delete("/questions/:questionId/images/:imageId", protect, authorize("teacher"), deleteQuestionImage);
 
 /* =========================================================================
    IMPORTANT: keep /:id LAST — it will otherwise swallow the named routes above

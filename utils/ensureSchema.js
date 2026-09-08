@@ -1043,6 +1043,40 @@ async function ensureSchema(pool, sql) {
       )
     `);
 
+    /* ---------------- e_assessments.cover_page_url ----------------
+       Lets each exam carry its own unique cover page — a PDF uploaded
+       by the admin/teacher (title page, instructions sheet, letterhead,
+       etc.) that students see before starting the exam. NULL = no
+       cover page (existing behavior, unchanged). Set/cleared via
+       POST and DELETE /e-assessments/:id/cover-page. */
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='e_assessments' AND xtype='U')
+      AND NOT EXISTS (
+        SELECT * FROM sys.columns
+        WHERE Name = N'cover_page_url' AND Object_ID = Object_ID(N'e_assessments')
+      )
+      ALTER TABLE e_assessments ADD cover_page_url NVARCHAR(500) NULL
+    `);
+
+    /* ---------------- e_assessment_question_images ----------------
+       Diagrams/photos attached to a question — either uploaded one at
+       a time by a teacher while setting a question by hand, or pulled
+       out automatically when a question is imported from a Word
+       document (see parseQuestionsDocx). A question can have zero or
+       more images, shown to students inline with the question text.
+       No FK constraint, matching e_assessment_question_setters above —
+       this codebase doesn't enforce FKs on these support tables. */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='e_assessment_question_images' AND xtype='U')
+      CREATE TABLE e_assessment_question_images (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        question_id INT NOT NULL,
+        image_url NVARCHAR(500) NOT NULL,
+        sort_order INT NOT NULL DEFAULT 0,
+        createdAt DATETIME NOT NULL DEFAULT GETDATE()
+      )
+    `);
+
     /* ---------------- newsletter_subscribers table ----------------
        Backs POST /api/contact/newsletter (public) — the email field in
        the public website's Footer, same "used to go nowhere" gap as
@@ -1056,7 +1090,7 @@ async function ensureSchema(pool, sql) {
       )
     `);
 
-    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, PortalPageSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, leave_outs code-verification columns, meal_daily_codes, leave_auto_approve, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl, Students.profileCompleted, student_profile_change_requests, website_content, contact_messages, newsletter_subscribers)");
+    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, PortalPageSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, leave_outs code-verification columns, meal_daily_codes, leave_auto_approve, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl, Students.profileCompleted, student_profile_change_requests, website_content, contact_messages, newsletter_subscribers, e_assessments.cover_page_url, e_assessment_question_images)");
   } catch (err) {
     console.error("⚠️  Schema ensure failed:", err.message);
   }
