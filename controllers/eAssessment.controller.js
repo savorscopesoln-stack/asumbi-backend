@@ -4,6 +4,7 @@ const jwt = require("jsonwebtoken");
 const fs = require("fs");
 const path = require("path");
 const mammoth = require("mammoth");
+const { PDFDocument } = require("pdf-lib");
 const { notifyUsers, notifyOne } = require("../utils/notify");
 const { coverPageUrlFor, deleteCoverPageByUrl } = require("../middleware/coverPageUpload");
 const { QUESTION_IMAGES_DIR, questionImageUrlFor, deleteQuestionImageByUrl } = require("../middleware/questionImageUpload");
@@ -185,17 +186,43 @@ const uploadCoverPage = async (req, res) => {
     }
 
     const newUrl = coverPageUrlFor(req.file.filename);
+
+    // Read page 1's own size (points) straight off the uploaded PDF so the
+    // student-facing preview can be sized to this exact cover page's shape
+    // instead of a fixed generic box — see cover_page_width/height in
+    // ensureSchema.js. Best-effort: a malformed/unreadable PDF still saves
+    // fine, it just falls back to the frontend's default A4 ratio.
+    let pageWidth = null;
+    let pageHeight = null;
+    try {
+      const pdfDoc = await PDFDocument.load(fs.readFileSync(req.file.path));
+      const firstPage = pdfDoc.getPage(0);
+      const size = firstPage.getSize();
+      pageWidth = size.width;
+      pageHeight = size.height;
+    } catch (dimErr) {
+      console.error("COVER PAGE DIMENSION READ ERROR:", dimErr.message);
+    }
+
     await pool.request()
       .input("id", sql.Int, id)
       .input("cover_page_url", sql.NVarChar(500), newUrl)
-      .query(`UPDATE e_assessments SET cover_page_url = @cover_page_url WHERE id = @id`);
+      .input("cover_page_width", sql.Float, pageWidth)
+      .input("cover_page_height", sql.Float, pageHeight)
+      .query(`
+        UPDATE e_assessments
+        SET cover_page_url = @cover_page_url,
+            cover_page_width = @cover_page_width,
+            cover_page_height = @cover_page_height
+        WHERE id = @id
+      `);
 
     // Replacing an existing cover page — clean up the old file now that
     // the DB row points at the new one.
     const oldUrl = existing.recordset[0].cover_page_url;
     if (oldUrl && oldUrl !== newUrl) deleteCoverPageByUrl(oldUrl);
 
-    res.json({ success: true, cover_page_url: newUrl });
+    res.json({ success: true, cover_page_url: newUrl, cover_page_width: pageWidth, cover_page_height: pageHeight });
   } catch (err) {
     console.error("UPLOAD COVER PAGE ERROR:", err);
     res.status(500).json({ success: false, message: err.message || "Cover page upload failed" });
@@ -220,7 +247,11 @@ const deleteCoverPage = async (req, res) => {
     }
 
     await pool.request().input("id", sql.Int, id)
-      .query(`UPDATE e_assessments SET cover_page_url = NULL WHERE id = @id`);
+      .query(`
+        UPDATE e_assessments
+        SET cover_page_url = NULL, cover_page_width = NULL, cover_page_height = NULL
+        WHERE id = @id
+      `);
 
     const oldUrl = existing.recordset[0].cover_page_url;
     if (oldUrl) deleteCoverPageByUrl(oldUrl);
