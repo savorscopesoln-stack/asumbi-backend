@@ -308,9 +308,15 @@ const getEAssessments = async (req, res) => {
     const result = await request.query(`
       SELECT ea.*, t.name AS teacher_name, c.name AS class_name,
         ${isTeacher ? "CASE WHEN ea.teacher_id = @teacherId THEN 0 ELSE 1 END" : "0"} AS assigned_only
+        ${isStudent ? `,
+        sub.id AS my_submission_id, sub.status AS my_submission_status,
+        sub.score AS my_score, sub.submitted_at AS my_submitted_at` : ""}
       FROM e_assessments ea
       LEFT JOIN Teachers t ON ea.teacher_id = t.id
       LEFT JOIN Classes c ON ea.class_id = c.id
+      ${isStudent ? `
+      LEFT JOIN e_assessment_submissions sub
+        ON sub.e_assessment_id = ea.id AND sub.student_id = @studentId` : ""}
       ${isTeacher ? `
       WHERE ea.teacher_id = @teacherId
          OR EXISTS (
@@ -1579,17 +1585,90 @@ const getStudentResult = async (req, res) => {
       return res.status(403).json({ message: "This exam session isn't valid for this assessment" });
     }
 
-    const result = await pool.request()
+    const subResult = await pool.request()
       .input("assessmentId", sql.Int, assessmentId)
       .input("studentId", sql.Int, studentId)
       .query(`
-        SELECT * FROM e_assessment_submissions
-        WHERE e_assessment_id = @assessmentId AND student_id = @studentId
+        SELECT s.*, a.title AS assessment_title, a.subject AS assessment_subject,
+               a.total_marks AS total_marks, t.name AS teacher_name
+        FROM e_assessment_submissions s
+        LEFT JOIN e_assessments a ON a.id = s.e_assessment_id
+        LEFT JOIN Teachers t ON t.id = a.teacher_id
+        WHERE s.e_assessment_id = @assessmentId AND s.student_id = @studentId
       `);
-    res.json(result.recordset[0] || null);
+
+    const submission = subResult.recordset[0] || null;
+    if (!submission) return res.json({ submission: null, released: false, questions: [] });
+
+    // Marks/answers are only ever shown to the student once the submission
+    // has actually been released (see releaseMarks/bulkReleaseMarks) — a
+    // submission sitting at 'submitted' or 'marked' means a teacher/admin
+    // hasn't signed off on it yet, so no per-question detail goes out,
+    // same principle as the exam_password redaction above.
+    if (submission.status !== "released") {
+      return res.json({ submission, released: false, questions: [] });
+    }
+
+    // Full marked-paper breakdown: every question on the paper, this
+    // student's own answer, whether it was correct (MCQ) and the marks/
+    // remarks a teacher gave it (essay) — mirrors the shape TakeEAssessment
+    // shows while sitting the exam (question_text/options/images), just
+    // overlaid with the answer + marking outcome instead of blank inputs.
+    const questionsResult = await pool.request()
+      .input("assessmentId", sql.Int, assessmentId)
+      .input("submissionId", sql.Int, submission.id)
+      .query(`
+        SELECT q.id, q.question_text, q.marks AS max_marks, q.correct_answer, q.question_type,
+               o.option_label, o.option_text,
+               ans.selected_answer, ans.essay_answer, ans.is_correct, ans.marks_awarded, ans.remarks
+        FROM e_assessment_questions q
+        LEFT JOIN e_assessment_options o ON q.id = o.question_id
+        LEFT JOIN e_assessment_answers ans ON ans.question_id = q.id AND ans.submission_id = @submissionId
+        WHERE q.e_assessment_id = @assessmentId
+        ORDER BY q.id, o.id
+      `);
+
+    const imageResult = await pool.request()
+      .input("assessmentId", sql.Int, assessmentId)
+      .query(`
+        SELECT qi.question_id, qi.id, qi.image_url
+        FROM e_assessment_question_images qi
+        INNER JOIN e_assessment_questions q ON q.id = qi.question_id
+        WHERE q.e_assessment_id = @assessmentId
+        ORDER BY qi.question_id, qi.sort_order, qi.id
+      `);
+    const imagesByQuestion = {};
+    imageResult.recordset.forEach((row) => {
+      (imagesByQuestion[row.question_id] ||= []).push({ id: row.id, image_url: row.image_url });
+    });
+
+    const map = {};
+    questionsResult.recordset.forEach((row) => {
+      if (!map[row.id]) {
+        map[row.id] = {
+          id: row.id,
+          question_text: row.question_text,
+          question_type: row.question_type || "mcq",
+          max_marks: row.max_marks,
+          correct_answer: row.correct_answer,
+          selected_answer: row.selected_answer,
+          essay_answer: row.essay_answer,
+          is_correct: row.is_correct,
+          marks_awarded: row.marks_awarded,
+          remarks: row.remarks,
+          options: [],
+          images: imagesByQuestion[row.id] || [],
+        };
+      }
+      if (row.option_label) {
+        map[row.id].options.push({ option_label: row.option_label, option_text: row.option_text });
+      }
+    });
+
+    res.json({ submission, released: true, questions: Object.values(map) });
   } catch (err) {
     console.error("GET RESULT ERROR:", err);
-    res.status(500).json(null);
+    res.status(500).json({ message: "Failed to load result" });
   }
 };
 
