@@ -2124,6 +2124,34 @@ const saveMarking = async (req, res) => {
 
     const results = [];
     for (const submissionId of submissionIds) {
+      // Safety net: MCQ answers are supposed to get marks_awarded set the
+      // moment the student submits (see submitEAssessment), but some
+      // marking screens only ever send essay answer ids in `scores` and
+      // never touch the MCQ rows — if an MCQ answer's marks_awarded is
+      // still NULL for any reason when a teacher saves marking, make sure
+      // it gets graded here instead of silently contributing 0 forever.
+      await pool.request()
+        .input("submission_id", sql.Int, submissionId)
+        .query(`
+          UPDATE a
+          SET a.marks_awarded = CASE
+                WHEN a.selected_answer IS NOT NULL AND q.correct_answer IS NOT NULL
+                     AND LOWER(LTRIM(RTRIM(a.selected_answer))) = LOWER(LTRIM(RTRIM(q.correct_answer)))
+                THEN ISNULL(q.marks, 0)
+                ELSE 0
+              END,
+              a.is_correct = CASE
+                WHEN a.selected_answer IS NOT NULL AND q.correct_answer IS NOT NULL
+                     AND LOWER(LTRIM(RTRIM(a.selected_answer))) = LOWER(LTRIM(RTRIM(q.correct_answer)))
+                THEN 1 ELSE 0
+              END
+          FROM e_assessment_answers a
+          INNER JOIN e_assessment_questions q ON q.id = a.question_id
+          WHERE a.submission_id = @submission_id
+            AND q.question_type <> 'essay'
+            AND a.marks_awarded IS NULL
+        `);
+
       const totalResult = await pool.request()
         .input("submission_id", sql.Int, submissionId)
         .query(`SELECT ISNULL(SUM(marks_awarded), 0) AS total FROM e_assessment_answers WHERE submission_id = @submission_id`);
