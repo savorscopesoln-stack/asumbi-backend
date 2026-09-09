@@ -4,6 +4,7 @@ const jwt = require("jsonwebtoken");
 const fs = require("fs");
 const path = require("path");
 const mammoth = require("mammoth");
+const { PDFDocument } = require("pdf-lib");
 const { notifyUsers, notifyOne } = require("../utils/notify");
 const { coverPageUrlFor, deleteCoverPageByUrl } = require("../middleware/coverPageUpload");
 const { QUESTION_IMAGES_DIR, questionImageUrlFor, deleteQuestionImageByUrl } = require("../middleware/questionImageUpload");
@@ -185,17 +186,43 @@ const uploadCoverPage = async (req, res) => {
     }
 
     const newUrl = coverPageUrlFor(req.file.filename);
+
+    // Read page 1's own size (points) straight off the uploaded PDF so the
+    // student-facing preview can be sized to this exact cover page's shape
+    // instead of a fixed generic box — see cover_page_width/height in
+    // ensureSchema.js. Best-effort: a malformed/unreadable PDF still saves
+    // fine, it just falls back to the frontend's default A4 ratio.
+    let pageWidth = null;
+    let pageHeight = null;
+    try {
+      const pdfDoc = await PDFDocument.load(fs.readFileSync(req.file.path));
+      const firstPage = pdfDoc.getPage(0);
+      const size = firstPage.getSize();
+      pageWidth = size.width;
+      pageHeight = size.height;
+    } catch (dimErr) {
+      console.error("COVER PAGE DIMENSION READ ERROR:", dimErr.message);
+    }
+
     await pool.request()
       .input("id", sql.Int, id)
       .input("cover_page_url", sql.NVarChar(500), newUrl)
-      .query(`UPDATE e_assessments SET cover_page_url = @cover_page_url WHERE id = @id`);
+      .input("cover_page_width", sql.Float, pageWidth)
+      .input("cover_page_height", sql.Float, pageHeight)
+      .query(`
+        UPDATE e_assessments
+        SET cover_page_url = @cover_page_url,
+            cover_page_width = @cover_page_width,
+            cover_page_height = @cover_page_height
+        WHERE id = @id
+      `);
 
     // Replacing an existing cover page — clean up the old file now that
     // the DB row points at the new one.
     const oldUrl = existing.recordset[0].cover_page_url;
     if (oldUrl && oldUrl !== newUrl) deleteCoverPageByUrl(oldUrl);
 
-    res.json({ success: true, cover_page_url: newUrl });
+    res.json({ success: true, cover_page_url: newUrl, cover_page_width: pageWidth, cover_page_height: pageHeight });
   } catch (err) {
     console.error("UPLOAD COVER PAGE ERROR:", err);
     res.status(500).json({ success: false, message: err.message || "Cover page upload failed" });
@@ -220,7 +247,11 @@ const deleteCoverPage = async (req, res) => {
     }
 
     await pool.request().input("id", sql.Int, id)
-      .query(`UPDATE e_assessments SET cover_page_url = NULL WHERE id = @id`);
+      .query(`
+        UPDATE e_assessments
+        SET cover_page_url = NULL, cover_page_width = NULL, cover_page_height = NULL
+        WHERE id = @id
+      `);
 
     const oldUrl = existing.recordset[0].cover_page_url;
     if (oldUrl) deleteCoverPageByUrl(oldUrl);
@@ -277,9 +308,15 @@ const getEAssessments = async (req, res) => {
     const result = await request.query(`
       SELECT ea.*, t.name AS teacher_name, c.name AS class_name,
         ${isTeacher ? "CASE WHEN ea.teacher_id = @teacherId THEN 0 ELSE 1 END" : "0"} AS assigned_only
+        ${isStudent ? `,
+        sub.id AS my_submission_id, sub.status AS my_submission_status,
+        sub.score AS my_score, sub.submitted_at AS my_submitted_at` : ""}
       FROM e_assessments ea
       LEFT JOIN Teachers t ON ea.teacher_id = t.id
       LEFT JOIN Classes c ON ea.class_id = c.id
+      ${isStudent ? `
+      LEFT JOIN e_assessment_submissions sub
+        ON sub.e_assessment_id = ea.id AND sub.student_id = @studentId` : ""}
       ${isTeacher ? `
       WHERE ea.teacher_id = @teacherId
          OR EXISTS (
@@ -1538,12 +1575,6 @@ if (!hasEssay) {
   }
 };
 
-// Backs the student-facing "marked paper" page (GET /e-assessments/results/:assessmentId).
-// This used to just return the raw e_assessment_submissions row, which is why
-// the marked-paper page never showed essay marks/remarks (or anything else
-// per-question) — the frontend expects { submission, released, questions },
-// and "questions" was never being built at all. This composes that shape
-// from the same tables the teacher-marking endpoints already join.
 const getStudentResult = async (req, res) => {
   try {
     const pool = req.pool;
@@ -1559,7 +1590,7 @@ const getStudentResult = async (req, res) => {
       .input("studentId", sql.Int, studentId)
       .query(`
         SELECT s.*, a.title AS assessment_title, a.subject AS assessment_subject,
-               ISNULL(a.total_marks, 100) AS total_marks, t.name AS teacher_name
+               a.total_marks AS total_marks, t.name AS teacher_name
         FROM e_assessment_submissions s
         LEFT JOIN e_assessments a ON a.id = s.e_assessment_id
         LEFT JOIN Teachers t ON t.id = a.teacher_id
@@ -1567,77 +1598,77 @@ const getStudentResult = async (req, res) => {
       `);
 
     const submission = subResult.recordset[0] || null;
-    if (!submission) {
-      return res.json({ submission: null, released: false, questions: [] });
+    if (!submission) return res.json({ submission: null, released: false, questions: [] });
+
+    // Marks/answers are only ever shown to the student once the submission
+    // has actually been released (see releaseMarks/bulkReleaseMarks) — a
+    // submission sitting at 'submitted' or 'marked' means a teacher/admin
+    // hasn't signed off on it yet, so no per-question detail goes out,
+    // same principle as the exam_password redaction above.
+    if (submission.status !== "released") {
+      return res.json({ submission, released: false, questions: [] });
     }
 
-    const released = submission.status === "released";
+    // Full marked-paper breakdown: every question on the paper, this
+    // student's own answer, whether it was correct (MCQ) and the marks/
+    // remarks a teacher gave it (essay) — mirrors the shape TakeEAssessment
+    // shows while sitting the exam (question_text/options/images), just
+    // overlaid with the answer + marking outcome instead of blank inputs.
+    const questionsResult = await pool.request()
+      .input("assessmentId", sql.Int, assessmentId)
+      .input("submissionId", sql.Int, submission.id)
+      .query(`
+        SELECT q.id, q.question_text, q.marks AS max_marks, q.correct_answer, q.question_type,
+               o.option_label, o.option_text,
+               ans.selected_answer, ans.essay_answer, ans.is_correct, ans.marks_awarded, ans.remarks
+        FROM e_assessment_questions q
+        LEFT JOIN e_assessment_options o ON q.id = o.question_id
+        LEFT JOIN e_assessment_answers ans ON ans.question_id = q.id AND ans.submission_id = @submissionId
+        WHERE q.e_assessment_id = @assessmentId
+        ORDER BY q.id, o.id
+      `);
 
-    // Only assemble the (potentially large) per-question breakdown once we
-    // know it'll actually be shown — before release, the page just shows
-    // "being marked" and doesn't need any of this.
-    let questions = [];
-    if (released) {
-      const answersResult = await pool.request()
-        .input("submissionId", sql.Int, submission.id)
-        .query(`
-          SELECT a.question_id AS id, a.selected_answer, a.essay_answer, a.is_correct,
-                 a.marks_awarded, a.remarks,
-                 q.question_text, q.correct_answer, q.marks AS max_marks, q.question_type
-          FROM e_assessment_answers a
-          INNER JOIN e_assessment_questions q ON q.id = a.question_id
-          WHERE a.submission_id = @submissionId
-          ORDER BY q.id
-        `);
+    const imageResult = await pool.request()
+      .input("assessmentId", sql.Int, assessmentId)
+      .query(`
+        SELECT qi.question_id, qi.id, qi.image_url
+        FROM e_assessment_question_images qi
+        INNER JOIN e_assessment_questions q ON q.id = qi.question_id
+        WHERE q.e_assessment_id = @assessmentId
+        ORDER BY qi.question_id, qi.sort_order, qi.id
+      `);
+    const imagesByQuestion = {};
+    imageResult.recordset.forEach((row) => {
+      (imagesByQuestion[row.question_id] ||= []).push({ id: row.id, image_url: row.image_url });
+    });
 
-      const optionsResult = await pool.request()
-        .input("submissionId", sql.Int, submission.id)
-        .query(`
-          SELECT o.question_id, o.option_label, o.option_text
-          FROM e_assessment_options o
-          INNER JOIN e_assessment_answers a ON a.question_id = o.question_id
-          WHERE a.submission_id = @submissionId
-          ORDER BY o.question_id, o.option_label
-        `);
-      const optionsByQuestion = {};
-      optionsResult.recordset.forEach((row) => {
-        (optionsByQuestion[row.question_id] ||= []).push({ option_label: row.option_label, option_text: row.option_text });
-      });
+    const map = {};
+    questionsResult.recordset.forEach((row) => {
+      if (!map[row.id]) {
+        map[row.id] = {
+          id: row.id,
+          question_text: row.question_text,
+          question_type: row.question_type || "mcq",
+          max_marks: row.max_marks,
+          correct_answer: row.correct_answer,
+          selected_answer: row.selected_answer,
+          essay_answer: row.essay_answer,
+          is_correct: row.is_correct,
+          marks_awarded: row.marks_awarded,
+          remarks: row.remarks,
+          options: [],
+          images: imagesByQuestion[row.id] || [],
+        };
+      }
+      if (row.option_label) {
+        map[row.id].options.push({ option_label: row.option_label, option_text: row.option_text });
+      }
+    });
 
-      const imagesResult = await pool.request()
-        .input("submissionId", sql.Int, submission.id)
-        .query(`
-          SELECT qi.question_id, qi.id, qi.image_url
-          FROM e_assessment_question_images qi
-          INNER JOIN e_assessment_answers a ON a.question_id = qi.question_id
-          WHERE a.submission_id = @submissionId
-          ORDER BY qi.question_id, qi.sort_order, qi.id
-        `);
-      const imagesByQuestion = {};
-      imagesResult.recordset.forEach((row) => {
-        (imagesByQuestion[row.question_id] ||= []).push({ id: row.id, image_url: row.image_url });
-      });
-
-      questions = answersResult.recordset.map((row) => ({
-        id: row.id,
-        question_type: row.question_type || "mcq",
-        question_text: row.question_text,
-        options: optionsByQuestion[row.id] || [],
-        correct_answer: row.correct_answer,
-        selected_answer: row.selected_answer,
-        is_correct: row.is_correct === null ? null : !!row.is_correct,
-        essay_answer: row.essay_answer,
-        marks_awarded: row.marks_awarded,
-        max_marks: row.max_marks,
-        remarks: row.remarks,
-        images: imagesByQuestion[row.id] || [],
-      }));
-    }
-
-    res.json({ submission, released, questions });
+    res.json({ submission, released: true, questions: Object.values(map) });
   } catch (err) {
     console.error("GET RESULT ERROR:", err);
-    res.status(500).json({ submission: null, released: false, questions: [], message: err.message });
+    res.status(500).json({ message: "Failed to load result" });
   }
 };
 
