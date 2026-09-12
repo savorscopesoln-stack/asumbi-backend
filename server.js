@@ -37,6 +37,7 @@ const gateRoutes = require("./routes/gate");
 const kitchenRoutes = require("./routes/kitchen");
 const attendanceRoutes = require("./routes/attendance");
 const eAssessmentRoutes = require("./routes/eAssessments");
+const localSyncRoutes = require("./routes/localSync");
 const metaRoutes = require("./routes/meta.routes");
 const feesRoutes = require("./routes/fees");
 const leaveRoutes = require("./routes/leave");
@@ -185,6 +186,7 @@ app.use("/api/gate", protect, gateRoutes);
 app.use("/api/kitchen", protect, kitchenRoutes);
 app.use("/api/attendance", protect, attendanceRoutes);
 app.use("/api/e-assessments", eAssessmentRoutes); // already protects internally
+app.use("/api/local-sync", localSyncRoutes); // mounted separately so it can't collide with e-assessments' /:id catch-all; protects internally (JWT for admin routes, X-Sync-Token for device routes)
 app.use("/api/fees", protect, feesRoutes);
 app.use("/api/leave", protect, leaveRoutes);
 app.use("/api/search", protect, searchRoutes);
