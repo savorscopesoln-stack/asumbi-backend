@@ -1270,6 +1270,30 @@ app.get("/api/users", protect, requirePage("Users"), async (req, res) => {
    START SERVER
 ========================================================= */
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => {
-  console.log("Server running on port " + PORT);
+// Explicit backlog: the new WARN[...]/"actively refused" failures seen in
+// the 900-VU-at-once k6 debug run are OS-level TCP connection refusals,
+// NOT the DB pool (no DB_BUSY/503s showed up in that run's checks, and
+// exam-login's own duration/latency was reasonable whenever it did reach
+// Express). That points at the *listen backlog* — the queue of pending
+// TCP connections the OS holds while Node's event loop catches up.
+// Node's default (no second arg to .listen) delegates to libuv's default
+// backlog of 511; against a burst of 900 near-simultaneous connection
+// attempts that's not enough headroom, and on Windows specifically a
+// full backlog queue causes an immediate RST ("actively refused") rather
+// than the SYN just being silently queued/dropped as on Linux.
+//
+// Raising this is cheap and has no functional downside — it only widens
+// the queue of *already-established-at-the-TCP-level* connections
+// waiting for Node to accept() them; it doesn't change app behavior.
+// NOTE: on Windows, the effective backlog Winsock will actually honor is
+// capped well below whatever you request here (historically ~200),
+// so this helps but isn't a full fix for a Windows-hosted server taking
+// a 900-at-once burst — see the accompanying report for the OS-level
+// follow-up options (and note staging here is Windows; confirm your
+// actual production OS before assuming this alone is sufficient).
+const LISTEN_BACKLOG = process.env.LISTEN_BACKLOG
+  ? parseInt(process.env.LISTEN_BACKLOG, 10)
+  : 1024;
+server.listen(PORT, LISTEN_BACKLOG, () => {
+  console.log(`Server running on port ${PORT} (listen backlog ${LISTEN_BACKLOG})`);
 });

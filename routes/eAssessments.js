@@ -45,6 +45,7 @@ const { protect, authorize, requirePage } = require("../middleware/authMiddlewar
 const { runCoverPageUpload } = require("../middleware/coverPageUpload");
 const { runQuestionImageUpload } = require("../middleware/questionImageUpload");
 const { runQuestionDocUpload } = require("../middleware/questionDocUpload");
+const { examLoginConcurrencyGuard } = require("../middleware/examLoginConcurrencyGuard");
 
 // Wrap the promise-based multer runners (see photoUpload.js's runPhotoUpload
 // for the pattern this follows) so a bad file (wrong type/too large) comes
@@ -76,7 +77,7 @@ router.get("/health", (req, res) => {
    password set on this specific assessment (see AdminEAssessments →
    Create/Edit Assessment → "Exam Password").
 ========================================================================= */
-router.post("/exam-login", examLogin);
+router.post("/exam-login", examLoginConcurrencyGuard, examLogin);
 
 /* =========================================================================
    SUPPORT DATA

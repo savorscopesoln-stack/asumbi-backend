@@ -6,6 +6,7 @@ const path = require("path");
 const mammoth = require("mammoth");
 const { PDFDocument } = require("pdf-lib");
 const { notifyUsers, notifyOne } = require("../utils/notify");
+const { withTransientRetry, isTransientDbError } = require("../utils/transientDbRetry");
 const { coverPageUrlFor, deleteCoverPageByUrl } = require("../middleware/coverPageUpload");
 const { QUESTION_IMAGES_DIR, questionImageUrlFor, deleteQuestionImageByUrl } = require("../middleware/questionImageUpload");
 
@@ -16,6 +17,28 @@ const toInt = (v) => {
   const n = parseInt(v);
   return isNaN(n) ? null : n;
 };
+
+// Used only by examLogin (see section on load-test hardening): turns a
+// transient DB/pool error — the pool was momentarily saturated and
+// withTransientRetry's one retry didn't clear it — into a controlled,
+// diagnosable 503 instead of a generic 500. This is the "pool
+// temporarily busy → client can retry shortly" behavior, as opposed to
+// the connection-reset-style failures seen under the original 900-VU
+// login burst. Any non-transient error still falls through to the
+// normal 500 handler below.
+function respondDbBusy(res, err) {
+  if (isTransientDbError(err)) {
+    console.error("⚠️ EXAM LOGIN — DB pool busy:", err.message);
+    res.set("Retry-After", "2");
+    return res.status(503).json({
+      success: false,
+      code: "DB_BUSY",
+      message: "The system is under heavy load right now. Please try again in a few seconds.",
+    });
+  }
+  console.error("EXAM LOGIN ERROR:", err);
+  return res.status(500).json({ success: false, message: "Server error" });
+}
 
 // 6-char token, uppercase letters + digits, ambiguous chars (0,O,1,I) removed
 const ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
@@ -511,9 +534,24 @@ const examLogin = async (req, res) => {
       return res.status(400).json({ success: false, message: "Assessment, username and exam password are all required" });
     }
 
-    const aRes = await pool.request()
-      .input("id", sql.Int, assessmentId)
-      .query(`SELECT id, title, subject, duration_minutes, class_id, status, active_status, exam_password FROM e_assessments WHERE id = @id`);
+    // Both queries below are wrapped in withTransientRetry: under a login
+    // burst, the pool can be momentarily saturated (all DB_POOL_MAX
+    // connections busy) — that surfaces as a pool-acquire-timeout error,
+    // not a real query failure, so one quick retry after a short backoff
+    // is safe and often succeeds once a connection frees up. This never
+    // retries on bad credentials/validation, since those aren't thrown
+    // errors here at all — see isTransientDbError.
+    let aRes;
+    try {
+      aRes = await withTransientRetry(
+        () => pool.request()
+          .input("id", sql.Int, assessmentId)
+          .query(`SELECT id, title, subject, duration_minutes, class_id, status, active_status, exam_password FROM e_assessments WHERE id = @id`),
+        { label: "exam-login:fetch-assessment" }
+      );
+    } catch (dbErr) {
+      return respondDbBusy(res, dbErr);
+    }
 
     if (!aRes.recordset.length) {
       return res.status(404).json({ success: false, message: "Assessment not found" });
@@ -533,9 +571,17 @@ const examLogin = async (req, res) => {
       return res.status(400).json({ success: false, message: "This assessment isn't active right now." });
     }
 
-    const sRes = await pool.request()
-      .input("username", sql.NVarChar, username)
-      .query(`SELECT id, username, name FROM Students WHERE username = @username`);
+    let sRes;
+    try {
+      sRes = await withTransientRetry(
+        () => pool.request()
+          .input("username", sql.NVarChar, username)
+          .query(`SELECT id, username, name FROM Students WHERE username = @username`),
+        { label: "exam-login:fetch-student" }
+      );
+    } catch (dbErr) {
+      return respondDbBusy(res, dbErr);
+    }
 
     if (!sRes.recordset.length) {
       return res.status(400).json({ success: false, message: "No student account found with that username" });
@@ -1261,42 +1307,62 @@ const startExamSession = async (req, res) => {
     }
 
     let token, sessionId;
-    try {
-      token = generateToken();
-      const result = await pool.request()
-        .input("aid", sql.Int, e_assessment_id)
-        .input("sid", sql.Int, student_id)
-        .input("token", sql.Char(6), token)
-        .query(`
-          INSERT INTO e_assessment_exam_sessions (e_assessment_id, student_id, token, status)
-          OUTPUT INSERTED.id
-          VALUES (@aid, @sid, @token, 'issued')
-        `);
-      sessionId = result.recordset[0].id;
-    } catch (insertErr) {
-      // Race condition: another near-simultaneous request (e.g. a double-fired
-      // React effect) already inserted the row between our SELECT and INSERT.
-      // Instead of failing, just fetch and return the row that won the race.
-      if (insertErr.number === 2627) {
-        const retry = await pool.request()
+    // At most 2 attempts total: SQL Server deadlock victims (error 1205)
+    // are a well-known, genuinely transient outcome of many concurrent
+    // INSERTs racing for the same table/index pages — exactly what a
+    // login burst produces here, since every student's first start-exam
+    // call inserts into this same table within milliseconds of each
+    // other. A deadlock victim is not a data problem and is safe to
+    // retry once; it is NOT the same as the 2627 unique-violation case
+    // below (a real duplicate row), which is handled by re-fetching
+    // instead of retrying the insert.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        token = generateToken();
+        const result = await pool.request()
           .input("aid", sql.Int, e_assessment_id)
           .input("sid", sql.Int, student_id)
-          .query(`SELECT * FROM e_assessment_exam_sessions WHERE e_assessment_id = @aid AND student_id = @sid`);
+          .input("token", sql.Char(6), token)
+          .query(`
+            INSERT INTO e_assessment_exam_sessions (e_assessment_id, student_id, token, status)
+            OUTPUT INSERTED.id
+            VALUES (@aid, @sid, @token, 'issued')
+          `);
+        sessionId = result.recordset[0].id;
+        break;
+      } catch (insertErr) {
+        // Race condition: another near-simultaneous request (e.g. a double-fired
+        // React effect) already inserted the row between our SELECT and INSERT.
+        // Instead of failing, just fetch and return the row that won the race.
+        if (insertErr.number === 2627) {
+          const retry = await pool.request()
+            .input("aid", sql.Int, e_assessment_id)
+            .input("sid", sql.Int, student_id)
+            .query(`SELECT * FROM e_assessment_exam_sessions WHERE e_assessment_id = @aid AND student_id = @sid`);
 
-        if (retry.recordset.length) {
-          const row = retry.recordset[0];
-          if (row.status === "ended") {
-            return res.status(409).json({ message: "This assessment has already been completed" });
+          if (retry.recordset.length) {
+            const row = retry.recordset[0];
+            if (row.status === "ended") {
+              return res.status(409).json({ message: "This assessment has already been completed" });
+            }
+            return res.json({
+              success: true,
+              token: row.token,
+              status: row.status,
+              device_bound: !!row.device_id,
+            });
           }
-          return res.json({
-            success: true,
-            token: row.token,
-            status: row.status,
-            device_bound: !!row.device_id,
-          });
+          throw insertErr; // no row found after all — genuine error, let the outer catch handle it
         }
+
+        if (insertErr.number === 1205 && attempt === 0) {
+          console.warn(`⚠️ start-exam: deadlock victim on insert (aid=${e_assessment_id}, sid=${student_id}), retrying once`);
+          await new Promise((r) => setTimeout(r, 100));
+          continue; // one retry only
+        }
+
+        throw insertErr; // not a race condition or deadlock — genuine error, let the outer catch handle it
       }
-      throw insertErr; // not a race condition — genuine error, let the outer catch handle it
     }
 
     res.json({ success: true, session_id: sessionId, token, status: "issued", device_bound: false });

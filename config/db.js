@@ -17,10 +17,33 @@ const config = {
     encrypt: process.env.DB_ENCRYPT === "true",
     trustServerCertificate: process.env.DB_TRUST_CERT !== "false",
   },
+  // Pool sizing — env-driven so it can be tuned per environment without a
+  // code change. The old hard-coded max:10/min:0 was fine for normal admin
+  // portal traffic but is the confirmed cause of the exam-login failures
+  // under a burst of ~900 simultaneous students: only 10 physical SQL
+  // connections existed, so requests queued for a connection and, once the
+  // queue wait exceeded tarn's default 30s acquireTimeoutMillis, failed as
+  // connection-level errors rather than clean 400/401 responses.
+  //
+  // DB_POOL_MAX default of 50 is a conservative starting point for a
+  // 2-query, index-lookup login (not "max:900" — that would just move the
+  // bottleneck onto SQL Server's own worker/connection limits). Re-tune
+  // upward only after confirming SQL Server CPU/connection headroom at
+  // that size during staged load testing (see TESTING STRATEGY).
+  //
+  // DB_POOL_ACQUIRE_TIMEOUT_MS default of 8000 makes a saturated pool fail
+  // fast with a clear, catchable error (caught in examLogin below and
+  // turned into a 503 + Retry-After) instead of silently hanging for 30s,
+  // which is what produced the connection-reset-style failures under load.
   pool: {
-    max: 10,
-    min: 0,
-    idleTimeoutMillis: 30000,
+    max: process.env.DB_POOL_MAX ? parseInt(process.env.DB_POOL_MAX, 10) : 50,
+    min: process.env.DB_POOL_MIN ? parseInt(process.env.DB_POOL_MIN, 10) : 2,
+    idleTimeoutMillis: process.env.DB_POOL_IDLE_MS
+      ? parseInt(process.env.DB_POOL_IDLE_MS, 10)
+      : 30000,
+    acquireTimeoutMillis: process.env.DB_POOL_ACQUIRE_TIMEOUT_MS
+      ? parseInt(process.env.DB_POOL_ACQUIRE_TIMEOUT_MS, 10)
+      : 8000,
   },
   // Azure SQL Serverless can be *paused* after a period of inactivity —
   // the first connection after a pause has to wait for it to resume,
