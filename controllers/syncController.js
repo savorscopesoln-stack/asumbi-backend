@@ -176,9 +176,22 @@ const pullPackage = async (req, res) => {
 
     // Roster: students in the assessment's class, so the local server
     // can validate exam logins entirely offline.
+    //
+    // Students has no class_id column — class membership is matched by
+    // name (Students.studentClass = Classes.name), same as everywhere
+    // else in this codebase (see eAssessment.controller.js's
+    // getEAssessments student filter). Also honor year_of_study-targeted
+    // assessments the same way, or a whole-year assessment would pull an
+    // empty roster.
     const rosterRes = await pool.request()
       .input("class_id", sql.Int, assessment.class_id)
-      .query(`SELECT id, username, name FROM Students WHERE class_id = @class_id`);
+      .input("year_of_study", sql.Int, assessment.year_of_study)
+      .query(`
+        SELECT DISTINCT st.id, st.username, st.name
+        FROM Students st
+        WHERE st.studentClass = (SELECT name FROM Classes WHERE id = @class_id)
+           OR (@year_of_study IS NOT NULL AND st.yearOfStudy = @year_of_study)
+      `);
 
     // Attach options/images to their question client-side (keeps the
     // package simple and flat — the local server can nest them itself).
