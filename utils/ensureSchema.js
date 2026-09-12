@@ -1117,7 +1117,58 @@ async function ensureSchema(pool, sql) {
       )
     `);
 
-    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, PortalPageSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, leave_outs code-verification columns, meal_daily_codes, leave_auto_approve, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl, Students.profileCompleted, student_profile_change_requests, website_content, contact_messages, newsletter_subscribers, e_assessments.cover_page_url, e_assessments.cover_page_width/height, e_assessment_question_images)");
+    /* ---------------- Local Sync (offline exam server) ----------------
+       Lets a lightweight local exam server register as a "sync device",
+       pull an assessment package while it has internet, and push
+       collected results back once connectivity returns. See
+       routes/localSync.js + controllers/syncController.js. */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='e_assessment_sync_devices' AND xtype='U')
+      CREATE TABLE e_assessment_sync_devices (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        device_name NVARCHAR(200) NOT NULL,
+        token_hash NVARCHAR(128) NOT NULL,
+        created_by INT NULL,
+        is_active BIT NOT NULL DEFAULT 1,
+        last_pull_at DATETIME NULL,
+        last_push_at DATETIME NULL,
+        createdAt DATETIME NOT NULL DEFAULT GETDATE()
+      )
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='e_assessment_sync_device_assessments' AND xtype='U')
+      CREATE TABLE e_assessment_sync_device_assessments (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        device_id INT NOT NULL,
+        e_assessment_id INT NOT NULL,
+        createdAt DATETIME NOT NULL DEFAULT GETDATE(),
+        CONSTRAINT UQ_sync_device_assessment UNIQUE (device_id, e_assessment_id)
+      )
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='e_assessment_sync_logs' AND xtype='U')
+      CREATE TABLE e_assessment_sync_logs (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        device_id INT NOT NULL,
+        e_assessment_id INT NULL,
+        direction NVARCHAR(10) NOT NULL,
+        batch_id NVARCHAR(64) NULL,
+        record_count INT NOT NULL DEFAULT 0,
+        status NVARCHAR(20) NOT NULL DEFAULT 'ok',
+        message NVARCHAR(500) NULL,
+        createdAt DATETIME NOT NULL DEFAULT GETDATE()
+      )
+    `);
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='e_assessment_submissions' AND xtype='U')
+      AND NOT EXISTS (
+        SELECT * FROM sys.columns
+        WHERE Name = N'sync_batch_id' AND Object_ID = Object_ID(N'e_assessment_submissions')
+      )
+      ALTER TABLE e_assessment_submissions ADD sync_batch_id NVARCHAR(64) NULL
+    `);
+
+    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, PortalPageSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, leave_outs code-verification columns, meal_daily_codes, leave_auto_approve, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl, Students.profileCompleted, student_profile_change_requests, website_content, contact_messages, newsletter_subscribers, e_assessments.cover_page_url, e_assessments.cover_page_width/height, e_assessment_question_images, e_assessment_sync_devices, e_assessment_sync_device_assessments, e_assessment_sync_logs, e_assessment_submissions.sync_batch_id)");
   } catch (err) {
     console.error("⚠️  Schema ensure failed:", err.message);
   }
