@@ -2,6 +2,30 @@ const sql = require("mssql");
 const crypto = require("crypto");
 const { hashToken } = require("../middleware/syncDeviceAuth");
 
+// Records a pull/push attempt — success OR failure — so "Recent sync
+// activity" actually reflects reality. Previously only successful pulls
+// and successful/duplicate pushes were ever logged, so a device that was
+// unauthorized, mistyped an assessment id, or hit a server error left no
+// trace at all: the admin panel just looked idle. Best-effort — a logging
+// failure should never mask the real error being reported to the caller.
+async function logSyncAttempt(pool, { deviceId, assessmentId, direction, status, recordCount = 0, message = null }) {
+  try {
+    await pool.request()
+      .input("device_id", sql.Int, deviceId)
+      .input("assessment_id", sql.Int, assessmentId ?? null)
+      .input("direction", sql.NVarChar(10), direction)
+      .input("record_count", sql.Int, recordCount)
+      .input("status", sql.NVarChar(20), status)
+      .input("message", sql.NVarChar(500), message)
+      .query(`
+        INSERT INTO e_assessment_sync_logs (device_id, e_assessment_id, direction, record_count, status, message)
+        VALUES (@device_id, @assessment_id, @direction, @record_count, @status, @message)
+      `);
+  } catch (logErr) {
+    console.error("SYNC LOG WRITE FAILED:", logErr);
+  }
+}
+
 /* =========================================================================
    ADMIN — DEVICE MANAGEMENT
 ========================================================================= */
@@ -19,15 +43,23 @@ const createSyncDevice = async (req, res) => {
 
     const rawToken = crypto.randomBytes(24).toString("hex"); // shown once to the admin
     const created_by = req.user?.id || null;
+    // req.tenant is set by server.js's DB middleware from the ADMIN's own
+    // JWT — this is the one place we reliably know which tenant this
+    // device belongs to, since the local exam server's later pull/push
+    // calls carry no JWT at all. Stamp it now so authenticateSyncDevice
+    // can look the device up in the right tenant DB later (see
+    // middleware/syncDeviceAuth.js).
+    const tenantKey = String(req.tenant || "default").toLowerCase();
 
     const result = await pool.request()
       .input("device_name", sql.NVarChar(200), device_name)
       .input("token_hash", sql.NVarChar(128), hashToken(rawToken))
+      .input("tenant_key", sql.NVarChar(50), tenantKey)
       .input("created_by", sql.Int, created_by)
       .query(`
-        INSERT INTO e_assessment_sync_devices (device_name, token_hash, created_by)
+        INSERT INTO e_assessment_sync_devices (device_name, token_hash, tenant_key, created_by)
         OUTPUT INSERTED.id
-        VALUES (@device_name, @token_hash, @created_by)
+        VALUES (@device_name, @token_hash, @tenant_key, @created_by)
       `);
     const deviceId = result.recordset[0].id;
 
@@ -45,6 +77,11 @@ const createSyncDevice = async (req, res) => {
       success: true,
       device: { id: deviceId, device_name },
       token: rawToken, // display this to the admin once, then never again
+      // Also shown once: the local exam server needs BOTH of these — the
+      // token as SYNC_TOKEN and this as SYNC_TENANT_KEY (or applied
+      // together via the admin page's "apply reissued token" flow) — or
+      // every pull/push will 401 against the wrong tenant DB.
+      tenant_key: tenantKey,
     });
   } catch (err) {
     console.error("CREATE SYNC DEVICE ERROR:", err);
@@ -57,7 +94,7 @@ const getSyncDevices = async (req, res) => {
   try {
     const pool = req.pool;
     const devices = await pool.request().query(`
-      SELECT d.id, d.device_name, d.is_active, d.last_pull_at, d.last_push_at, d.createdAt
+      SELECT d.id, d.device_name, d.tenant_key, d.is_active, d.last_pull_at, d.last_push_at, d.createdAt
       FROM e_assessment_sync_devices d
       ORDER BY d.createdAt DESC
     `);
@@ -93,6 +130,54 @@ const revokeSyncDevice = async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     console.error("REVOKE SYNC DEVICE ERROR:", err);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+};
+
+// PUT /api/local-sync/devices/:id/reissue
+// Rotates a device's token and re-activates it. This is the resync path:
+// a lab machine that was revoked (or whose token leaked/was lost) keeps
+// its identity, assessment assignments, and history — it just gets a new
+// token to authenticate with. The old token stops working immediately
+// (we overwrite token_hash), so this doubles as a safe "kick and replace"
+// even for a device that was never revoked.
+const reissueSyncDevice = async (req, res) => {
+  try {
+    const pool = req.pool;
+
+    const existing = await pool.request()
+      .input("id", sql.Int, req.params.id)
+      .query(`SELECT id, device_name, tenant_key FROM e_assessment_sync_devices WHERE id = @id`);
+    const device = existing.recordset[0];
+    if (!device) {
+      return res.status(404).json({ success: false, message: "Device not found" });
+    }
+
+    const rawToken = crypto.randomBytes(24).toString("hex"); // shown once to the admin
+    // Re-stamp tenant_key from THIS request's own tenant too (not just
+    // carry the old value forward) — reissue is also the recovery path
+    // for a device whose tenant_key predates this fix and was only
+    // backfilled to a guess by the migration.
+    const tenantKey = String(req.tenant || device.tenant_key || "default").toLowerCase();
+
+    await pool.request()
+      .input("id", sql.Int, req.params.id)
+      .input("token_hash", sql.NVarChar(128), hashToken(rawToken))
+      .input("tenant_key", sql.NVarChar(50), tenantKey)
+      .query(`
+        UPDATE e_assessment_sync_devices
+        SET token_hash = @token_hash, tenant_key = @tenant_key, is_active = 1
+        WHERE id = @id
+      `);
+
+    res.json({
+      success: true,
+      device: { id: device.id, device_name: device.device_name },
+      token: rawToken, // display this to the admin once, then never again
+      tenant_key: tenantKey, // give this to the local server too — see createSyncDevice's note
+    });
+  } catch (err) {
+    console.error("REISSUE SYNC DEVICE ERROR:", err);
     res.status(500).json({ success: false, message: "Server error" });
   }
 };
@@ -137,6 +222,10 @@ const pullPackage = async (req, res) => {
         WHERE device_id = @device_id AND e_assessment_id = @assessment_id
       `);
     if (!scope.recordset.length) {
+      await logSyncAttempt(pool, {
+        deviceId, assessmentId, direction: "pull", status: "error",
+        message: "This device is not authorized for that assessment",
+      });
       return res.status(403).json({ success: false, message: "This device is not authorized for that assessment" });
     }
 
@@ -147,7 +236,13 @@ const pullPackage = async (req, res) => {
                total_marks, instructions, exam_password, cover_page_url
         FROM e_assessments WHERE id = @id
       `);
-    if (!aRes.recordset.length) return res.status(404).json({ success: false, message: "Assessment not found" });
+    if (!aRes.recordset.length) {
+      await logSyncAttempt(pool, {
+        deviceId, assessmentId, direction: "pull", status: "error",
+        message: "Assessment not found",
+      });
+      return res.status(404).json({ success: false, message: "Assessment not found" });
+    }
     const assessment = aRes.recordset[0];
 
     const qRes = await pool.request()
@@ -205,14 +300,11 @@ const pullPackage = async (req, res) => {
       roster: rosterRes.recordset,
     };
 
-    await pool.request()
-      .input("device_id", sql.Int, deviceId)
-      .input("assessment_id", sql.Int, assessmentId)
-      .input("record_count", sql.Int, questions.length)
-      .query(`
-        INSERT INTO e_assessment_sync_logs (device_id, e_assessment_id, direction, record_count, status)
-        VALUES (@device_id, @assessment_id, 'pull', @record_count, 'ok')
-      `);
+    await logSyncAttempt(pool, {
+      deviceId, assessmentId, direction: "pull", status: "ok",
+      recordCount: questions.length,
+      message: `${questions.length} question(s), ${rosterRes.recordset.length} student(s)`,
+    });
     await pool.request()
       .input("id", sql.Int, deviceId)
       .query(`UPDATE e_assessment_sync_devices SET last_pull_at = GETDATE() WHERE id = @id`);
@@ -220,6 +312,10 @@ const pullPackage = async (req, res) => {
     res.json({ success: true, package: packageOut });
   } catch (err) {
     console.error("PULL PACKAGE ERROR:", err);
+    await logSyncAttempt(req.pool, {
+      deviceId: req.syncDevice?.id, assessmentId: parseInt(req.params.assessmentId),
+      direction: "pull", status: "error", message: "Server error while building package",
+    });
     res.status(500).json({ success: false, message: "Server error" });
   }
 };
@@ -237,6 +333,10 @@ const pushResults = async (req, res) => {
     const { assessment_id, batch_id, submissions } = req.body;
 
     if (!assessment_id || !batch_id || !Array.isArray(submissions)) {
+      await logSyncAttempt(pool, {
+        deviceId, assessmentId: assessment_id, direction: "push", status: "error",
+        message: "assessment_id, batch_id and submissions[] are required",
+      });
       return res.status(400).json({ success: false, message: "assessment_id, batch_id and submissions[] are required" });
     }
 
@@ -248,6 +348,10 @@ const pushResults = async (req, res) => {
         WHERE device_id = @device_id AND e_assessment_id = @assessment_id
       `);
     if (!scope.recordset.length) {
+      await logSyncAttempt(pool, {
+        deviceId, assessmentId: assessment_id, direction: "push", status: "error",
+        message: "This device is not authorized for that assessment",
+      });
       return res.status(403).json({ success: false, message: "This device is not authorized for that assessment" });
     }
 
@@ -354,6 +458,10 @@ const pushResults = async (req, res) => {
   } catch (err) {
     try { await transaction.rollback(); } catch (_) {}
     console.error("PUSH RESULTS ERROR:", err);
+    await logSyncAttempt(req.pool, {
+      deviceId: req.syncDevice?.id, assessmentId: req.body?.assessment_id,
+      direction: "push", status: "error", message: "Server error while applying submissions (rolled back)",
+    });
     res.status(500).json({ success: false, message: "Server error" });
   }
 };
@@ -384,6 +492,6 @@ const getMyAssessments = async (req, res) => {
 };
 
 module.exports = {
-  createSyncDevice, getSyncDevices, revokeSyncDevice, getSyncLogs,
+  createSyncDevice, getSyncDevices, revokeSyncDevice, reissueSyncDevice, getSyncLogs,
   pullPackage, pushResults, getMyAssessments,
 };

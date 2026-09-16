@@ -1156,6 +1156,7 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
         id INT IDENTITY(1,1) PRIMARY KEY,
         device_name NVARCHAR(200) NOT NULL,
         token_hash NVARCHAR(128) NOT NULL,
+        tenant_key NVARCHAR(50) NOT NULL DEFAULT 'default',
         created_by INT NULL,
         is_active BIT NOT NULL DEFAULT 1,
         last_pull_at DATETIME NULL,
@@ -1195,6 +1196,34 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       )
       ALTER TABLE e_assessment_submissions ADD sync_batch_id NVARCHAR(64) NULL
     `);
+
+    // tenant_key patch for DBs that already had this table before this
+    // fix. Device-token requests (X-Sync-Token) carry no JWT, so the
+    // global tenant-resolving middleware in server.js can't tell which
+    // tenant's DB to use for them — it always fell back to "default",
+    // which silently broke local sync for every non-default tenant
+    // (their device rows live in THEIR db, never found via the default
+    // pool). authenticateSyncDevice now resolves the pool from this
+    // column (via an X-Tenant-Key header the local exam server sends)
+    // instead of trusting that middleware's guess.
+    await pool.request().query(`
+      IF NOT EXISTS (
+        SELECT * FROM sys.columns
+        WHERE Name = N'tenant_key' AND Object_ID = Object_ID(N'e_assessment_sync_devices')
+      )
+      ALTER TABLE e_assessment_sync_devices ADD tenant_key NVARCHAR(50) NOT NULL DEFAULT 'default'
+    `);
+    // Backfill: the ALTER above defaults every existing row to
+    // 'default'. Every device that was already registered while
+    // running against THIS tenant's own pool actually belongs to this
+    // tenant, so correct that guess for any tenant that isn't literally
+    // "default" — otherwise those pre-existing devices would still be
+    // permanently unreachable even after upgrading.
+    if (tenantKey && tenantKey !== "default") {
+      await pool.request()
+        .input("tenantKey", sql.NVarChar(50), tenantKey)
+        .query(`UPDATE e_assessment_sync_devices SET tenant_key = @tenantKey WHERE tenant_key = 'default'`);
+    }
 
     /* ---------------- SchoolSettings table ----------------
        Doravo Core is a white-label platform: the software itself is
@@ -1276,7 +1305,7 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       END
     `);
 
-    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, PortalPageSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, leave_outs code-verification columns, meal_daily_codes, leave_auto_approve, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl, Students.profileCompleted, student_profile_change_requests, website_content, contact_messages, newsletter_subscribers, e_assessments.cover_page_url, e_assessments.cover_page_width/height, e_assessment_question_images, e_assessment_sync_devices, e_assessment_sync_device_assessments, e_assessment_sync_logs, e_assessment_submissions.sync_batch_id, SchoolSettings, SchoolOfficials)");
+    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, PortalPageSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, leave_outs code-verification columns, meal_daily_codes, leave_auto_approve, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl, Students.profileCompleted, student_profile_change_requests, website_content, contact_messages, newsletter_subscribers, e_assessments.cover_page_url, e_assessments.cover_page_width/height, e_assessment_question_images, e_assessment_sync_devices, e_assessment_sync_devices.tenant_key, e_assessment_sync_device_assessments, e_assessment_sync_logs, e_assessment_submissions.sync_batch_id, SchoolSettings, SchoolOfficials)");
   } catch (err) {
     console.error("⚠️  Schema ensure failed:", err.message);
   }
