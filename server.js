@@ -429,6 +429,7 @@ const SCHEMA_CACHE_TTL_MS = 60_000;
 const recordTablesCache = new Map(); // pool -> { list, expires }
 const recordColumnsCache = new Map(); // "pool|table" -> { columns, expires }
 const primaryKeyCache = new Map(); // "pool|table" -> { pk, expires }
+const identityColumnCache = new Map(); // "pool|table" -> { identity, expires }
 
 async function getAllTableNames(pool) {
   const cached = recordTablesCache.get(pool);
@@ -522,6 +523,30 @@ async function getPrimaryKeyColumn(pool, table) {
   return pk;
 }
 
+// Discovers whether the table has an IDENTITY (auto-increment) column,
+// so the "add record" form knows to leave that column out of the
+// INSERT (and out of the form itself) rather than letting the client
+// supply a value SQL Server will reject.
+async function getIdentityColumn(pool, table) {
+  const key = `${table}`;
+  const cached = identityColumnCache.get(key);
+  if (cached && Date.now() < cached.expires) return cached.identity;
+
+  const result = await pool
+    .request()
+    .input("table", sql.NVarChar, table)
+    .query(`
+      SELECT c.name AS COLUMN_NAME
+      FROM sys.identity_columns c
+      JOIN sys.tables t ON c.object_id = t.object_id
+      WHERE t.name = @table
+    `);
+
+  const identity = result.recordset.length ? result.recordset[0].COLUMN_NAME : null;
+  identityColumnCache.set(key, { identity, expires: Date.now() + SCHEMA_CACHE_TTL_MS });
+  return identity;
+}
+
 /* -------- list every table the Data Manager can open -------- */
 app.get("/api/records/tables", protect, adminOnly, async (req, res) => {
   try {
@@ -574,10 +599,67 @@ app.get("/api/records", protect, adminOnly, async (req, res) => {
     query += ` OFFSET ${(page - 1) * limit} ROWS FETCH NEXT ${limit} ROWS ONLY`;
 
     const result = await dbRequest.query(query);
-    res.json({ records: result.recordset, table, columns, primaryKey: pk });
+    const identityColumn = await getIdentityColumn(pool, table);
+    res.json({ records: result.recordset, table, columns, primaryKey: pk, identityColumn });
   } catch (err) {
     console.log("RECORDS ERROR:", err);
     res.status(500).json({ message: "Records failed" });
+  }
+});
+
+/* =========================================================
+   CREATE RECORD (admin only)
+   Generic insert for any table the Data Manager can see — mirrors
+   /api/update-records but builds an INSERT instead of an UPDATE.
+   The table's IDENTITY column (if any) is always left out of the
+   statement so SQL Server assigns it; every other writable column
+   the client actually sent is included, so a partially-filled form
+   still works (unsent columns fall back to the column's own default
+   / NULL).
+========================================================= */
+app.post("/api/records/create", protect, adminOnly, async (req, res) => {
+  try {
+    const pool = req.pool;
+    const requestedTable = req.body.type || req.body.table;
+    const table = await resolveTableName(pool, requestedTable);
+    if (!table) {
+      return res.status(400).json({ message: `Unknown table "${requestedTable || ""}"` });
+    }
+
+    const data = req.body.data && typeof req.body.data === "object" ? req.body.data : {};
+
+    const identityColumn = await getIdentityColumn(pool, table);
+    const columnInfo = await getRecordColumnInfo(pool, table);
+    const writableColumns = new Set(
+      columnInfo
+        .filter((c) => !RECORD_SENSITIVE_COLUMN_PATTERN.test(c.name) && c.name !== identityColumn)
+        .map((c) => c.name)
+    );
+
+    const insertCols = Object.keys(data).filter(
+      (k) => writableColumns.has(k) && data[k] !== "" && data[k] !== undefined
+    );
+
+    if (!insertCols.length) {
+      return res.status(400).json({ message: "No fields to insert" });
+    }
+
+    const dbRequest = pool.request();
+    insertCols.forEach((col, i) => dbRequest.input(`c${i}`, data[col]));
+
+    const colList = insertCols.map((c) => `[${c}]`).join(", ");
+    const valList = insertCols.map((c, i) => `@c${i}`).join(", ");
+
+    const result = await dbRequest.query(`
+      INSERT INTO [${table}] (${colList})
+      OUTPUT INSERTED.*
+      VALUES (${valList})
+    `);
+
+    res.json({ message: "Record created successfully", record: result.recordset?.[0] || null });
+  } catch (err) {
+    console.log("CREATE RECORD ERROR:", err);
+    res.status(500).json({ message: err.message || "Create failed" });
   }
 });
 
