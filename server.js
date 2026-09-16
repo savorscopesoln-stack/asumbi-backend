@@ -395,56 +395,186 @@ app.get("/api/subjects", protect, async (req, res) => {
 
 /* =========================================================
    RECORDS (admin only — this drives raw record editing)
+
+   Generalized to work against ANY base table in the DB, not just
+   Students/Teachers/Users. mssql can't parameterize identifiers
+   (table/column names), so every identifier that ends up inside a
+   query string is first checked against a live read of
+   INFORMATION_SCHEMA — the client's string is only ever used to
+   look up a real name, never interpolated directly.
 ========================================================= */
-const RECORD_TABLES = { teachers: "Teachers", users: "Users", students: "Students" };
 
-// Columns that must never reach the client, regardless of table —
-// checked case-insensitively against whatever the DB schema reports.
-const RECORD_SENSITIVE_COLUMNS = new Set(["password"]);
+// Short aliases kept for backward compatibility with the original
+// three record types (and with the separate bulk-import endpoint,
+// which still expects these exact lowercase strings). Any other
+// real table name can also be passed directly, matched case-
+// insensitively against the live schema.
+const RECORD_TABLE_ALIASES = { teachers: "Teachers", users: "Users", students: "Students" };
 
-// Per-table column list is discovered from the DB schema itself (via
-// INFORMATION_SCHEMA.COLUMNS) rather than hand-maintained here, so a
-// column added to a table later (e.g. Teachers.photoUrl) shows up
-// automatically instead of silently disappearing from this endpoint.
-// Cached per table for the life of the process — schema changes only
-// happen via migrations/deploys, not at runtime.
-const recordColumnsCache = new Map();
+// Column NAME patterns that must never reach the client, or be
+// written to, regardless of table.
+const RECORD_SENSITIVE_COLUMN_PATTERN = /password|secret|token|apikey|api_key/i;
 
-async function getRecordColumns(pool, table) {
-  if (recordColumnsCache.has(table)) return recordColumnsCache.get(table);
+// Tables the data manager will never expose, even to an admin —
+// pure internal bookkeeping.
+const RECORD_TABLE_BLOCKLIST = new Set(["sysdiagrams"]);
+
+const TEXT_COLUMN_TYPES = new Set(["char", "varchar", "nchar", "nvarchar", "text", "ntext"]);
+
+// Schema reads are cached for a minute at a time — long enough to
+// avoid hitting INFORMATION_SCHEMA on every request, short enough
+// that a migration run while the server is up is picked up without
+// a restart.
+const SCHEMA_CACHE_TTL_MS = 60_000;
+const recordTablesCache = new Map(); // pool -> { list, expires }
+const recordColumnsCache = new Map(); // "pool|table" -> { columns, expires }
+const primaryKeyCache = new Map(); // "pool|table" -> { pk, expires }
+
+async function getAllTableNames(pool) {
+  const cached = recordTablesCache.get(pool);
+  if (cached && Date.now() < cached.expires) return cached.list;
+
+  const result = await pool.request().query(`
+    SELECT TABLE_NAME
+    FROM INFORMATION_SCHEMA.TABLES
+    WHERE TABLE_TYPE = 'BASE TABLE'
+    ORDER BY TABLE_NAME
+  `);
+
+  const list = result.recordset
+    .map((r) => r.TABLE_NAME)
+    .filter((n) => !RECORD_TABLE_BLOCKLIST.has(n.toLowerCase()));
+
+  recordTablesCache.set(pool, { list, expires: Date.now() + SCHEMA_CACHE_TTL_MS });
+  return list;
+}
+
+// Resolves whatever the client sent ("students", "Students", or any
+// other real table name) to the table's exact, canonical name as it
+// exists in the live schema — or null if nothing matches. This is
+// the only place a client-supplied table "name" is allowed to turn
+// into something usable in a query.
+async function resolveTableName(pool, requested) {
+  if (!requested) return null;
+  const alias = RECORD_TABLE_ALIASES[String(requested).toLowerCase()];
+  if (alias) return alias;
+
+  const tables = await getAllTableNames(pool);
+  return tables.find((t) => t.toLowerCase() === String(requested).toLowerCase()) || null;
+}
+
+// Per-table column list + type, discovered from the DB schema itself
+// (via INFORMATION_SCHEMA.COLUMNS) rather than hand-maintained, so a
+// column added to any table later shows up automatically. `table`
+// here is always an already-resolved, real table name.
+async function getRecordColumnInfo(pool, table) {
+  const key = `${table}`;
+  const cached = recordColumnsCache.get(key);
+  if (cached && Date.now() < cached.expires) return cached.columns;
 
   const result = await pool
     .request()
     .input("table", sql.NVarChar, table)
     .query(`
-      SELECT COLUMN_NAME
+      SELECT COLUMN_NAME, DATA_TYPE
       FROM INFORMATION_SCHEMA.COLUMNS
       WHERE TABLE_NAME = @table
       ORDER BY ORDINAL_POSITION
     `);
 
-  const columns = result.recordset
-    .map((r) => r.COLUMN_NAME)
-    .filter((col) => !RECORD_SENSITIVE_COLUMNS.has(col.toLowerCase()));
-
-  recordColumnsCache.set(table, columns);
+  const columns = result.recordset.map((r) => ({ name: r.COLUMN_NAME, type: r.DATA_TYPE }));
+  recordColumnsCache.set(key, { columns, expires: Date.now() + SCHEMA_CACHE_TTL_MS });
   return columns;
 }
 
+// Column names safe to send to the client / accept edits on for this
+// table (sensitive columns like password hashes are stripped either
+// way).
+async function getRecordColumns(pool, table) {
+  const info = await getRecordColumnInfo(pool, table);
+  return info.filter((c) => !RECORD_SENSITIVE_COLUMN_PATTERN.test(c.name)).map((c) => c.name);
+}
+
+// Discovers the table's single-column primary key so row-level
+// update/delete works generically. Falls back to "id" (the
+// convention every table in this app already follows) when a table
+// has no primary key constraint or a composite one.
+async function getPrimaryKeyColumn(pool, table) {
+  const key = `${table}`;
+  const cached = primaryKeyCache.get(key);
+  if (cached && Date.now() < cached.expires) return cached.pk;
+
+  const result = await pool
+    .request()
+    .input("table", sql.NVarChar, table)
+    .query(`
+      SELECT KU.COLUMN_NAME
+      FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS TC
+      JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE AS KU
+        ON TC.CONSTRAINT_NAME = KU.CONSTRAINT_NAME
+        AND TC.TABLE_NAME = KU.TABLE_NAME
+      WHERE TC.CONSTRAINT_TYPE = 'PRIMARY KEY' AND TC.TABLE_NAME = @table
+      ORDER BY KU.ORDINAL_POSITION
+    `);
+
+  const pk = result.recordset.length === 1 ? result.recordset[0].COLUMN_NAME : "id";
+  primaryKeyCache.set(key, { pk, expires: Date.now() + SCHEMA_CACHE_TTL_MS });
+  return pk;
+}
+
+/* -------- list every table the Data Manager can open -------- */
+app.get("/api/records/tables", protect, adminOnly, async (req, res) => {
+  try {
+    const pool = req.pool;
+    const tables = await getAllTableNames(pool);
+    res.json({ tables });
+  } catch (err) {
+    console.log("RECORD TABLES ERROR:", err);
+    res.status(500).json({ message: "Failed to list tables" });
+  }
+});
+
+/* -------- read rows from any table, with optional search -------- */
 app.get("/api/records", protect, adminOnly, async (req, res) => {
   try {
     const pool = req.pool;
-    const table = RECORD_TABLES[req.query.type] || "Students";
+    const requestedTable = req.query.type || req.query.table;
+    const table = await resolveTableName(pool, requestedTable);
+    if (!table) {
+      return res.status(400).json({ message: `Unknown table "${requestedTable || ""}"` });
+    }
 
     const columns = await getRecordColumns(pool, table);
     if (!columns.length) {
       return res.status(500).json({ message: `No columns found for ${table}` });
     }
 
-    const result = await pool
-      .request()
-      .query(`SELECT ${columns.map((c) => `[${c}]`).join(", ")} FROM ${table}`);
-    res.json({ records: result.recordset });
+    const pk = await getPrimaryKeyColumn(pool, table);
+    const orderCol = columns.includes(pk) ? pk : columns[0];
+
+    const dbRequest = pool.request();
+    let query = `SELECT ${columns.map((c) => `[${c}]`).join(", ")} FROM [${table}]`;
+
+    const search = (req.query.search || req.query.q || "").trim();
+    if (search) {
+      const columnInfo = await getRecordColumnInfo(pool, table);
+      const textCols = columnInfo.filter(
+        (c) => !RECORD_SENSITIVE_COLUMN_PATTERN.test(c.name) && TEXT_COLUMN_TYPES.has(c.type.toLowerCase())
+      );
+      if (textCols.length) {
+        dbRequest.input("search", sql.NVarChar, `%${search}%`);
+        query += ` WHERE ` + textCols.map((c) => `[${c.name}] LIKE @search`).join(" OR ");
+      }
+    }
+
+    query += ` ORDER BY [${orderCol}]`;
+
+    const page = Math.max(parseInt(req.query.page) || 1, 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit) || 500, 1), 2000);
+    query += ` OFFSET ${(page - 1) * limit} ROWS FETCH NEXT ${limit} ROWS ONLY`;
+
+    const result = await dbRequest.query(query);
+    res.json({ records: result.recordset, table, columns, primaryKey: pk });
   } catch (err) {
     console.log("RECORDS ERROR:", err);
     res.status(500).json({ message: "Records failed" });
@@ -453,69 +583,53 @@ app.get("/api/records", protect, adminOnly, async (req, res) => {
 
 /* =========================================================
    UPDATE RECORDS (admin only)
+   Builds the SET clause dynamically from whatever columns are
+   present on each submitted row AND actually exist (and are
+   writable) on the resolved table — so it works for any table's
+   shape without a hand-maintained per-table field list. Only
+   columns the client actually sent are touched; anything the row
+   doesn't mention is left alone in the DB.
 ========================================================= */
 app.post("/api/update-records", protect, adminOnly, async (req, res) => {
   try {
     const pool = req.pool;
-    const { type, data } = req.body;
-    const table = RECORD_TABLES[type] || "Students";
+    const requestedTable = req.body.type || req.body.table;
+    const table = await resolveTableName(pool, requestedTable);
+    if (!table) {
+      return res.status(400).json({ message: `Unknown table "${requestedTable || ""}"` });
+    }
 
+    const { data } = req.body;
     if (!Array.isArray(data)) {
       return res.status(400).json({ message: "data must be an array" });
     }
 
+    const pk = await getPrimaryKeyColumn(pool, table);
+    const columnInfo = await getRecordColumnInfo(pool, table);
+    const writableColumns = new Set(
+      columnInfo
+        .filter((c) => !RECORD_SENSITIVE_COLUMN_PATTERN.test(c.name) && c.name !== pk)
+        .map((c) => c.name)
+    );
+
+    let updated = 0;
     for (const row of data) {
-      if (!row.id) continue;
+      const pkValue = row[pk];
+      if (pkValue === undefined || pkValue === null || pkValue === "") continue;
 
-      const request = pool.request();
-      request.input("id", row.id);
-      request.input("name", row.name || "");
-      request.input("status", row.status || "active");
+      const setCols = Object.keys(row).filter((k) => writableColumns.has(k));
+      if (!setCols.length) continue;
 
-      if (table === "Students") {
-        request
-          .input("admissionNo", row.admissionNo || "")
-          .input("studentClass", row.studentClass || "")
-          .input("gender", row.gender || "")
-          .input("yearOfStudy", parseInt(row.yearOfStudy) || 1)
-          .input("phone", row.phone || "")
-          .input("assessmentNumber", row.assessmentNumber || null);
+      const dbRequest = pool.request();
+      dbRequest.input("pkValue", pkValue);
+      setCols.forEach((col, i) => dbRequest.input(`c${i}`, row[col]));
 
-        await request.query(`
-          UPDATE Students
-          SET name = @name, status = @status, admissionNo = @admissionNo,
-              studentClass = @studentClass, gender = @gender,
-              assessmentNumber = @assessmentNumber, yearOfStudy = @yearOfStudy,
-              phone = @phone
-          WHERE id = @id
-        `);
-      } else if (table === "Teachers") {
-        request
-          .input("subject", row.subject || "")
-          .input("staffId", row.staffId || "")
-          .input("phone", row.phone || "")
-          .input("email", row.email || null)
-          .input("username", row.username || "")
-          .input("role", row.role || "teacher");
-
-        await request.query(`
-          UPDATE Teachers
-          SET name = @name, status = @status, subject = @subject,
-              staffId = @staffId, phone = @phone, email = @email,
-              username = @username, role = @role
-          WHERE id = @id
-        `);
-      } else if (table === "Users") {
-        request.input("username", row.username || "").input("role", row.role || "user");
-        await request.query(`
-          UPDATE Users
-          SET name = @name, status = @status, username = @username, role = @role
-          WHERE id = @id
-        `);
-      }
+      const setClause = setCols.map((col, i) => `[${col}] = @c${i}`).join(", ");
+      await dbRequest.query(`UPDATE [${table}] SET ${setClause} WHERE [${pk}] = @pkValue`);
+      updated++;
     }
 
-    res.json({ message: "Updated successfully" });
+    res.json({ message: `Updated ${updated} record${updated === 1 ? "" : "s"} successfully` });
   } catch (err) {
     console.log("UPDATE ERROR:", err);
     res.status(500).json({ message: err.message });
@@ -528,13 +642,19 @@ app.post("/api/update-records", protect, adminOnly, async (req, res) => {
 app.post("/api/update-records/delete", protect, adminOnly, async (req, res) => {
   try {
     const pool = req.pool;
-    const { type, id } = req.body;
-    const table = RECORD_TABLES[type] || "Students";
-    const numId = toInt(id);
+    const requestedTable = req.body.type || req.body.table;
+    const table = await resolveTableName(pool, requestedTable);
+    if (!table) {
+      return res.status(400).json({ message: `Unknown table "${requestedTable || ""}"` });
+    }
 
-    if (!numId) return res.status(400).json({ message: "Invalid id" });
+    const { id } = req.body;
+    if (id === undefined || id === null || id === "") {
+      return res.status(400).json({ message: "Invalid id" });
+    }
 
-    await pool.request().input("id", sql.Int, numId).query(`DELETE FROM ${table} WHERE id = @id`);
+    const pk = await getPrimaryKeyColumn(pool, table);
+    await pool.request().input("id", id).query(`DELETE FROM [${table}] WHERE [${pk}] = @id`);
     res.json({ message: "Deleted" });
   } catch (err) {
     console.log("DELETE ERROR:", err);
