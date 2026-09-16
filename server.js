@@ -16,17 +16,24 @@ const { ensureSchema } = require("./utils/ensureSchema");
 const { photoUrlFor, deletePhotoByUrl, runPhotoUpload } = require("./middleware/photoUpload");
 
 // Idempotent startup check — creates/upgrades the Notifications table
-// and adds leave_outs.leave_type if either is missing. Safe to run
-// on every boot. Runs against EVERY configured tenant DB (default +
-// anything in DB_TENANTS), not just the default one, so a second
-// tenant database gets the same schema fixes.
-for (const tenantKey of listTenantKeys()) {
+// and adds leave_outs.leave_type if either is missing. Runs against
+// EVERY configured tenant DB (default + anything in DB_TENANTS).
+//
+// IMPORTANT: these promises are awaited before the server starts
+// accepting traffic (see startServer() near the bottom) — otherwise,
+// on a cold Render deploy or a paused Azure SQL Serverless DB, requests
+// can land before a tenant's schema check has actually finished,
+// producing "Invalid object name" errors that look like the DB is
+// broken when it's really just not ready yet. Each tenant's promise
+// still catches its own error, so one bad tenant can't block the
+// others or crash boot.
+const schemaReadyPromises = listTenantKeys().map((tenantKey) =>
   getPool(tenantKey)
     .then((pool) => ensureSchema(pool, sql, tenantKey))
     .catch((err) =>
       console.error(`Schema ensure skipped (tenant "${tenantKey}"):`, err.message)
-    );
-}
+    )
+);
 
 // route modules
 const registerRoutes = require("./routes/register");
@@ -1357,6 +1364,14 @@ const PORT = process.env.PORT || 5000;
 const LISTEN_BACKLOG = process.env.LISTEN_BACKLOG
   ? parseInt(process.env.LISTEN_BACKLOG, 10)
   : 1024;
-server.listen(PORT, LISTEN_BACKLOG, () => {
-  console.log(`Server running on port ${PORT} (listen backlog ${LISTEN_BACKLOG})`);
-});
+async function startServer() {
+  console.log("⏳ Waiting for tenant DB schema checks before accepting traffic...");
+  await Promise.allSettled(schemaReadyPromises);
+  console.log("✅ Schema checks settled — starting server.");
+
+  server.listen(PORT, LISTEN_BACKLOG, () => {
+    console.log(`Server running on port ${PORT} (listen backlog ${LISTEN_BACKLOG})`);
+  });
+}
+
+startServer();
