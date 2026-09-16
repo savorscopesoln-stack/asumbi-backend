@@ -97,7 +97,7 @@ const corsOptions = {
     if (/^https:\/\/asumbi(-[a-z0-9]+)?-savorscopesoln-stacks-projects\.vercel\.app$/.test(origin)) {
       return callback(null, true);
     }
-    if (origin === "https://asumbi.vercel.app") return callback(null, true);
+    if (origin === "https://doravo.co.ke") return callback(null, true);
 
     callback(new Error("Not allowed by CORS: " + origin));
   },
