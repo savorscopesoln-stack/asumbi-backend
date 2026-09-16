@@ -1,71 +1,8 @@
 const sql = require("mssql");
 require("dotenv").config();
 
-// =========================================================
-// CONFIG — single source of truth, fully env-driven
-// Works for local SQL Server Express AND cloud (Azure SQL)
-// =========================================================
-const config = {
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  server: process.env.DB_SERVER,
-  database: process.env.DB_NAME,
-  port: process.env.DB_PORT ? parseInt(process.env.DB_PORT, 10) : 1433,
-  options: {
-    // Azure SQL requires encryption; local SQL Server Express usually doesn't.
-    // Set DB_ENCRYPT=true in your .env when connecting to Azure SQL / any cloud DB.
-    encrypt: process.env.DB_ENCRYPT === "true",
-    trustServerCertificate: process.env.DB_TRUST_CERT !== "false",
-  },
-  // Pool sizing — env-driven so it can be tuned per environment without a
-  // code change. The old hard-coded max:10/min:0 was fine for normal admin
-  // portal traffic but is the confirmed cause of the exam-login failures
-  // under a burst of ~900 simultaneous students: only 10 physical SQL
-  // connections existed, so requests queued for a connection and, once the
-  // queue wait exceeded tarn's default 30s acquireTimeoutMillis, failed as
-  // connection-level errors rather than clean 400/401 responses.
-  //
-  // DB_POOL_MAX default of 50 is a conservative starting point for a
-  // 2-query, index-lookup login (not "max:900" — that would just move the
-  // bottleneck onto SQL Server's own worker/connection limits). Re-tune
-  // upward only after confirming SQL Server CPU/connection headroom at
-  // that size during staged load testing (see TESTING STRATEGY).
-  //
-  // DB_POOL_ACQUIRE_TIMEOUT_MS default of 8000 makes a saturated pool fail
-  // fast with a clear, catchable error (caught in examLogin below and
-  // turned into a 503 + Retry-After) instead of silently hanging for 30s,
-  // which is what produced the connection-reset-style failures under load.
-  pool: {
-    max: process.env.DB_POOL_MAX ? parseInt(process.env.DB_POOL_MAX, 10) : 50,
-    min: process.env.DB_POOL_MIN ? parseInt(process.env.DB_POOL_MIN, 10) : 2,
-    idleTimeoutMillis: process.env.DB_POOL_IDLE_MS
-      ? parseInt(process.env.DB_POOL_IDLE_MS, 10)
-      : 30000,
-    acquireTimeoutMillis: process.env.DB_POOL_ACQUIRE_TIMEOUT_MS
-      ? parseInt(process.env.DB_POOL_ACQUIRE_TIMEOUT_MS, 10)
-      : 8000,
-  },
-  // Azure SQL Serverless can be *paused* after a period of inactivity —
-  // the first connection after a pause has to wait for it to resume,
-  // which can take well over the mssql/tedious default of 15s. Give it
-  // real headroom (overridable via env for local SQL Server Express,
-  // which reconnects instantly and doesn't need this).
-  connectionTimeout: process.env.DB_CONNECT_TIMEOUT_MS
-    ? parseInt(process.env.DB_CONNECT_TIMEOUT_MS, 10)
-    : 45000,
-  requestTimeout: process.env.DB_REQUEST_TIMEOUT_MS
-    ? parseInt(process.env.DB_REQUEST_TIMEOUT_MS, 10)
-    : 45000,
-};
-
-// =========================================================
-// VALIDATE ENV — fail fast with a clear message
-// =========================================================
-if (!config.user || !config.password || !config.server || !config.database) {
-  throw new Error(
-    "❌ Missing DB config. Check DB_USER, DB_PASSWORD, DB_SERVER, DB_NAME in your .env file."
-  );
-}
+const tenants = require("./tenants");
+const tenantContext = require("./tenantContext");
 
 // =========================================================
 // CONNECTION POOL — reconnects on demand instead of caching
@@ -85,8 +22,9 @@ if (!config.user || !config.password || !config.server || !config.database) {
 // stale cached Promise.
 // =========================================================
 class LazyPool {
-  constructor(cfg) {
+  constructor(cfg, label) {
     this._config = cfg;
+    this._label = label; // for log lines, e.g. "default" or "eregi"
     this._pool = null; // a connected ConnectionPool, once we have one
     this._connecting = null; // in-flight connect attempt, if any
   }
@@ -104,7 +42,7 @@ class LazyPool {
     this._connecting = new sql.ConnectionPool(this._config)
       .connect()
       .then((pool) => {
-        console.log("✅ SQL Server Connected");
+        console.log(`✅ SQL Server Connected (tenant: ${this._label})`);
         this._pool = pool;
         this._connecting = null;
 
@@ -112,14 +50,14 @@ class LazyPool {
         // Azure DB auto-pausing again), forget it so the *next*
         // request reconnects instead of reusing a dead pool.
         pool.on("error", (err) => {
-          console.error("⚠️ SQL pool error:", err.message);
+          console.error(`⚠️ SQL pool error (tenant: ${this._label}):`, err.message);
           this._pool = null;
         });
 
         return pool;
       })
       .catch((err) => {
-        console.error("❌ DB Connection Failed:", err.message);
+        console.error(`❌ DB Connection Failed (tenant: ${this._label}):`, err.message);
         this._connecting = null;
         throw err;
       });
@@ -138,9 +76,58 @@ class LazyPool {
   }
 }
 
-const poolPromise = new LazyPool(config);
+// =========================================================
+// MULTI-TENANT POOL REGISTRY
+// One LazyPool per configured tenant, created on first use and cached
+// here for the life of the process (same lifetime the old single
+// `poolPromise` had).
+// =========================================================
+const poolsByTenant = new Map();
+
+function getPoolForTenant(tenantKey) {
+  const key = tenantKey || tenants.DEFAULT_TENANT;
+  if (!poolsByTenant.has(key)) {
+    const cfg = tenants.buildTenantConfig(key); // throws a clear error if misconfigured
+    poolsByTenant.set(key, new LazyPool(cfg, key));
+  }
+  return poolsByTenant.get(key);
+}
+
+// =========================================================
+// poolPromise — SAME PUBLIC SHAPE AS BEFORE.
+// Every existing call site across the codebase does
+// `const pool = await poolPromise` (or .then/.catch on it) with no
+// idea a tenant even exists. To keep every one of those call sites
+// working unchanged, poolPromise is itself a thenable: on await, it
+// looks up the tenant key stashed in AsyncLocalStorage for the
+// in-flight request (set by middleware/tenantContext.js very early in
+// the request pipeline, before any route runs) and delegates to that
+// tenant's LazyPool. Outside of a request (e.g. a background job, or
+// code that never went through the tenant middleware) it just uses
+// the default tenant, which is exactly the old single-DB behavior.
+// =========================================================
+const poolPromise = {
+  then(onFulfilled, onRejected) {
+    const tenantKey = tenantContext.getTenant() || tenants.DEFAULT_TENANT;
+    return getPoolForTenant(tenantKey).then(onFulfilled, onRejected);
+  },
+  catch(onRejected) {
+    const tenantKey = tenantContext.getTenant() || tenants.DEFAULT_TENANT;
+    return getPoolForTenant(tenantKey).catch(onRejected);
+  },
+  finally(onFinally) {
+    const tenantKey = tenantContext.getTenant() || tenants.DEFAULT_TENANT;
+    return getPoolForTenant(tenantKey).finally(onFinally);
+  },
+};
 
 module.exports = {
   sql,
   poolPromise,
+  // Exposed for code that explicitly needs a *specific* tenant's pool
+  // regardless of request context — e.g. server.js running
+  // ensureSchema()/the notification scheduler once per configured
+  // tenant at startup.
+  getPoolForTenant,
+  tenantKeys: tenants.ALL_TENANT_KEYS,
 };

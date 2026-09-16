@@ -10,17 +10,25 @@ const jwt = require("jsonwebtoken");
 
 const path = require("path");
 
-const { poolPromise, sql } = require("./config/db");
+const { poolPromise, sql, getPoolForTenant, tenantKeys } = require("./config/db");
+const tenantContext = require("./config/tenantContext");
+const { tenantMiddleware } = require("./middleware/tenantMiddleware");
 const { protect, authorize, adminOnly, requirePage } = require("./middleware/authMiddleware");
 const { ensureSchema } = require("./utils/ensureSchema");
 const { photoUrlFor, deletePhotoByUrl, runPhotoUpload } = require("./middleware/photoUpload");
 
 // Idempotent startup check — creates/upgrades the Notifications table
 // and adds leave_outs.leave_type if either is missing. Safe to run
-// on every boot.
-poolPromise
-  .then((pool) => ensureSchema(pool, sql))
-  .catch((err) => console.error("Schema ensure skipped:", err.message));
+// on every boot. Runs once per configured DB tenant (just "default"
+// unless DB_TENANTS lists more), since each tenant is its own
+// database and needs its own schema check.
+for (const tenantKey of tenantKeys) {
+  getPoolForTenant(tenantKey)
+    .then((pool) => ensureSchema(pool, sql))
+    .catch((err) =>
+      console.error(`Schema ensure skipped (tenant: ${tenantKey}):`, err.message)
+    );
+}
 
 // route modules
 const registerRoutes = require("./routes/register");
@@ -118,6 +126,14 @@ app.options("*", cors(corsOptions));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// Must come before the DB middleware below (and before every route,
+// all of which are mounted further down) — it decides which
+// database this request talks to. See config/tenants.js for how a
+// request gets mapped to a tenant, and config/db.js for how
+// `poolPromise` uses it. With no DB_TENANTS configured this is a
+// no-op and everything behaves exactly as a single-DB deployment.
+app.use(tenantMiddleware);
+
 const upload = multer({ storage: multer.memoryStorage() });
 
 /* ================= PROFILE PHOTOS (static) =================
@@ -207,7 +223,15 @@ app.use("/", metaRoutes);
 
 // Sweeps ScheduledNotifications once a minute for anything due and sends
 // it out over its configured channels (in-app / email / SMS / WhatsApp).
-startNotificationScheduler(poolPromise, io, dispatchBroadcast);
+// Started once per configured DB tenant — each runs its own setInterval
+// inside that tenant's AsyncLocalStorage context (established here,
+// synchronously, before the timer is registered) so poolPromise inside
+// the scheduler resolves to the right tenant's database on every tick.
+for (const tenantKey of tenantKeys) {
+  tenantContext.run(tenantKey, () => {
+    startNotificationScheduler(poolPromise, io, dispatchBroadcast);
+  });
+}
 
 /* =========================================================
    CLASSES
