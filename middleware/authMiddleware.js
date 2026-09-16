@@ -34,7 +34,7 @@ const protect = (req, res, next) => {
        VERIFY TOKEN
     ===================================================== */
     const secret =
-      process.env.JWT_SECRET || "asumbi_secret";
+      process.env.JWT_SECRET || "doravo_core_secret";
 
     const decoded = jwt.verify(token, secret);
 
@@ -67,6 +67,19 @@ const protect = (req, res, next) => {
         : [],
 
       source: decoded?.source || null,
+
+      /*
+        MULTI-TENANT
+        Which tenant DB (see config/db.js / DB_TENANTS) this account's
+        row actually lives in — "default" for tokens minted before
+        multi-tenant support existed, or that never got a tenant
+        stamped on them. server.js's DB middleware already uses this
+        same claim to pick req.pool before `protect` even runs; this
+        just also exposes it on req.user for any controller that
+        wants it directly.
+      */
+      tenant: decoded?.tenant || "default",
+
       iat: decoded?.iat || null,
       exp: decoded?.exp || null,
 

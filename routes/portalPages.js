@@ -31,7 +31,7 @@ module.exports = (poolPromise, sql) => {
   */
   router.get("/", authorize("admin", "sub_admin", "sub_admin_2"), async (req, res) => {
     try {
-      const pool = await poolPromise;
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
       const result = await pool.request().query(`SELECT * FROM PortalPageSettings ORDER BY portal, page_key`);
       res.json(result.recordset || []);
     } catch (err) {
@@ -51,7 +51,7 @@ module.exports = (poolPromise, sql) => {
         return res.status(400).json({ message: "Unknown portal" });
       }
 
-      const pool = await poolPromise;
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
       const result = await pool.request()
         .input("portal", sql.NVarChar, portal)
         .query(`SELECT page_key, enabled FROM PortalPageSettings WHERE portal=@portal`);
@@ -84,7 +84,7 @@ module.exports = (poolPromise, sql) => {
         return res.status(400).json({ message: "This page is the portal's landing page and can't be disabled." });
       }
 
-      const pool = await poolPromise;
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
       const actorName = await getActorDisplayName(pool, req.user);
 
       await pool.request()

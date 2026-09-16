@@ -25,7 +25,7 @@ const getActorDisplayName = async (pool, user) => {
 ========================================================= */
 router.post("/verify", authorize(...KITCHEN_STAFF_ROLES), async (req, res) => {
   try {
-    const pool = await poolPromise;
+    const pool = req.pool; // tenant-resolved by server.js DB middleware
     const code = String(req.body.code || "").trim();
     if (!code) return res.status(400).json({ message: "Code is required" });
 
@@ -86,7 +86,7 @@ router.post("/verify", authorize(...KITCHEN_STAFF_ROLES), async (req, res) => {
 ========================================================= */
 router.get("/log", authorize(...KITCHEN_STAFF_ROLES), async (req, res) => {
   try {
-    const pool = await poolPromise;
+    const pool = req.pool; // tenant-resolved by server.js DB middleware
     const date = req.query.date || new Date().toISOString().slice(0, 10);
 
     const result = await pool.request().input("date", sql.Date, date).query(`

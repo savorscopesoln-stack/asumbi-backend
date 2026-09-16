@@ -10,7 +10,7 @@ const { authorize } = require("../middleware/authMiddleware");
 ========================================================= */
 router.get("/", async (req, res) => {
   try {
-    const pool = await poolPromise;
+    const pool = req.pool; // tenant-resolved by server.js DB middleware
 
     const result = await pool.request()
       .input("id", sql.Int, req.user.id)
@@ -34,7 +34,7 @@ router.get("/", async (req, res) => {
 ========================================================= */
 router.get("/unread-count", async (req, res) => {
   try {
-    const pool = await poolPromise;
+    const pool = req.pool; // tenant-resolved by server.js DB middleware
 
     const result = await pool.request()
       .input("id", sql.Int, req.user.id)
@@ -57,7 +57,7 @@ router.get("/unread-count", async (req, res) => {
 ========================================================= */
 router.put("/read-all", async (req, res) => {
   try {
-    const pool = await poolPromise;
+    const pool = req.pool; // tenant-resolved by server.js DB middleware
 
     await pool.request()
       .input("id", sql.Int, req.user.id)
@@ -80,7 +80,7 @@ router.put("/read-all", async (req, res) => {
 ========================================================= */
 router.put("/:id/read", async (req, res) => {
   try {
-    const pool = await poolPromise;
+    const pool = req.pool; // tenant-resolved by server.js DB middleware
 
     await pool.request()
       .input("id", sql.Int, req.params.id)
@@ -108,7 +108,7 @@ router.put("/:id/read", async (req, res) => {
 ========================================================= */
 router.post("/", authorize("admin", "teacher", "sub_admin", "sub_admin_2"), async (req, res) => {
   try {
-    const pool = await poolPromise;
+    const pool = req.pool; // tenant-resolved by server.js DB middleware
     const { recipientType, recipientId, studentClass, title, message, type } = req.body;
 
     if (!message || !String(message).trim()) {

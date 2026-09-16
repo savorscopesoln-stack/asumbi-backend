@@ -88,7 +88,7 @@ module.exports = (poolPromise, sql) => {
      into the site directly. */
   router.get("/", async (req, res) => {
     try {
-      const pool = await poolPromise;
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
       const result = await pool.request().query(`SELECT section_key, content_json, updated_at FROM website_content`);
 
       const bySection = {};
@@ -176,7 +176,7 @@ module.exports = (poolPromise, sql) => {
         return res.status(400).json({ message: "Unknown section" });
       }
 
-      const pool = await poolPromise;
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
       const result = await pool.request()
         .input("sectionKey", sql.NVarChar, section)
         .query(`SELECT section_key, content_json, updated_by_name, updated_at FROM website_content WHERE section_key=@sectionKey`);
@@ -215,7 +215,7 @@ module.exports = (poolPromise, sql) => {
         return res.status(400).json({ message: "content is required" });
       }
 
-      const pool = await poolPromise;
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
       const actorName = await getActorDisplayName(pool, req.user);
       const contentJson = JSON.stringify(content);
 
@@ -288,7 +288,7 @@ module.exports = (poolPromise, sql) => {
         return res.status(400).json({ message: "Unknown section" });
       }
 
-      const pool = await poolPromise;
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
       const result = await pool.request()
         .input("sectionKey", sql.NVarChar, section)
         .query(`
@@ -328,7 +328,7 @@ module.exports = (poolPromise, sql) => {
         return res.status(400).json({ message: "Invalid history id" });
       }
 
-      const pool = await poolPromise;
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
       const found = await pool.request()
         .input("id", sql.Int, historyId)
         .input("sectionKey", sql.NVarChar, section)

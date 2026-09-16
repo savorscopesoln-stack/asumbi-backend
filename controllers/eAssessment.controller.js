@@ -9,6 +9,7 @@ const { notifyUsers, notifyOne } = require("../utils/notify");
 const { withTransientRetry, isTransientDbError } = require("../utils/transientDbRetry");
 const { coverPageUrlFor, deleteCoverPageByUrl } = require("../middleware/coverPageUpload");
 const { QUESTION_IMAGES_DIR, questionImageUrlFor, deleteQuestionImageByUrl } = require("../middleware/questionImageUpload");
+const { getPool, listTenantKeys } = require("../config/db");
 
 /* =========================================================================
    HELPERS
@@ -525,7 +526,6 @@ const getEAssessmentById = async (req, res) => {
 
 const examLogin = async (req, res) => {
   try {
-    const pool = req.pool;
     const assessmentId = toInt(req.body.assessmentId);
     const username = (req.body.username || "").trim();
     const examPassword = (req.body.examPassword || "").trim();
@@ -534,29 +534,52 @@ const examLogin = async (req, res) => {
       return res.status(400).json({ success: false, message: "Assessment, username and exam password are all required" });
     }
 
-    // Both queries below are wrapped in withTransientRetry: under a login
-    // burst, the pool can be momentarily saturated (all DB_POOL_MAX
-    // connections busy) — that surfaces as a pool-acquire-timeout error,
-    // not a real query failure, so one quick retry after a short backoff
-    // is safe and often succeeds once a connection frees up. This never
-    // retries on bad credentials/validation, since those aren't thrown
-    // errors here at all — see isTransientDbError.
-    let aRes;
-    try {
-      aRes = await withTransientRetry(
-        () => pool.request()
-          .input("id", sql.Int, assessmentId)
-          .query(`SELECT id, title, subject, duration_minutes, class_id, status, active_status, exam_password FROM e_assessments WHERE id = @id`),
-        { label: "exam-login:fetch-assessment" }
-      );
-    } catch (dbErr) {
-      return respondDbBusy(res, dbErr);
+    // MULTI-TENANT: there's no JWT yet at this point (that's the whole
+    // point of exam-login — a student reaches it via a shared link with
+    // no prior /login), so server.js's DB middleware has no tenant hint
+    // and req.pool is just the "default" tenant. The assessment could
+    // live in ANY configured tenant DB, so try each one in turn (same
+    // pattern as routes/auth.js's POST /login) until the assessment id is
+    // found, then look the student up in THAT SAME tenant's Students
+    // table — a student's account and the assessment they're sitting
+    // always live in one database together, never split across two.
+    let pool = null;
+    let tenant = null;
+    let assessment = null;
+
+    for (const tenantKey of listTenantKeys()) {
+      const candidatePool = await getPool(tenantKey);
+
+      // Both queries below are wrapped in withTransientRetry: under a login
+      // burst, the pool can be momentarily saturated (all DB_POOL_MAX
+      // connections busy) — that surfaces as a pool-acquire-timeout error,
+      // not a real query failure, so one quick retry after a short backoff
+      // is safe and often succeeds once a connection frees up. This never
+      // retries on bad credentials/validation, since those aren't thrown
+      // errors here at all — see isTransientDbError.
+      let aRes;
+      try {
+        aRes = await withTransientRetry(
+          () => candidatePool.request()
+            .input("id", sql.Int, assessmentId)
+            .query(`SELECT id, title, subject, duration_minutes, class_id, status, active_status, exam_password FROM e_assessments WHERE id = @id`),
+          { label: `exam-login:fetch-assessment:${tenantKey}` }
+        );
+      } catch (dbErr) {
+        return respondDbBusy(res, dbErr);
+      }
+
+      if (aRes.recordset.length) {
+        pool = candidatePool;
+        tenant = tenantKey;
+        assessment = aRes.recordset[0];
+        break;
+      }
     }
 
-    if (!aRes.recordset.length) {
+    if (!assessment) {
       return res.status(404).json({ success: false, message: "Assessment not found" });
     }
-    const assessment = aRes.recordset[0];
 
     if (!assessment.exam_password) {
       return res.status(400).json({ success: false, message: "This assessment has no exam password configured. Ask your teacher to set one, or log in to the student portal normally." });
@@ -599,11 +622,12 @@ const examLogin = async (req, res) => {
         role: "student",
         permissions: [],
         source: "Students",
+        tenant,
         mustChangePassword: false,
         examOnly: true,
         examAssessmentId: assessment.id,
       },
-      process.env.JWT_SECRET || "asumbi_secret",
+      process.env.JWT_SECRET || "doravo_core_secret",
       { expiresIn: `${minutes}m` }
     );
 
@@ -617,6 +641,7 @@ const examLogin = async (req, res) => {
         role: "student",
         permissions: [],
         source: "Students",
+        tenant,
         mustChangePassword: false,
         examOnly: true,
         examAssessmentId: assessment.id,

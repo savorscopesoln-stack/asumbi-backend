@@ -29,7 +29,7 @@ module.exports = (poolPromise, sql) => {
      School Settings admin form) needs exactly one fetch. */
   router.get("/", async (req, res) => {
     try {
-      const pool = await poolPromise;
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
 
       const settingsResult = await pool.request().query(
         `SELECT TOP 1 * FROM SchoolSettings WHERE id = 1`
@@ -54,7 +54,7 @@ module.exports = (poolPromise, sql) => {
   /* ================= UPDATE SETTINGS (admin) ================= */
   router.put("/", protect, requirePage("School Settings"), async (req, res) => {
     try {
-      const pool = await poolPromise;
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
       const {
         schoolName, shortName, motto, centreCode,
         address, phone, email, website, numberOfClasses, logoUrl,
@@ -110,7 +110,7 @@ module.exports = (poolPromise, sql) => {
      Website page, so a logo can be previewed before saving). */
   router.post("/logo", protect, requirePage("School Settings"), async (req, res) => {
     try {
-      const pool = await poolPromise;
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
       await runWebsiteImageUpload(req, res);
       if (!req.file) return res.status(400).json({ message: "No image file received" });
 
@@ -131,7 +131,7 @@ module.exports = (poolPromise, sql) => {
   /* ================= OFFICIALS (admin) ================= */
   router.post("/officials", protect, requirePage("School Settings"), async (req, res) => {
     try {
-      const pool = await poolPromise;
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
       const { title, name, sortOrder, isSignatory } = req.body || {};
 
       if (!title || !String(title).trim()) {
@@ -164,7 +164,7 @@ module.exports = (poolPromise, sql) => {
 
   router.put("/officials/:id", protect, requirePage("School Settings"), async (req, res) => {
     try {
-      const pool = await poolPromise;
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
       const { title, name, sortOrder, isSignatory } = req.body || {};
 
       if (!title || !String(title).trim()) {
@@ -197,7 +197,7 @@ module.exports = (poolPromise, sql) => {
 
   router.delete("/officials/:id", protect, requirePage("School Settings"), async (req, res) => {
     try {
-      const pool = await poolPromise;
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
       await pool.request()
         .input("id", sql.Int, req.params.id)
         .query(`DELETE FROM SchoolOfficials WHERE id = @id`);

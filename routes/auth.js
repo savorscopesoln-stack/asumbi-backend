@@ -2,7 +2,7 @@ const express = require("express");
 const router = express.Router();
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
-const { sql, poolPromise } = require("../config/db");
+const { sql, poolPromise, getPool, listTenantKeys } = require("../config/db");
 const { protect, requirePage } = require("../middleware/authMiddleware");
 
 // Password every admin-reset account is set back to. Kept as one named
@@ -17,7 +17,16 @@ const SOURCE_TABLE = {
 };
 
 /* =========================================================
-   LOGIN (ALL USERS - FIXED)
+   LOGIN (ALL USERS - MULTI-TENANT)
+   ─────────────────────────────────────────────────────────
+   Tries every configured tenant database in turn — the "default"
+   DB first, then any extra tenants listed in DB_TENANTS (e.g.
+   "eregi") — checking Users, then Students, then Teachers in each,
+   until a matching username is found, instead of only ever looking
+   at one hard-coded database. See config/db.js for how tenants are
+   declared. Whichever DB the match came from is stamped into the
+   JWT as `tenant`, so later requests (server.js's DB middleware)
+   get routed back to that same database automatically.
 ========================================================= */
 router.post("/login", async (req, res) => {
   try {
@@ -32,23 +41,26 @@ router.post("/login", async (req, res) => {
     // ================= NORMALIZE INPUT =================
     username = username.trim();
 
-    const pool = await poolPromise;
-
     let user = null;
     let source = null;
+    let tenant = null;
 
-    /* ================= USERS ================= */
-    const userRes = await pool.request()
-      .input("username", sql.NVarChar, username)
-      .query("SELECT * FROM Users WHERE username = @username");
+    for (const tenantKey of listTenantKeys()) {
+      const pool = await getPool(tenantKey);
 
-    if (userRes.recordset.length > 0) {
-      user = userRes.recordset[0];
-      source = "Users";
-    }
+      /* ================= USERS ================= */
+      const userRes = await pool.request()
+        .input("username", sql.NVarChar, username)
+        .query("SELECT * FROM Users WHERE username = @username");
 
-    /* ================= STUDENTS ================= */
-    if (!user) {
+      if (userRes.recordset.length > 0) {
+        user = userRes.recordset[0];
+        source = "Users";
+        tenant = tenantKey;
+        break;
+      }
+
+      /* ================= STUDENTS ================= */
       const studentRes = await pool.request()
         .input("username", sql.NVarChar, username)
         .query("SELECT * FROM Students WHERE username = @username");
@@ -56,29 +68,31 @@ router.post("/login", async (req, res) => {
       if (studentRes.recordset.length > 0) {
         user = studentRes.recordset[0];
         source = "Students";
+        tenant = tenantKey;
+        break;
+      }
+
+      /* ================= TEACHERS ================= */
+      const teacherRes = await pool.request()
+        .input("staffId", sql.NVarChar, username)
+        .query("SELECT * FROM Teachers WHERE username = @staffId");
+
+      if (teacherRes.recordset.length > 0) {
+        user = teacherRes.recordset[0];
+        source = "Teachers";
+        tenant = tenantKey;
+        break;
       }
     }
 
-    /* ================= TEACHERS (FIXED + SAFE) ================= */
-   /* ================= TEACHERS ================= */
-if (!user) {
-  const teacherRes = await pool.request()
-    .input("staffId", sql.NVarChar, username)
-    .query("SELECT * FROM Teachers WHERE username = @staffId");
-    
-  if (teacherRes.recordset.length > 0) {
-    user = teacherRes.recordset[0];
-    source = "Teachers";
-  }
-}
-/* ================= NOT FOUND ================= */
+    /* ================= NOT FOUND (in any tenant) ================= */
     if (!user) {
       return res.status(401).json({
         message: "Invalid username or password"
       });
     }
 
-    console.log("Lookup result:", { username, found: !!user, source });
+    console.log("Lookup result:", { username, found: !!user, source, tenant });
 
     /* ================= PASSWORD CHECK ================= */
     if (!user.password) {
@@ -144,10 +158,11 @@ if (!user) {
         role,
         permissions,
         source,
+        tenant,
         mustChangePassword,
         profileIncomplete,
       },
-      process.env.JWT_SECRET || "asumbi_secret",
+      process.env.JWT_SECRET || "doravo_core_secret",
       { expiresIn: "1d" }
     );
 
@@ -161,6 +176,7 @@ if (!user) {
         role,
         permissions,
         source,
+        tenant,
         subject: user.subject || null,
         photoUrl: user.photoUrl || null,
         mustChangePassword,
@@ -206,7 +222,10 @@ router.put("/change-password", protect, async (req, res) => {
       });
     }
 
-    const pool = await poolPromise;
+    // req.pool is already resolved to this account's tenant DB by
+    // server.js's DB middleware (it reads the same `tenant` claim off
+    // this request's JWT), so no separate tenant lookup is needed here.
+    const pool = req.pool;
 
     const userRes = await pool.request()
       .input("id", sql.Int, req.user.id)
@@ -249,10 +268,11 @@ router.put("/change-password", protect, async (req, res) => {
         role: req.user.role,
         permissions: req.user.permissions,
         source: req.user.source,
+        tenant: req.user.tenant,
         mustChangePassword: false,
         profileIncomplete,
       },
-      process.env.JWT_SECRET || "asumbi_secret",
+      process.env.JWT_SECRET || "doravo_core_secret",
       { expiresIn: "1d" }
     );
 
@@ -266,6 +286,7 @@ router.put("/change-password", protect, async (req, res) => {
         role: req.user.role,
         permissions: req.user.permissions,
         source: req.user.source,
+        tenant: req.user.tenant,
         subject: account.subject || null,
         photoUrl: account.photoUrl || null,
         mustChangePassword: false,
@@ -298,7 +319,10 @@ router.put("/admin/reset-password", protect, requirePage("Password Reset"), asyn
       });
     }
 
-    const pool = await poolPromise;
+    // req.pool is already resolved to this account's tenant DB by
+    // server.js's DB middleware (it reads the same `tenant` claim off
+    // this request's JWT), so no separate tenant lookup is needed here.
+    const pool = req.pool;
 
     const check = await pool.request()
       .input("id", sql.Int, id)

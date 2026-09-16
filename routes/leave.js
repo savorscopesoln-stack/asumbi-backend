@@ -10,7 +10,7 @@ router.post("/", async (req, res) => {
       return res.status(400).json({ message: "studentId and reason are required" });
     }
 
-    const pool = await poolPromise;
+    const pool = req.pool; // tenant-resolved by server.js DB middleware
 
     await pool.request()
       .input("studentId", studentId)
@@ -33,7 +33,7 @@ router.put("/:id", async (req, res) => {
     const { status } = req.body;
     if (!status) return res.status(400).json({ message: "status is required" });
 
-    const pool = await poolPromise;
+    const pool = req.pool; // tenant-resolved by server.js DB middleware
 
     await pool.request()
       .input("id", req.params.id)

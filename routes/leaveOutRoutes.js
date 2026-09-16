@@ -164,7 +164,7 @@ module.exports = (poolPromise, sql) => {
   */
   router.post("/", authorize("student"), async (req, res) => {
     try {
-      const pool = await poolPromise;
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
 
       const { reason, request_date, duration, leave_type } = req.body;
       // The requester is always the authenticated student — never
@@ -282,7 +282,7 @@ module.exports = (poolPromise, sql) => {
      gets a ready-to-render name/admissionNo, not just a bare id. */
   router.get("/auto-approve-list", authorize("sub_admin_2", "admin"), async (req, res) => {
     try {
-      const pool = await poolPromise;
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
       const result = await pool.request().query(`
         SELECT l.student_id, l.added_by_name, l.added_at,
                s.name AS student_name, s.admissionNo, s.studentClass
@@ -299,7 +299,7 @@ module.exports = (poolPromise, sql) => {
 
   router.post("/auto-approve-list", authorize("sub_admin_2", "admin"), async (req, res) => {
     try {
-      const pool = await poolPromise;
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
       const studentId = Number(req.body.student_id);
       if (!studentId) {
         return res.status(400).json({ message: "student_id is required" });
@@ -331,7 +331,7 @@ module.exports = (poolPromise, sql) => {
 
   router.delete("/auto-approve-list/:studentId", authorize("sub_admin_2", "admin"), async (req, res) => {
     try {
-      const pool = await poolPromise;
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
       await pool.request()
         .input("id", sql.Int, req.params.studentId)
         .query(`DELETE FROM leave_auto_approve WHERE student_id = @id`);
@@ -345,7 +345,7 @@ module.exports = (poolPromise, sql) => {
   /* ================= STUDENT LEAVES ================= */
   router.get("/student", async (req, res) => {
     try {
-      const pool = await poolPromise;
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
 
       // A student may only ever read their own leave history — the
       // query param is honored only for staff roles.
@@ -388,7 +388,7 @@ module.exports = (poolPromise, sql) => {
   */
   router.get("/", authorize(...LEAVE_STAFF_ROLES), async (req, res) => {
     try {
-      const pool = await poolPromise;
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
 
       const role = req.user.role;
       let where = "";
@@ -431,7 +431,7 @@ module.exports = (poolPromise, sql) => {
   */
   router.put("/:id/verify-code", authorize("sub_admin", "admin"), async (req, res) => {
     try {
-      const pool = await poolPromise;
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
       const code = String(req.body.code || "").trim();
       if (!code) return res.status(400).json({ message: "Code is required" });
 
@@ -478,7 +478,7 @@ module.exports = (poolPromise, sql) => {
   */
   router.put("/:id/approve", authorize(...LEAVE_STAFF_ROLES), async (req, res) => {
     try {
-      const pool = await poolPromise;
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
       const role = req.user.role;
       const { approvedAt, duration } = req.body;
 
@@ -676,7 +676,7 @@ module.exports = (poolPromise, sql) => {
   */
   router.put("/:id/deny", authorize(...LEAVE_STAFF_ROLES), async (req, res) => {
     try {
-      const pool = await poolPromise;
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
       const role = req.user.role;
       const { reason } = req.body;
       const denyReason = reason || "No reason provided";
@@ -757,7 +757,7 @@ module.exports = (poolPromise, sql) => {
   */
   router.put("/:id/cancel", authorize("student"), async (req, res) => {
     try {
-      const pool = await poolPromise;
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
 
       const existing = await pool.request()
         .input("id", sql.Int, req.params.id)
@@ -803,7 +803,7 @@ module.exports = (poolPromise, sql) => {
   */
   router.post("/force-grant", authorize("admin"), async (req, res) => {
     try {
-      const pool = await poolPromise;
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
 
       const { student_id, leave_type, request_date, duration, end_date, reason } = req.body;
 
@@ -868,7 +868,7 @@ module.exports = (poolPromise, sql) => {
   /* ================= REVOKE ================= */
   router.put("/:id/revoke", authorize(...LEAVE_STAFF_ROLES), async (req, res) => {
     try {
-      const pool = await poolPromise;
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
 
       // Get student info first (for WhatsApp + in-app notification)
       const leave = await pool.request()
@@ -931,7 +931,7 @@ module.exports = (poolPromise, sql) => {
   /* ================= EXPIRE ================= */
   router.put("/:id/expire", authorize(...LEAVE_STAFF_ROLES), async (req, res) => {
     try {
-      const pool = await poolPromise;
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
 
       const existing = await pool.request()
         .input("id", sql.Int, req.params.id)
@@ -972,7 +972,7 @@ module.exports = (poolPromise, sql) => {
   */
   router.get("/approved", authorize(...LEAVE_STAFF_ROLES), async (req, res) => {
     try {
-      const pool = await poolPromise;
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
       const role = req.user.role;
 
       let where = "WHERE lo.status IN ('approved','admin_granted')";
@@ -1003,7 +1003,7 @@ module.exports = (poolPromise, sql) => {
      can't be reached by calling the API directly. */
   router.get("/analytics", authorize("admin", "sub_admin"), async (req, res) => {
     try {
-      const pool = await poolPromise;
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
 
       const role = req.user.role;
       const excludeLong = role === "sub_admin";

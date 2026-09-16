@@ -5,7 +5,7 @@ const { poolPromise } = require("../config/db");
 // GET /api/fees  — full fee list (used by the admin Fees page)
 router.get("/", async (req, res) => {
   try {
-    const pool = await poolPromise;
+    const pool = req.pool; // tenant-resolved by server.js DB middleware
     const fees = await pool.request().query(`
       SELECT f.*, s.name AS studentName, s.admissionNo
       FROM Fees f
@@ -21,7 +21,7 @@ router.get("/", async (req, res) => {
 
 router.get("/:studentId", async (req, res) => {
   try {
-    const pool = await poolPromise;
+    const pool = req.pool; // tenant-resolved by server.js DB middleware
 
     const fees = await pool.request()
       .input("studentId", req.params.studentId)

@@ -11,7 +11,7 @@ const getPool = async () => {
 /* ================= GET ACTIVE STUDENTS ================= */
 router.get("/students/active", async (req, res) => {
   try {
-    const pool = await getPool();
+    const pool = req.pool; // tenant-resolved by server.js DB middleware
 
     const result = await pool.request().query(`
       SELECT 
@@ -39,7 +39,7 @@ router.get("/students/search", async (req, res) => {
   const { q } = req.query;
 
   try {
-    const pool = await getPool();
+    const pool = req.pool; // tenant-resolved by server.js DB middleware
 
     if (!q) return res.json([]);
 
@@ -80,7 +80,7 @@ router.post("/assign", async (req, res) => {
   } = req.body;
 
   try {
-    const pool = await getPool();
+    const pool = req.pool; // tenant-resolved by server.js DB middleware
 
     const check = await pool
       .request()
@@ -146,7 +146,7 @@ router.post("/assign", async (req, res) => {
 /* ================= GET ALL MEAL CARDS ================= */
 router.get("/all", async (req, res) => {
   try {
-    const pool = await getPool();
+    const pool = req.pool; // tenant-resolved by server.js DB middleware
 
     const result = await pool.request().query(`
       SELECT 
@@ -185,7 +185,7 @@ router.put("/update/:id", async (req, res) => {
   } = req.body;
 
   try {
-    const pool = await getPool();
+    const pool = req.pool; // tenant-resolved by server.js DB middleware
 
     const mealsRemaining =
       Number(meals_per_day) * Number(number_of_days);
@@ -222,7 +222,7 @@ router.put("/update/:id", async (req, res) => {
 /* ================= SUSPEND ================= */
 router.put("/suspend/:id", async (req, res) => {
   try {
-    const pool = await getPool();
+    const pool = req.pool; // tenant-resolved by server.js DB middleware
 
     await pool
       .request()
@@ -243,7 +243,7 @@ router.put("/suspend/:id", async (req, res) => {
 /* ================= DISABLE ================= */
 router.put("/disable/:id", async (req, res) => {
   try {
-    const pool = await getPool();
+    const pool = req.pool; // tenant-resolved by server.js DB middleware
 
     await pool
       .request()
@@ -264,7 +264,7 @@ router.put("/disable/:id", async (req, res) => {
 /* ================= ACTIVATE ================= */
 router.put("/activate/:id", async (req, res) => {
   try {
-    const pool = await getPool();
+    const pool = req.pool; // tenant-resolved by server.js DB middleware
 
     await pool
       .request()
@@ -287,7 +287,7 @@ router.get("/my/:id", async (req, res) => {
   const studentId = req.params.id;
 
   try {
-    const pool = await getPool();
+    const pool = req.pool; // tenant-resolved by server.js DB middleware
 
     const result = await pool
       .request()
@@ -324,7 +324,7 @@ router.get("/my/:id", async (req, res) => {
 /* ================= DELETE ALL MEAL CARDS ================= */
 router.delete("/delete-all", async (req, res) => {
   try {
-    const pool = await getPool();
+    const pool = req.pool; // tenant-resolved by server.js DB middleware
 
     await pool.request().query(`
       DELETE FROM meal_cards
@@ -357,7 +357,7 @@ router.get("/my/:studentId/daily-codes", async (req, res) => {
   const SLOTS = ["breakfast", "lunch", "supper"];
 
   try {
-    const pool = await getPool();
+    const pool = req.pool; // tenant-resolved by server.js DB middleware
     const today = new Date().toISOString().slice(0, 10);
 
     const cardRes = await pool.request().input("sid", sql.Int, studentId).query(`

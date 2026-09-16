@@ -5,7 +5,7 @@ const { poolPromise } = require("../config/db");
 /* ================= CLASSES ================= */
 router.get("/classes", async (req, res) => {
   try {
-    const pool = await poolPromise;
+    const pool = req.pool; // tenant-resolved by server.js DB middleware
 
     const result = await pool.request().query(`
       SELECT DISTINCT studentClass AS class_name
@@ -23,7 +23,7 @@ router.get("/classes", async (req, res) => {
 /* ================= SUBJECTS / LEARNING AREAS ================= */
 router.get("/subjects", async (req, res) => {
   try {
-    const pool = await poolPromise;
+    const pool = req.pool; // tenant-resolved by server.js DB middleware
 
     const result = await pool.request().query(`
       SELECT id, name
@@ -41,7 +41,7 @@ router.get("/subjects", async (req, res) => {
 /* ================= TEACHERS ================= */
 router.get("/teachers", async (req, res) => {
   try {
-    const pool = await poolPromise;
+    const pool = req.pool; // tenant-resolved by server.js DB middleware
 
     const result = await pool.request().query(`
       SELECT id, name

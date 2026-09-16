@@ -10,23 +10,21 @@ const jwt = require("jsonwebtoken");
 
 const path = require("path");
 
-const { poolPromise, sql, getPoolForTenant, tenantKeys } = require("./config/db");
-const tenantContext = require("./config/tenantContext");
-const { tenantMiddleware } = require("./middleware/tenantMiddleware");
+const { poolPromise, sql, getPool, listTenantKeys } = require("./config/db");
 const { protect, authorize, adminOnly, requirePage } = require("./middleware/authMiddleware");
 const { ensureSchema } = require("./utils/ensureSchema");
 const { photoUrlFor, deletePhotoByUrl, runPhotoUpload } = require("./middleware/photoUpload");
 
 // Idempotent startup check — creates/upgrades the Notifications table
 // and adds leave_outs.leave_type if either is missing. Safe to run
-// on every boot. Runs once per configured DB tenant (just "default"
-// unless DB_TENANTS lists more), since each tenant is its own
-// database and needs its own schema check.
-for (const tenantKey of tenantKeys) {
-  getPoolForTenant(tenantKey)
-    .then((pool) => ensureSchema(pool, sql))
+// on every boot. Runs against EVERY configured tenant DB (default +
+// anything in DB_TENANTS), not just the default one, so a second
+// tenant database gets the same schema fixes.
+for (const tenantKey of listTenantKeys()) {
+  getPool(tenantKey)
+    .then((pool) => ensureSchema(pool, sql, tenantKey))
     .catch((err) =>
-      console.error(`Schema ensure skipped (tenant: ${tenantKey}):`, err.message)
+      console.error(`Schema ensure skipped (tenant "${tenantKey}"):`, err.message)
     );
 }
 
@@ -39,6 +37,7 @@ const practicumRoutes = require("./routes/practicum");
 const leaveOutRoutes = require("./routes/leaveOutRoutes")(poolPromise, sql);
 const portalPagesRoutes = require("./routes/portalPages")(poolPromise, sql);
 const websiteRoutes = require("./routes/website")(poolPromise, sql);
+const schoolSettingsRoutes = require("./routes/schoolSettings")(poolPromise, sql);
 const contactRoutes = require("./routes/contact")(poolPromise, sql);
 const mealRoutes = require("./routes/mealRoutes");
 const gateRoutes = require("./routes/gate");
@@ -83,6 +82,22 @@ const allowedOrigins = `${process.env.FRONTEND_URL || "http://localhost:5173"},$
   .map((o) => o.trim())
   .filter(Boolean);
 
+// Doravo's two production domains — doravocore.co.ke is the app itself
+// (this backend's real FRONTEND_URL: login, dashboards, and the "/"
+// landing page), doravo.co.ke is the shorter marketing-facing domain
+// (WEBSITE_URL). Hardcoded as a fallback the same way the Vercel
+// project URLs below already are, so a misconfigured/missing
+// FRONTEND_URL or WEBSITE_URL env var in a given deployment doesn't
+// silently break login or the contact form for either domain. Update
+// (or remove, once FRONTEND_URL/WEBSITE_URL are reliably set in every
+// deployment's env) if these domains ever change.
+const HARDCODED_PRODUCTION_ORIGINS = [
+  "https://www.doravocore.co.ke",
+  "https://doravocore.co.ke",
+  "https://www.doravo.co.ke",
+  "https://doravo.co.ke",
+];
+
 const corsOptions = {
   origin: (origin, callback) => {
     // allow non-browser tools (curl/Postman) which send no origin
@@ -91,13 +106,17 @@ const corsOptions = {
     // allow explicit origins from FRONTEND_URL / WEBSITE_URL
     if (allowedOrigins.includes(origin)) return callback(null, true);
 
+    // allow Doravo's own production domains regardless of env config —
+    // see HARDCODED_PRODUCTION_ORIGINS above
+    if (HARDCODED_PRODUCTION_ORIGINS.includes(origin)) return callback(null, true);
+
     // allow any Vercel preview/production deployment URL for this project
     // (covers both the admin portal AND the public website when both are
     // deployed under the same Vercel team/project naming pattern)
     if (/^https:\/\/asumbi(-[a-z0-9]+)?-savorscopesoln-stacks-projects\.vercel\.app$/.test(origin)) {
       return callback(null, true);
     }
-    if (origin === "https://www.doravo.co.ke" || origin === "https://www.doravocore.co.ke") return callback(null, true);
+    if (origin === "https://asumbi.vercel.app") return callback(null, true);
 
     callback(new Error("Not allowed by CORS: " + origin));
   },
@@ -126,14 +145,6 @@ app.options("*", cors(corsOptions));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Must come before the DB middleware below (and before every route,
-// all of which are mounted further down) — it decides which
-// database this request talks to. See config/tenants.js for how a
-// request gets mapped to a tenant, and config/db.js for how
-// `poolPromise` uses it. With no DB_TENANTS configured this is a
-// no-op and everything behaves exactly as a single-DB deployment.
-app.use(tenantMiddleware);
-
 const upload = multer({ storage: multer.memoryStorage() });
 
 /* ================= PROFILE PHOTOS (static) =================
@@ -149,10 +160,39 @@ if (process.env.NODE_ENV !== "production") {
   });
 }
 
-/* ================= DB MIDDLEWARE ================= */
+/* ================= DB MIDDLEWARE (multi-tenant) =================
+   Resolves which tenant DB this request belongs to from its JWT's
+   `tenant` claim (stamped in routes/auth.js's POST /login once it finds
+   which database the username actually lives in — see config/db.js
+   for how tenants are declared via DB_TENANTS) and attaches that
+   tenant's pool as req.pool / req.tenant.
+
+   Logged-out requests (login itself, register, public pages) and
+   tokens minted before multi-tenant support existed have no usable
+   tenant claim, so they fall back to the "default" DB — exactly the
+   old single-DB behavior. An invalid/expired token is deliberately
+   NOT rejected here; that's still `protect`'s job on the actual
+   route. This middleware only needs a best-effort tenant hint. */
 app.use(async (req, res, next) => {
+  let tenant = "default";
+
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    try {
+      const decoded = jwt.verify(
+        authHeader.split(" ")[1],
+        process.env.JWT_SECRET || "doravo_core_secret"
+      );
+      if (decoded && decoded.tenant) tenant = decoded.tenant;
+    } catch {
+      // Invalid/expired — leave tenant as "default" and let `protect`
+      // reject the request on the route itself.
+    }
+  }
+
   try {
-    req.pool = await poolPromise;
+    req.tenant = tenant;
+    req.pool = await getPool(tenant);
     next();
   } catch (err) {
     console.error("DB ERROR:", err.message);
@@ -170,7 +210,7 @@ const toInt = (val) => {
 app.get("/api/health", (req, res) => {
   res.status(200).json({
     status: "ok",
-    message: "Asumbi backend is running",
+    message: "Doravo Core backend is running",
     timestamp: new Date().toISOString()
   });
 });
@@ -194,6 +234,11 @@ app.use("/api/portal-pages", protect, portalPagesRoutes);
 // session). The admin-only read/write routes (GET/PUT /:section) apply
 // protect + requirePage("Website") internally in routes/website.js.
 app.use("/api/website", websiteRoutes);
+// Not wrapped in global `protect` either — GET /api/school-settings backs
+// the Login screen's brand/footer and every portal's report headers
+// before/regardless of role, so it's public read; writes are gated
+// requirePage("School Settings") internally in routes/schoolSettings.js.
+app.use("/api/school-settings", schoolSettingsRoutes);
 app.use("/api/contact", contactRoutes); // public POSTs (contact form + newsletter); GET/manage routes are protected internally
 app.use("/analytics", protect, analyticsRoute);
 app.use("/api/register", registerRoutes);
@@ -223,15 +268,7 @@ app.use("/", metaRoutes);
 
 // Sweeps ScheduledNotifications once a minute for anything due and sends
 // it out over its configured channels (in-app / email / SMS / WhatsApp).
-// Started once per configured DB tenant — each runs its own setInterval
-// inside that tenant's AsyncLocalStorage context (established here,
-// synchronously, before the timer is registered) so poolPromise inside
-// the scheduler resolves to the right tenant's database on every tick.
-for (const tenantKey of tenantKeys) {
-  tenantContext.run(tenantKey, () => {
-    startNotificationScheduler(poolPromise, io, dispatchBroadcast);
-  });
-}
+startNotificationScheduler(getPool, listTenantKeys, io, dispatchBroadcast);
 
 /* =========================================================
    CLASSES
@@ -868,7 +905,7 @@ app.put("/api/student/profile", protect, authorize("student"), async (req, res) 
         mustChangePassword: false,
         profileIncomplete: false,
       },
-      process.env.JWT_SECRET || "asumbi_secret",
+      process.env.JWT_SECRET || "doravo_core_secret",
       { expiresIn: "1d" }
     );
 

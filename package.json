@@ -1,7 +1,7 @@
 {
-  "name": "backend",
+  "name": "doravo-core-backend",
   "version": "1.6.7",
-  "description": "Asumbi Smart Campus Backend",
+  "description": "Doravo Core Backend",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

@@ -7,8 +7,25 @@
 
 const { ensureElectionSchema } = require("./electionSchema");
 
-async function ensureSchema(pool, sql) {
+// `tenantKey` (added for Doravo Core multi-tenancy — see server.js's
+// per-tenant boot loop) defaults to "default" so every pre-multi-tenant
+// call site that doesn't pass it keeps behaving exactly as before.
+// It exists ONLY to gate the Asumbi-specific SEED DATA below (real
+// school name/address/website copy) — every CREATE TABLE / ALTER
+// TABLE / structural migration above still runs unconditionally for
+// every tenant, same as always. Seeding Asumbi's actual identity into
+// a brand-new tenant's database was the bug: those blocks used to run
+// against every tenant with no tenant-awareness at all, so a fresh
+// tenant DB's very first boot (tables empty, IF NOT EXISTS seeds all
+// firing) got real Asumbi rows written into its own SchoolSettings /
+// website_content / SchoolOfficials tables instead of staying empty
+// for that school's own admin to fill in.
+async function ensureSchema(pool, sql, tenantKey = "default") {
   try {
+    // Gates every Asumbi-specific SEED (not structural/CREATE TABLE)
+    // statement below — see the note on the function signature above.
+    const isDefaultTenant = tenantKey === "default";
+
     // Student Council Voting System — its own file since it owns a
     // self-contained set of tables; kept as a separate module so it's
     // easy to find/maintain without wading through the rest of this file.
@@ -908,15 +925,26 @@ async function ensureSchema(pool, sql) {
       theme: { presetKey: "default" },
     };
 
-    for (const [sectionKey, defaultContent] of Object.entries(websiteDefaults)) {
-      await pool.request()
-        .input("sectionKey", sql.NVarChar, sectionKey)
-        .input("contentJson", sql.NVarChar(sql.MAX), JSON.stringify(defaultContent))
-        .query(`
-          IF NOT EXISTS (SELECT 1 FROM website_content WHERE section_key = @sectionKey)
-          INSERT INTO website_content (section_key, content_json, updated_by_name, updated_at)
-          VALUES (@sectionKey, @contentJson, 'System (default)', GETDATE())
-        `);
+    // Same tenant gate as SchoolSettings above: this entire block is
+    // Asumbi's actual public-website copy (hero text, testimonials,
+    // contact details, etc.), so it's only meaningful — and only
+    // seeded — for the "default" tenant. A new tenant gets no
+    // website_content rows at all rather than inheriting Asumbi's
+    // marketing copy; the website_content additive-migration step
+    // further below safely no-ops on a tenant with no rows yet
+    // (it only patches existing rows, never creates new ones), so
+    // nothing else needs to change to keep this scoped correctly.
+    if (isDefaultTenant) {
+      for (const [sectionKey, defaultContent] of Object.entries(websiteDefaults)) {
+        await pool.request()
+          .input("sectionKey", sql.NVarChar, sectionKey)
+          .input("contentJson", sql.NVarChar(sql.MAX), JSON.stringify(defaultContent))
+          .query(`
+            IF NOT EXISTS (SELECT 1 FROM website_content WHERE section_key = @sectionKey)
+            INSERT INTO website_content (section_key, content_json, updated_by_name, updated_at)
+            VALUES (@sectionKey, @contentJson, 'System (default)', GETDATE())
+          `);
+      }
     }
 
     /* ---------------- website_content additive migration ----------------
@@ -1168,7 +1196,87 @@ async function ensureSchema(pool, sql) {
       ALTER TABLE e_assessment_submissions ADD sync_batch_id NVARCHAR(64) NULL
     `);
 
-    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, PortalPageSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, leave_outs code-verification columns, meal_daily_codes, leave_auto_approve, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl, Students.profileCompleted, student_profile_change_requests, website_content, contact_messages, newsletter_subscribers, e_assessments.cover_page_url, e_assessments.cover_page_width/height, e_assessment_question_images, e_assessment_sync_devices, e_assessment_sync_device_assessments, e_assessment_sync_logs, e_assessment_submissions.sync_batch_id)");
+    /* ---------------- SchoolSettings table ----------------
+       Doravo Core is a white-label platform: the software itself is
+       no longer tied to any one school's name/branding, so every
+       school-specific fact that used to be hand-typed into report
+       cards, result slips, and certificates (school name, address,
+       phone/email, KNEC/exam-body centre code, number of classes)
+       now lives here instead — one row, id=1. Every download/report
+       reads it via GET /api/school-settings (public) rather than a
+       literal string baked into the JSX. Seeded once, on first
+       creation, with this deployment's actual current details so
+       nothing changes on existing downloads until an admin edits
+       something from the new School Settings page. */
+    // Only the "default" tenant (the original single-tenant Asumbi
+    // deployment) gets seeded with Asumbi's real identity — any other
+    // tenant gets this row seeded blank (NOT NULL columns get '',
+    // nullable ones get NULL) so a brand-new school's database doesn't
+    // silently inherit Asumbi's name/address/phone. Their own admin
+    // fills this in once from the School Settings page; the UI already
+    // treats a blank schoolName as "not configured yet" rather than
+    // erroring, so this is a safe default.
+    await pool.request()
+      .input("seedSchoolName", sql.NVarChar, isDefaultTenant ? "Asumbi Teachers Training College" : "")
+      .input("seedShortName", sql.NVarChar, isDefaultTenant ? "ASUMBI TTC" : "")
+      .input("seedCentreCode", sql.NVarChar, isDefaultTenant ? "ASB-214" : null)
+      .input("seedAddress", sql.NVarChar, isDefaultTenant ? "P.O. Box 22 – 40305, Asumbi" : null)
+      .input("seedPhone", sql.NVarChar, isDefaultTenant ? "059-22001" : null)
+      .input("seedEmail", sql.NVarChar, isDefaultTenant ? "knec@asumbi.ac.ke" : null)
+      .query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='SchoolSettings' AND xtype='U')
+      BEGIN
+        CREATE TABLE SchoolSettings (
+          id INT PRIMARY KEY,
+          schoolName NVARCHAR(200) NOT NULL DEFAULT '',
+          shortName NVARCHAR(50) NOT NULL DEFAULT '',
+          motto NVARCHAR(300) NULL,
+          centreCode NVARCHAR(50) NULL,
+          address NVARCHAR(300) NULL,
+          phone NVARCHAR(100) NULL,
+          email NVARCHAR(150) NULL,
+          website NVARCHAR(200) NULL,
+          numberOfClasses INT NULL,
+          logoUrl NVARCHAR(500) NULL,
+          updatedAt DATETIME NOT NULL DEFAULT GETDATE(),
+          updatedBy INT NULL
+        )
+
+        INSERT INTO SchoolSettings
+          (id, schoolName, shortName, centreCode, address, phone, email, numberOfClasses)
+        VALUES
+          (1, @seedSchoolName, @seedShortName, @seedCentreCode,
+           @seedAddress, @seedPhone, @seedEmail, NULL)
+      END
+    `);
+
+    /* ---------------- SchoolOfficials table ----------------
+       Replaces the hand-typed "Dean of Curriculum" / "Chief Principal"
+       names/titles that used to be scattered across result slips and
+       exam reports. Any number of officials, shown in sortOrder;
+       isSignatory marks the one whose name appears on the main
+       signature line of a certificate/result slip (defaults to the
+       first one seeded below). Managed from the School Settings page. */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='SchoolOfficials' AND xtype='U')
+      BEGIN
+        CREATE TABLE SchoolOfficials (
+          id INT IDENTITY(1,1) PRIMARY KEY,
+          title NVARCHAR(150) NOT NULL,
+          name NVARCHAR(150) NULL,
+          sortOrder INT NOT NULL DEFAULT 0,
+          isSignatory BIT NOT NULL DEFAULT 0,
+          createdAt DATETIME NOT NULL DEFAULT GETDATE(),
+          updatedAt DATETIME NOT NULL DEFAULT GETDATE()
+        )
+
+        INSERT INTO SchoolOfficials (title, name, sortOrder, isSignatory) VALUES
+          ('Dean of Curriculum', NULL, 1, 0),
+          ('Chief Principal', NULL, 2, 1)
+      END
+    `);
+
+    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, PortalPageSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, leave_outs code-verification columns, meal_daily_codes, leave_auto_approve, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl, Students.profileCompleted, student_profile_change_requests, website_content, contact_messages, newsletter_subscribers, e_assessments.cover_page_url, e_assessments.cover_page_width/height, e_assessment_question_images, e_assessment_sync_devices, e_assessment_sync_device_assessments, e_assessment_sync_logs, e_assessment_submissions.sync_batch_id, SchoolSettings, SchoolOfficials)");
   } catch (err) {
     console.error("⚠️  Schema ensure failed:", err.message);
   }

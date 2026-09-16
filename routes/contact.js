@@ -37,7 +37,7 @@ module.exports = (poolPromise, sql) => {
         return res.status(400).json({ message: "Message is required" });
       }
 
-      const pool = await poolPromise;
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
       await pool
         .request()
         .input("name", sql.NVarChar, String(name).trim().slice(0, 200))
@@ -66,7 +66,7 @@ module.exports = (poolPromise, sql) => {
         return res.status(400).json({ message: "A valid email address is required" });
       }
 
-      const pool = await poolPromise;
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
       await pool
         .request()
         .input("email", sql.NVarChar, String(email).trim().toLowerCase().slice(0, 200))
@@ -85,7 +85,7 @@ module.exports = (poolPromise, sql) => {
   /* ================= LIST SUBMISSIONS (admin) ================= */
   router.get("/", protect, adminOnly, async (req, res) => {
     try {
-      const pool = await poolPromise;
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
       const result = await pool.request().query(`SELECT * FROM contact_messages ORDER BY createdAt DESC`);
       res.json(result.recordset);
     } catch (err) {
@@ -97,7 +97,7 @@ module.exports = (poolPromise, sql) => {
   /* ================= MARK READ (admin) ================= */
   router.put("/:id/read", protect, adminOnly, async (req, res) => {
     try {
-      const pool = await poolPromise;
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
       await pool.request().input("id", sql.Int, req.params.id).query(`UPDATE contact_messages SET isRead = 1 WHERE id = @id`);
       res.json({ message: "OK" });
     } catch (err) {
@@ -109,7 +109,7 @@ module.exports = (poolPromise, sql) => {
   /* ================= DELETE (admin) ================= */
   router.delete("/:id", protect, adminOnly, async (req, res) => {
     try {
-      const pool = await poolPromise;
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
       await pool.request().input("id", sql.Int, req.params.id).query(`DELETE FROM contact_messages WHERE id = @id`);
       res.json({ message: "Deleted" });
     } catch (err) {
@@ -121,7 +121,7 @@ module.exports = (poolPromise, sql) => {
   /* ================= LIST NEWSLETTER SUBSCRIBERS (admin) ================= */
   router.get("/newsletter", protect, adminOnly, async (req, res) => {
     try {
-      const pool = await poolPromise;
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
       const result = await pool.request().query(`SELECT * FROM newsletter_subscribers ORDER BY createdAt DESC`);
       res.json(result.recordset);
     } catch (err) {
