@@ -210,14 +210,39 @@ function drawPdfHeader(doc, institution, { examinationName, academicYear, report
 
 /* Simple auto-paginating table: repeats the header row on every new
    page, zebra-stripes data rows, and never lets a row's text overflow
-   past its column (§32 "do not create unreadable giant tables"). */
+   past its column (§32 "do not create unreadable giant tables").
+
+   Column widths are measured from the actual content instead of split
+   evenly, so a column like "Name" naturally ends up wider than a short
+   one like "Position" — sized to whichever is longer, the header text
+   or the widest value in that column, then every column is scaled by
+   the same factor so the table still spans the full page edge-to-edge
+   (shrinking proportionally if the content is wider than one page,
+   growing proportionally to fill leftover space if it's narrower). */
 function drawPdfTable(doc, { columns, rows }) {
   const pageLeft = doc.page.margins.left;
   const pageRight = doc.page.width - doc.page.margins.right;
   const usableWidth = pageRight - pageLeft;
-  const totalWeight = columns.reduce((s, c) => s + (c.weight || 1), 0);
-  const colWidths = columns.map((c) => (usableWidth * (c.weight || 1)) / totalWeight);
   const rowHeight = 16;
+  const CELL_PADDING = 8;   // ~3px each side plus a little breathing room
+  const MIN_COL_WIDTH = 34; // never let a column collapse to unreadable
+
+  doc.fontSize(7.5);
+  const natural = columns.map((c) => {
+    doc.font("Helvetica-Bold");
+    let max = doc.widthOfString(String(c.header ?? ""));
+    doc.font("Helvetica");
+    rows.forEach((row) => {
+      const val = row[c.key];
+      const text = val == null || val === "" ? "-" : String(val);
+      const w = doc.widthOfString(text);
+      if (w > max) max = w;
+    });
+    return Math.max(MIN_COL_WIDTH, max + CELL_PADDING);
+  });
+  const naturalTotal = natural.reduce((s, w) => s + w, 0);
+  const scale = naturalTotal > 0 ? usableWidth / naturalTotal : 1;
+  const colWidths = natural.map((w) => w * scale);
 
   let y = doc.y;
 
