@@ -51,6 +51,8 @@ const gateRoutes = require("./routes/gate");
 const kitchenRoutes = require("./routes/kitchen");
 const attendanceRoutes = require("./routes/attendance");
 const eAssessmentRoutes = require("./routes/eAssessments");
+const mainExamsRoutes = require("./routes/mainExams");
+const mainExamsStudentRoutes = require("./routes/mainExamsStudent");
 const localSyncRoutes = require("./routes/localSync");
 const metaRoutes = require("./routes/meta.routes");
 const feesRoutes = require("./routes/fees");
@@ -63,6 +65,7 @@ const notificationSettingsRoutes = require("./routes/notificationSettings");
 const studentCouncilRoutes = require("./routes/studentCouncil");
 const { dispatchBroadcast } = require("./controllers/broadcastNotification.controller");
 const { startNotificationScheduler } = require("./utils/notificationScheduler");
+const { startExamScheduler } = require("./utils/examScheduler");
 
 /* =========================================================
    APP INIT
@@ -129,6 +132,14 @@ const corsOptions = {
   },
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
+  // Main Examination Excel/PDF exports (Phase 12-13) set Content-Disposition
+  // for the download filename; without exposing it cross-origin, the browser
+  // can still download the file's bytes but the frontend can't read the
+  // server-chosen filename from the response (a cross-origin default, not a
+  // bug in the export code itself) — so the report file downloads would
+  // silently fall back to a generic name in production. Exposed here rather
+  // than only working in dev (where the Vite proxy makes it same-origin).
+  exposedHeaders: ["Content-Disposition"],
   credentials: true,
 };
 
@@ -254,6 +265,12 @@ app.use("/api/gate", protect, gateRoutes);
 app.use("/api/kitchen", protect, kitchenRoutes);
 app.use("/api/attendance", protect, attendanceRoutes);
 app.use("/api/e-assessments", eAssessmentRoutes); // already protects internally
+app.use("/api/main-exams", mainExamsRoutes); // already protects internally (protect + requirePage("E-Assessments"))
+// Deliberately a distinct base path, not "/api/main-exams/student" — the
+// admin router above has a catch-all "/:id" route that would otherwise
+// swallow "/student" as if it were a numeric main-exam id before ever
+// reaching this router.
+app.use("/api/student/main-exams", mainExamsStudentRoutes); // already protects internally (protect + authorize("student"))
 app.use("/api/local-sync", localSyncRoutes); // mounted separately so it can't collide with e-assessments' /:id catch-all; protects internally (JWT for admin routes, X-Sync-Token for device routes)
 app.use("/api/fees", protect, feesRoutes);
 app.use("/api/leave", protect, leaveRoutes);
@@ -276,6 +293,12 @@ app.use("/", metaRoutes);
 // Sweeps ScheduledNotifications once a minute for anything due and sends
 // it out over its configured channels (in-app / email / SMS / WhatsApp).
 startNotificationScheduler(getPool, listTenantKeys, io, dispatchBroadcast);
+
+// Sweeps exam_subject_sessions once a minute, auto-activating/ending Main
+// Examination subjects on schedule (§7-§9) — same polling pattern as the
+// notification scheduler above, just a second independent tick function
+// rather than a second scheduling mechanism.
+startExamScheduler(getPool, listTenantKeys, io);
 
 /* =========================================================
    CLASSES

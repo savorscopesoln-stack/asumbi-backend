@@ -1827,6 +1827,27 @@ const toggleEAssessmentActive = async (req, res) => {
       .query(`SELECT active_status, class_id, year_of_study, title FROM e_assessments WHERE id = @id`);
     if (!current.recordset.length) return res.status(404).json({ message: "Assessment not found" });
 
+    // Phase 6 — Main Examination integration guard: once an assessment is
+    // attached to a Main Examination subject session (mainExams routes'
+    // attachAssessment), its active_status is owned by the exam scheduler
+    // (utils/examScheduler.js), which flips it automatically on the
+    // published schedule. Letting the old manual Start/Stop button here
+    // fight that would let an admin either open an exam before its
+    // scheduled time or close one the scheduler just opened. A subject
+    // session that's still 'draft' (never published) hasn't handed control
+    // over yet, so manual toggling is still fine at that stage.
+    const linkedSession = await pool.request().input("id", sql.Int, id)
+      .query(`
+        SELECT TOP 1 main_examination_id, status FROM exam_subject_sessions
+        WHERE e_assessment_id = @id AND status <> 'draft'
+      `);
+    if (linkedSession.recordset.length) {
+      return res.status(409).json({
+        message: "This assessment is scheduled as a Main Examination subject. Manage its Start/Stop from the Main Examination's timetable instead.",
+        main_examination_id: linkedSession.recordset[0].main_examination_id,
+      });
+    }
+
     const { class_id, year_of_study, title } = current.recordset[0];
     const next = current.recordset[0].active_status === "Active" ? "Inactive" : "Active";
     await pool.request().input("id", sql.Int, id).input("active_status", sql.NVarChar(20), next)

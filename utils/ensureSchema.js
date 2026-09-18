@@ -1305,7 +1305,102 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       END
     `);
 
-    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, PortalPageSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, leave_outs code-verification columns, meal_daily_codes, leave_auto_approve, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl, Students.profileCompleted, student_profile_change_requests, website_content, contact_messages, newsletter_subscribers, e_assessments.cover_page_url, e_assessments.cover_page_width/height, e_assessment_question_images, e_assessment_sync_devices, e_assessment_sync_devices.tenant_key, e_assessment_sync_device_assessments, e_assessment_sync_logs, e_assessment_submissions.sync_batch_id, SchoolSettings, SchoolOfficials)");
+    /* =========================================================
+       MAIN EXAMINATIONS — parent "2026 Second Year Final
+       Examination"-style container that groups several existing
+       e_assessments into one scheduled, timetabled event. See
+       controllers/mainExam.controller.js. Deliberately NOT a
+       replacement for e_assessments — a main_examinations row never
+       holds questions/submissions itself; it only groups and
+       schedules existing e_assessments rows via
+       exam_subject_sessions below (§35/§36 of the spec: "a subject
+       examination should REFERENCE an existing assessment rather
+       than duplicate its questions").
+    ========================================================= */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='main_examinations' AND xtype='U')
+      CREATE TABLE main_examinations (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        name NVARCHAR(200) NOT NULL,
+        academic_year NVARCHAR(20) NULL,
+        cohort_year INT NULL,           -- year of study (1/2/3...), same convention as e_assessments.year_of_study
+        programme NVARCHAR(150) NULL,
+        department NVARCHAR(150) NULL,
+        term NVARCHAR(100) NULL,
+        description NVARCHAR(MAX) NULL,
+        start_date DATE NULL,
+        end_date DATE NULL,
+        -- lifecycle status for the whole examination event (draft while
+        -- subjects are still being scheduled, published once the
+        -- timetable is finalized, archived instead of hard-deleted once
+        -- it has subjects/candidates attached — see §41 "safe archival").
+        status NVARCHAR(30) NOT NULL DEFAULT 'draft',
+        created_by INT NULL,
+        createdAt DATETIME NOT NULL DEFAULT GETDATE(),
+        updatedAt DATETIME NOT NULL DEFAULT GETDATE()
+      )
+    `);
+
+    /* ---------------- exam_subject_sessions ----------------
+       One row per subject/learning-area sitting inside a Main
+       Examination (§4). Holds ONLY the scheduling/venue metadata —
+       the actual questions, submissions and marking stay entirely
+       inside the referenced e_assessments row (e_assessment_id),
+       exactly like every existing CAT/Assignment. start_time/end_time
+       are full DATETIME (not just TIME) so the automatic-activation
+       scheduler (§7/§37/§38 — next phase) can compare directly
+       against GETDATE() with no separate date+time join logic.
+       e_assessment_id is nullable because §3 explicitly allows the
+       admin to schedule a subject slot before an assessment has been
+       attached to it yet. */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='exam_subject_sessions' AND xtype='U')
+      CREATE TABLE exam_subject_sessions (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        main_examination_id INT NOT NULL,
+        e_assessment_id INT NULL,
+        subject NVARCHAR(150) NOT NULL,
+        class_id INT NULL,
+        exam_date DATE NULL,
+        start_time DATETIME NULL,
+        end_time DATETIME NULL,
+        duration_minutes INT NULL,
+        venue NVARCHAR(150) NULL,
+        max_marks INT NULL,
+        instructions NVARCHAR(MAX) NULL,
+        -- DRAFT / SCHEDULED / WAITING / ACTIVE / ENDED / MARKING / COMPLETED (§7).
+        -- Stored for audit/display, but the backend scheduler (next phase)
+        -- is the source of truth, not this column alone (§37).
+        status NVARCHAR(30) NOT NULL DEFAULT 'draft',
+        activated_at DATETIME NULL,
+        ended_at DATETIME NULL,
+        createdAt DATETIME NOT NULL DEFAULT GETDATE(),
+        updatedAt DATETIME NOT NULL DEFAULT GETDATE(),
+        CONSTRAINT FK_exam_subject_sessions_main_exam FOREIGN KEY (main_examination_id)
+          REFERENCES main_examinations(id)
+      )
+    `);
+
+    /* ---------------- exam_audit_log ----------------
+       Factual event trail for Main Examination actions (§53) —
+       created/scheduled/activated/ended/results-published/etc.
+       details is a small JSON string (not parsed here) so new event
+       types never need a schema change. */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='exam_audit_log' AND xtype='U')
+      CREATE TABLE exam_audit_log (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        main_examination_id INT NULL,
+        exam_subject_session_id INT NULL,
+        action NVARCHAR(100) NOT NULL,
+        actor_id INT NULL,
+        actor_role NVARCHAR(30) NULL,
+        details NVARCHAR(MAX) NULL,
+        createdAt DATETIME NOT NULL DEFAULT GETDATE()
+      )
+    `);
+
+    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, PortalPageSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, leave_outs code-verification columns, meal_daily_codes, leave_auto_approve, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl, Students.profileCompleted, student_profile_change_requests, website_content, contact_messages, newsletter_subscribers, e_assessments.cover_page_url, e_assessments.cover_page_width/height, e_assessment_question_images, e_assessment_sync_devices, e_assessment_sync_devices.tenant_key, e_assessment_sync_device_assessments, e_assessment_sync_logs, e_assessment_submissions.sync_batch_id, SchoolSettings, SchoolOfficials, main_examinations, exam_subject_sessions, exam_audit_log)");
   } catch (err) {
     console.error("⚠️  Schema ensure failed:", err.message);
   }
