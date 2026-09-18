@@ -3,6 +3,7 @@ const {
   getMainExamAnalytics,
   getSubjectAnalytics,
   getStudentExaminationProfile,
+  loadNominalRoll,
 } = require("./mainExamAnalytics.controller");
 
 /* =========================================================================
@@ -71,6 +72,11 @@ const getSummaryReport = async (req, res) => {
     const { statusCode, data } = await runHandler(getMainExamAnalytics, { pool, params: { id: mainExamId } });
     if (statusCode !== 200) return res.status(statusCode).json(data);
 
+    // Nominal Roll — every registered candidate + the subjects they're
+    // entered for. Own query (not part of computeMainExaminationSummary,
+    // see loadNominalRoll's comment) since it's specific to this report.
+    const nominalRoll = await loadNominalRoll(pool, mainExamId);
+
     res.json({
       success: true,
       report: "main_examination_summary",
@@ -81,6 +87,7 @@ const getSummaryReport = async (req, res) => {
       grade_distribution: data.grade_distribution,
       grade_distribution_note: data.grade_distribution_note,
       subjects: data.subjects,
+      nominal_roll: nominalRoll,
     });
   } catch (err) {
     console.error("GET SUMMARY REPORT ERROR:", err);

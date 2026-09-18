@@ -255,6 +255,137 @@ async function computeMainExaminationSummary(pool, id) {
 }
 
 /* =========================================================================
+   Nominal Roll — the official candidate list for a Main Examination
+   (§30.1's "Summary" report), in the school's usual class-list layout:
+   one row per candidate (ranked by Class Position), one column per
+   subject scheduled in this Main Examination (by name, not a code —
+   this schema has no subject-code table), with that candidate's mark
+   underneath the subject they sat, and "—" under any subject they
+   weren't entered for. Uses the exact same class/year "registered
+   candidate" / subject-audience matching rule as
+   computeMainExaminationSummary's own `registered` count above (§51 —
+   so the roll's candidate count always equals the Summary's
+   "Registered" figure). Kept out of computeMainExaminationSummary
+   itself (and so out of the Analytics tab's payload) because §58 asks
+   analytics endpoints to stay small, bounded aggregations — a full
+   candidate-by-subject matrix only belongs on the Summary report,
+   which already fetches it once.
+========================================================================= */
+
+// Standard competition ranking (1, 2, 2, 4, ...) within each class, by
+// average_percentage descending. Candidates with no scored subject yet
+// get a null position (rendered as "—") rather than a fabricated rank.
+function assignClassPositions(rows) {
+  const byClass = new Map();
+  rows.forEach((r) => {
+    const key = r.class || `__year_${r.year_of_study || "unknown"}`;
+    if (!byClass.has(key)) byClass.set(key, []);
+    byClass.get(key).push(r);
+  });
+  byClass.forEach((group) => {
+    group.sort((a, b) => {
+      if (a.average_percentage == null && b.average_percentage == null) return 0;
+      if (a.average_percentage == null) return 1;
+      if (b.average_percentage == null) return -1;
+      return b.average_percentage - a.average_percentage;
+    });
+    let rank = 0, seen = 0, lastScore = null;
+    group.forEach((r) => {
+      seen += 1;
+      if (r.average_percentage == null) { r.class_position = null; return; }
+      if (lastScore === null || r.average_percentage !== lastScore) {
+        rank = seen;
+        lastScore = r.average_percentage;
+      }
+      r.class_position = rank;
+    });
+  });
+}
+
+async function loadNominalRoll(pool, mainExaminationId) {
+  const allSubjects = await loadSubjectsWithAssessment(pool, mainExaminationId);
+  const subjects = allSubjects.filter((s) => s.e_assessment_id);
+  if (!subjects.length) return { subjects: [], rows: [] };
+
+  const eAssessmentIds = [...new Set(subjects.map((s) => s.e_assessment_id))];
+
+  // Every registered candidate — same EXISTS matching rule as
+  // computeMainExaminationSummary's `registered` count (§51).
+  const candidatesResult = await pool.request().input("mainExaminationId", sql.Int, mainExaminationId).query(`
+    SELECT DISTINCT st.id AS student_id, st.name, st.admissionNo, st.gender, st.studentClass, st.yearOfStudy
+    FROM Students st
+    WHERE EXISTS (
+      SELECT 1 FROM exam_subject_sessions ess
+      JOIN e_assessments ea ON ea.id = ess.e_assessment_id
+      LEFT JOIN Classes c ON c.id = ea.class_id
+      WHERE ess.main_examination_id = @mainExaminationId
+        AND ( (c.name IS NOT NULL AND c.name = st.studentClass) OR ea.year_of_study = st.yearOfStudy )
+    )
+  `);
+  const candidates = candidatesResult.recordset;
+  if (!candidates.length) return { subjects: subjects.map((s) => ({ session_id: s.session_id, subject: s.subject, total_marks: s.total_marks })), rows: [] };
+
+  const idParams = eAssessmentIds.map((_, i) => `@eid${i}`).join(",");
+  const subReq = pool.request();
+  eAssessmentIds.forEach((eid, i) => subReq.input(`eid${i}`, sql.Int, eid));
+  const submissionsResult = await subReq.query(`
+    SELECT student_id, e_assessment_id, score
+    FROM e_assessment_submissions
+    WHERE e_assessment_id IN (${idParams})
+  `);
+  const scoreMap = new Map(); // `${student_id}:${e_assessment_id}` -> score
+  submissionsResult.recordset.forEach((r) => scoreMap.set(`${r.student_id}:${r.e_assessment_id}`, r.score));
+
+  const rows = candidates.map((st) => {
+    let totalObtained = 0, totalPossible = 0, anyScored = false;
+    const marks = subjects.map((subj) => {
+      const registered = (subj.class_name && subj.class_name === st.studentClass) || subj.year_of_study === st.yearOfStudy;
+      if (!registered) return { session_id: subj.session_id, not_registered: true, score: null, total_marks: subj.total_marks, percentage: null };
+      const score = scoreMap.has(`${st.student_id}:${subj.e_assessment_id}`) ? scoreMap.get(`${st.student_id}:${subj.e_assessment_id}`) : null;
+      if (score != null) {
+        totalObtained += score;
+        totalPossible += subj.total_marks || 0;
+        anyScored = true;
+      }
+      return {
+        session_id: subj.session_id,
+        not_registered: false,
+        score,
+        total_marks: subj.total_marks,
+        percentage: score != null && subj.total_marks > 0 ? round1((score / subj.total_marks) * 100) : null,
+      };
+    });
+    return {
+      student_id: st.student_id,
+      name: st.name,
+      admission_no: st.admissionNo,
+      gender: st.gender,
+      class: st.studentClass,
+      year_of_study: st.yearOfStudy,
+      marks,
+      total_obtained: anyScored ? totalObtained : null,
+      total_possible: anyScored ? totalPossible : null,
+      average_percentage: anyScored && totalPossible > 0 ? round1((totalObtained / totalPossible) * 100) : null,
+    };
+  });
+
+  assignClassPositions(rows);
+  rows.sort((a, b) => {
+    const classCmp = String(a.class || "").localeCompare(String(b.class || ""));
+    if (classCmp !== 0) return classCmp;
+    if (a.class_position == null && b.class_position == null) return String(a.name || "").localeCompare(String(b.name || ""));
+    if (a.class_position == null) return 1;
+    if (b.class_position == null) return -1;
+    return a.class_position - b.class_position;
+  });
+
+  return {
+    subjects: subjects.map((s) => ({ session_id: s.session_id, subject: s.subject, total_marks: s.total_marks })),
+    rows,
+  };
+}
+
+/* =========================================================================
    1. MAIN EXAMINATION ANALYTICS  (§16-§18)
    GET /main-exams/:id/analytics
 ========================================================================= */
@@ -723,4 +854,5 @@ module.exports = {
   // "Grade Distribution" reports can never disagree (§51).
   computeMainExaminationSummary,
   loadSubjectsWithAssessment,
+  loadNominalRoll,
 };

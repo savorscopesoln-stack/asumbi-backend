@@ -92,6 +92,28 @@ const SHAPES = {
     const gradeRows = data.grade_distribution || [];
     const gradeNote = !data.grade_distribution ? (data.grade_distribution_note || "Unavailable") : null;
 
+    const nr = data.nominal_roll || { subjects: [], rows: [] };
+    const nominalSubjects = nr.subjects || [];
+    const nominalCols = [
+      { header: "Position", key: "class_position", width: 10 },
+      { header: "Assessment No", key: "admission_no", width: 16 },
+      { header: "Gender", key: "gender", width: 8 },
+      { header: "Name", key: "name", width: 26 },
+      ...nominalSubjects.map((s, i) => ({ header: s.subject, key: `subj_${i}`, width: 12 })),
+      { header: "Average %", key: "average_percentage", width: 10, percent: true },
+    ];
+    const nominalRows = (nr.rows || []).map((r) => {
+      const row = {
+        class_position: r.class_position ?? "—",
+        admission_no: r.admission_no,
+        gender: r.gender || "—",
+        name: r.name,
+        average_percentage: r.average_percentage,
+      };
+      (r.marks || []).forEach((m, i) => { row[`subj_${i}`] = m.not_registered || m.score == null ? "—" : m.score; });
+      return row;
+    });
+
     return {
       title: "Main Examination Summary",
       excelSheets: [
@@ -99,12 +121,14 @@ const SHAPES = {
         { name: "Performance", title: "Overall Performance", columns: overviewCols, rows: perfRows },
         { name: "Subject Summary", title: "Performance by Subject", columns: subjectCols, rows: subjectRows },
         { name: "Grade Distribution", title: "Grade Distribution", columns: gradeCols, rows: gradeRows, note: gradeNote },
+        { name: "Nominal Roll", title: "Nominal Roll", columns: nominalCols, rows: nominalRows, note: !nominalRows.length ? "No registered candidates found." : null },
       ],
       pdfSections: [
         { heading: "Candidate Statistics", columns: overviewCols, rows: overviewRows },
         { heading: "Overall Performance", columns: overviewCols, rows: perfRows },
         { heading: "Performance by Subject", columns: subjectCols, rows: subjectRows },
         { heading: "Grade Distribution", columns: gradeCols, rows: gradeRows, text: gradeNote || undefined },
+        { heading: "Nominal Roll", columns: nominalCols, rows: nominalRows },
       ],
     };
   },
