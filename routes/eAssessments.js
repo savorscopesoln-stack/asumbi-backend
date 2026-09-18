@@ -39,6 +39,9 @@ const {
 
   // release
   getReleasedMarks, releaseMarks, bulkReleaseMarks,
+
+  // grading system
+  getGradingSystem, updateGradingSystem,
 } = require("../controllers/eAssessment.controller");
 
 const { protect, authorize, requirePage } = require("../middleware/authMiddleware");
@@ -117,6 +120,17 @@ router.put("/admin/remark-requests/:id/review", protect, requirePage("E-Assessme
 router.get("/admin/released-marks", protect, requirePage("E-Assessments"), getReleasedMarks);
 router.put("/admin/release-marks", protect, requirePage("E-Assessments"), releaseMarks);
 router.put("/admin/bulk-release-marks", protect, requirePage("E-Assessments"), bulkReleaseMarks);
+
+/* =========================================================================
+   GRADING SYSTEM
+   GET is deliberately just `protect` (any logged-in role) — the
+   student, teacher and admin report screens all need to render a
+   grade from this, not just the admin who configures it. Only the
+   PUT (Admin → E-Assessments → Grading System tab) is gated by
+   requirePage("E-Assessments").
+========================================================================= */
+router.get("/grading-system", protect, getGradingSystem);
+router.put("/admin/grading-system", protect, requirePage("E-Assessments"), updateGradingSystem);
 
 /* =========================================================================
    ADMIN — EXAM SESSION / DEVICE-LOCK MANAGEMENT

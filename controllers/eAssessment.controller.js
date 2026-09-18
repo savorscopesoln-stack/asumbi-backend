@@ -2622,6 +2622,140 @@ const bulkReleaseMarks = async (req, res) => {
 };
 
 /* =========================================================================
+   GRADING SYSTEM
+   Single configurable scale (see GradingSystem table in ensureSchema.js)
+   that every report screen — reports.jsx, StudentReport.jsx,
+   TeacherReports.jsx — reads instead of each hard-coding its own grade
+   boundaries. GET is intentionally NOT behind requirePage: a student
+   or teacher viewing their own report needs this too, same reasoning
+   as GET /api/school-settings being public. PUT is admin-only, gated
+   on the route by requirePage("E-Assessments").
+========================================================================= */
+const getGradingSystem = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const result = await pool.request().query(`SELECT TOP 1 * FROM GradingSystem WHERE id = 1`);
+    const row = result.recordset[0];
+
+    if (!row) {
+      // Table not migrated yet on this tenant for some reason — fall
+      // back to the same numbers the old hard-coded functions used,
+      // so a report screen never breaks because of a missing row.
+      return res.json({
+        id: 1,
+        systemName: "KNEC Standard",
+        passMark: 40,
+        gradeBands: [
+          { minScore: 80, grade: "1", label: "Distinction", remark: "Excellent Performance" },
+          { minScore: 75, grade: "2", label: "Distinction", remark: "Good Performance" },
+          { minScore: 70, grade: "3", label: "Credit", remark: "Good Performance" },
+          { minScore: 60, grade: "4", label: "Credit", remark: "Fair Performance" },
+          { minScore: 50, grade: "5", label: "Pass", remark: "Weak Performance" },
+          { minScore: 40, grade: "6", label: "Pass", remark: "Needs Improvement" },
+          { minScore: 0, grade: "7", label: "Fail", remark: "Needs Improvement" },
+        ],
+        overallBands: [
+          { minScore: 75, label: "DISTINCTION" },
+          { minScore: 60, label: "CREDIT" },
+          { minScore: 40, label: "PASS" },
+          { minScore: 0, label: "REFERRED" },
+        ],
+      });
+    }
+
+    let gradeBands = [];
+    let overallBands = [];
+    try { gradeBands = JSON.parse(row.gradeBandsJson || "[]"); } catch (_) {}
+    try { overallBands = JSON.parse(row.overallBandsJson || "[]"); } catch (_) {}
+
+    res.json({
+      id: row.id,
+      systemName: row.systemName,
+      passMark: row.passMark,
+      gradeBands,
+      overallBands,
+      updatedAt: row.updatedAt,
+    });
+  } catch (err) {
+    console.error("GET GRADING SYSTEM ERROR:", err);
+    res.status(500).json({ message: "Failed to load grading system" });
+  }
+};
+
+const updateGradingSystem = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const { systemName, passMark, gradeBands, overallBands } = req.body || {};
+
+    if (!Array.isArray(gradeBands) || gradeBands.length === 0) {
+      return res.status(400).json({ message: "At least one grade band is required" });
+    }
+    if (!Array.isArray(overallBands) || overallBands.length === 0) {
+      return res.status(400).json({ message: "At least one overall-result band is required" });
+    }
+
+    // Normalize + validate every band before persisting — a bad row
+    // here would silently break every report/result-slip in the app.
+    const cleanGradeBands = gradeBands
+      .map((b) => ({
+        minScore: Number(b.minScore),
+        grade: String(b.grade ?? "").trim(),
+        label: String(b.label ?? "").trim(),
+        remark: String(b.remark ?? "").trim(),
+      }))
+      .filter((b) => !Number.isNaN(b.minScore) && b.label)
+      .sort((a, b) => b.minScore - a.minScore);
+
+    const cleanOverallBands = overallBands
+      .map((b) => ({
+        minScore: Number(b.minScore),
+        label: String(b.label ?? "").trim(),
+      }))
+      .filter((b) => !Number.isNaN(b.minScore) && b.label)
+      .sort((a, b) => b.minScore - a.minScore);
+
+    if (!cleanGradeBands.length) return res.status(400).json({ message: "Grade bands are invalid" });
+    if (!cleanOverallBands.length) return res.status(400).json({ message: "Overall-result bands are invalid" });
+
+    await pool.request()
+      .input("systemName", sql.NVarChar, systemName || "Standard Grading")
+      .input("passMark", sql.Int, Number.isFinite(Number(passMark)) ? parseInt(passMark, 10) : 40)
+      .input("gradeBandsJson", sql.NVarChar(sql.MAX), JSON.stringify(cleanGradeBands))
+      .input("overallBandsJson", sql.NVarChar(sql.MAX), JSON.stringify(cleanOverallBands))
+      .input("updatedBy", sql.Int, req.user?.id || null)
+      .query(`
+        IF EXISTS (SELECT * FROM GradingSystem WHERE id = 1)
+          UPDATE GradingSystem SET
+            systemName = @systemName,
+            passMark = @passMark,
+            gradeBandsJson = @gradeBandsJson,
+            overallBandsJson = @overallBandsJson,
+            updatedAt = GETDATE(),
+            updatedBy = @updatedBy
+          WHERE id = 1
+        ELSE
+          INSERT INTO GradingSystem (id, systemName, passMark, gradeBandsJson, overallBandsJson, updatedBy)
+          VALUES (1, @systemName, @passMark, @gradeBandsJson, @overallBandsJson, @updatedBy)
+      `);
+
+    const result = await pool.request().query(`SELECT TOP 1 * FROM GradingSystem WHERE id = 1`);
+    const row = result.recordset[0];
+    res.json({
+      success: true,
+      id: row.id,
+      systemName: row.systemName,
+      passMark: row.passMark,
+      gradeBands: JSON.parse(row.gradeBandsJson),
+      overallBands: JSON.parse(row.overallBandsJson),
+      updatedAt: row.updatedAt,
+    });
+  } catch (err) {
+    console.error("UPDATE GRADING SYSTEM ERROR:", err);
+    res.status(500).json({ message: "Failed to update grading system" });
+  }
+};
+
+/* =========================================================================
    EXPORTS (single source of truth — no other module.exports in this file)
 ========================================================================= */
 module.exports = {
@@ -2662,4 +2796,7 @@ module.exports = {
 
   // release
   getReleasedMarks, releaseMarks, bulkReleaseMarks,
+
+  // grading system
+  getGradingSystem, updateGradingSystem,
 };

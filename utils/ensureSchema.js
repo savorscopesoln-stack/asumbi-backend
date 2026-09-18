@@ -1305,6 +1305,67 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       END
     `);
 
+    /* ---------------- GradingSystem table ----------------
+       Replaces the grading scale that used to be hard-coded three
+       different ways (reports.jsx's getKnecGrade/getOverallResult/
+       getRemark, StudentReport.jsx's own CBC-style scale,
+       TeacherReports.jsx's own three-band scale) — every report
+       screen now reads ONE shared scale from here instead. Single
+       row, id=1, like SchoolSettings. Edited from Admin →
+       E-Assessments → "Grading System" tab (PUT
+       /api/e-assessments/admin/grading-system, gated by the same
+       "E-Assessments" grantable page). Read side is public (same
+       reasoning as SchoolSettings: the student/teacher/admin report
+       pages all need it and shouldn't each require a fresh login
+       just to render a grade).
+
+       gradeBandsJson / overallBandsJson are JSON arrays kept in
+       highest-score-first order:
+         gradeBands:   [{ minScore, grade, label, remark }, ...]
+         overallBands: [{ minScore, label }, ...]
+       A score is matched to the first band whose minScore it meets
+       or exceeds (falls through to the last/lowest band otherwise).
+
+       Seeded with the exact numbers reports.jsx's old
+       getKnecGrade/getRemark/getOverallResult used, so behavior is
+       byte-for-byte unchanged until an admin edits something. */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='GradingSystem' AND xtype='U')
+      BEGIN
+        CREATE TABLE GradingSystem (
+          id INT PRIMARY KEY,
+          systemName NVARCHAR(100) NOT NULL DEFAULT 'Standard Grading',
+          passMark INT NOT NULL DEFAULT 40,
+          gradeBandsJson NVARCHAR(MAX) NOT NULL,
+          overallBandsJson NVARCHAR(MAX) NOT NULL,
+          updatedAt DATETIME NOT NULL DEFAULT GETDATE(),
+          updatedBy INT NULL
+        )
+
+        INSERT INTO GradingSystem (id, systemName, passMark, gradeBandsJson, overallBandsJson)
+        VALUES (
+          1,
+          'KNEC Standard',
+          40,
+          N'[
+            {"minScore":80,"grade":"1","label":"Distinction","remark":"Excellent Performance"},
+            {"minScore":75,"grade":"2","label":"Distinction","remark":"Good Performance"},
+            {"minScore":70,"grade":"3","label":"Credit","remark":"Good Performance"},
+            {"minScore":60,"grade":"4","label":"Credit","remark":"Fair Performance"},
+            {"minScore":50,"grade":"5","label":"Pass","remark":"Weak Performance"},
+            {"minScore":40,"grade":"6","label":"Pass","remark":"Needs Improvement"},
+            {"minScore":0,"grade":"7","label":"Fail","remark":"Needs Improvement"}
+          ]',
+          N'[
+            {"minScore":75,"label":"DISTINCTION"},
+            {"minScore":60,"label":"CREDIT"},
+            {"minScore":40,"label":"PASS"},
+            {"minScore":0,"label":"REFERRED"}
+          ]'
+        )
+      END
+    `);
+
     /* =========================================================
        MAIN EXAMINATIONS — parent "2026 Second Year Final
        Examination"-style container that groups several existing
@@ -1400,7 +1461,7 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       )
     `);
 
-    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, PortalPageSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, leave_outs code-verification columns, meal_daily_codes, leave_auto_approve, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl, Students.profileCompleted, student_profile_change_requests, website_content, contact_messages, newsletter_subscribers, e_assessments.cover_page_url, e_assessments.cover_page_width/height, e_assessment_question_images, e_assessment_sync_devices, e_assessment_sync_devices.tenant_key, e_assessment_sync_device_assessments, e_assessment_sync_logs, e_assessment_submissions.sync_batch_id, SchoolSettings, SchoolOfficials, main_examinations, exam_subject_sessions, exam_audit_log)");
+    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, PortalPageSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, leave_outs code-verification columns, meal_daily_codes, leave_auto_approve, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl, Students.profileCompleted, student_profile_change_requests, website_content, contact_messages, newsletter_subscribers, e_assessments.cover_page_url, e_assessments.cover_page_width/height, e_assessment_question_images, e_assessment_sync_devices, e_assessment_sync_devices.tenant_key, e_assessment_sync_device_assessments, e_assessment_sync_logs, e_assessment_submissions.sync_batch_id, SchoolSettings, SchoolOfficials, GradingSystem, main_examinations, exam_subject_sessions, exam_audit_log)");
   } catch (err) {
     console.error("⚠️  Schema ensure failed:", err.message);
   }
