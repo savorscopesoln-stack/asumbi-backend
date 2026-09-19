@@ -1982,7 +1982,7 @@ const assignTeacher = async (req, res) => {
 
     await notifyOne(pool, teacher_id, "Teachers", {
       title: "New Class Allocation",
-      message: `You've been allocated to teach ${subject_name || "a subject"} for ${class_name || "a class"}.`,
+      message: `You've been allocated to mark ${subject_name || "a subject"} for ${class_name || "a class"}.`,
       type: "allocation",
     });
 
