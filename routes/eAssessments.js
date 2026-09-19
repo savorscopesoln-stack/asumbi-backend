@@ -170,10 +170,23 @@ router.post("/submissions/:id/request-remark", protect, authorize("student"), re
 router.get("/", protect, getEAssessments);
 router.post("/", protect, authorize("teacher"), createEAssessment);
 router.put("/:id", protect, authorize("teacher"), updateEAssessment);
-router.post("/:id/questions", protect, authorize("teacher"), addEAssessmentQuestion);
+/* =========================================================================
+   QUESTION MANAGEMENT
+   Every route below is also reachable by admin/sub_admin/sub_admin_2 (and
+   module_admin, via the admin bypass in authorize()) on ANY assessment —
+   not just teacher-owned ones — see canManageAssessmentQuestions() in
+   eAssessment.controller.js, which every one of these already calls
+   internally. The route-level authorize() list has to include the
+   sub-admin tiers explicitly (only "admin"/"module_admin" bypass
+   automatically); leaving it as authorize("teacher") alone, as it
+   originally was, rejected admin/sub_admin requests before that inner
+   check ever ran — this is what /admin-e-assessments/:id/questions
+   (App.jsx) is supposed to reach.
+========================================================================= */
+router.post("/:id/questions", protect, authorize("teacher", "admin", "sub_admin", "sub_admin_2"), addEAssessmentQuestion);
 router.get("/:id/questions", protect, getAssessmentQuestions);
-router.put("/questions/:questionId", protect, authorize("teacher"), updateQuestion);
-router.delete("/questions/:questionId", protect, authorize("teacher"), deleteQuestion);
+router.put("/questions/:questionId", protect, authorize("teacher", "admin", "sub_admin", "sub_admin_2"), updateQuestion);
+router.delete("/questions/:questionId", protect, authorize("teacher", "admin", "sub_admin", "sub_admin_2"), deleteQuestion);
 
 /* =========================================================================
    COVER PAGE — per-exam PDF, shown to students before they start
@@ -184,14 +197,14 @@ router.delete("/:id/cover-page", protect, authorize("teacher"), deleteCoverPage)
 /* =========================================================================
    QUESTIONS FROM A WORD DOCUMENT — parse-then-review-then-bulk-save
 ========================================================================= */
-router.post("/:id/questions/import-docx", protect, authorize("teacher"), questionDocMiddleware, parseQuestionsDocx);
-router.post("/:id/questions/bulk", protect, authorize("teacher"), bulkAddQuestions);
+router.post("/:id/questions/import-docx", protect, authorize("teacher", "admin", "sub_admin", "sub_admin_2"), questionDocMiddleware, parseQuestionsDocx);
+router.post("/:id/questions/bulk", protect, authorize("teacher", "admin", "sub_admin", "sub_admin_2"), bulkAddQuestions);
 
 /* =========================================================================
    QUESTION IMAGES — diagrams/photos attached to a single question
 ========================================================================= */
-router.post("/questions/:questionId/images", protect, authorize("teacher"), questionImageMiddleware, uploadQuestionImages);
-router.delete("/questions/:questionId/images/:imageId", protect, authorize("teacher"), deleteQuestionImage);
+router.post("/questions/:questionId/images", protect, authorize("teacher", "admin", "sub_admin", "sub_admin_2"), questionImageMiddleware, uploadQuestionImages);
+router.delete("/questions/:questionId/images/:imageId", protect, authorize("teacher", "admin", "sub_admin", "sub_admin_2"), deleteQuestionImage);
 
 /* =========================================================================
    IMPORTANT: keep /:id LAST — it will otherwise swallow the named routes above
