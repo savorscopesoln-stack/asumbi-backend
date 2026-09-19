@@ -72,7 +72,7 @@ const getRecipientDirectory = async (req, res) => {
         SELECT TOP 50 id, username AS name, username, NULL AS phone, email, NULL AS studentClass, 'Users' AS source,
                LOWER(role) AS userType
         FROM Users
-        WHERE LOWER(role) IN ('admin', 'sub_admin', 'sub_admin_2')
+        WHERE LOWER(role) IN ('admin', 'sub_admin', 'sub_admin_2', 'module_admin')
       `;
       if (like) {
         r.input("like", sql.NVarChar, like);
@@ -112,7 +112,7 @@ const resolveRecipients = async (pool, { recipientType, recipientIds, studentCla
   const teacherQuery = `SELECT id, name, phone, email, 'Teachers' AS source FROM Teachers`;
   const adminQuery = `
     SELECT id, username AS name, NULL AS phone, email, 'Users' AS source
-    FROM Users WHERE LOWER(role) IN ('admin', 'sub_admin', 'sub_admin_2')
+    FROM Users WHERE LOWER(role) IN ('admin', 'sub_admin', 'sub_admin_2', 'module_admin')
   `;
 
   if (recipientType === "students") {

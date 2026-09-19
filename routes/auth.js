@@ -109,12 +109,15 @@ router.post("/login", async (req, res) => {
       });
     }
     /* ================= ROLE SYSTEM =================
-       Three account tiers exist in the Users table now:
-       "admin" (full access), "sub_admin", and "sub_admin_2"
-       (both sub-admin tiers have access limited to whichever
-       pages were granted at setup, see user.permissions
-       below — they're two independent, equally-capable
-       tiers). Any legacy "staff" rows are migrated to
+       Four account tiers exist in the Users table now:
+       "admin" (full access, every page), "sub_admin" and
+       "sub_admin_2" (limited admin capabilities AND limited to
+       whichever pages were granted at setup — two independent,
+       equally-capable tiers), and "module_admin" (FULL admin
+       capabilities, same as "admin", but still limited to whichever
+       pages were granted at setup — see authMiddleware.js's
+       authorize()/requirePage() for exactly how each tier is
+       enforced). Any legacy "staff" rows are migrated to
        "sub_admin" on server boot (ensureSchema), but the
        fallback below covers it defensively too. */
     let role = "user";
@@ -132,8 +135,12 @@ router.post("/login", async (req, res) => {
       if (dbRole === "admin") role = "admin";
       else if (dbRole === "sub_admin" || dbRole === "staff") role = "sub_admin";
       else if (dbRole === "sub_admin_2") role = "sub_admin_2";
+      // "module_admin" — full admin CAPABILITIES (see authMiddleware.js's
+      // authorize() bypass), but page access is limited by its own
+      // permissions list, same as the sub_admin tiers just above.
+      else if (dbRole === "module_admin") role = "module_admin";
 
-      if (role === "sub_admin" || role === "sub_admin_2") {
+      if (role === "sub_admin" || role === "sub_admin_2" || role === "module_admin") {
         try {
           const parsed = JSON.parse(user.permissions || "[]");
           permissions = Array.isArray(parsed) ? parsed : [];

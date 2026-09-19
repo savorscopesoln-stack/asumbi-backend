@@ -506,7 +506,7 @@ module.exports = (poolPromise, sql) => {
         if (status !== "pending_admin") {
           return res.status(409).json({ message: `This request is already ${status}.` });
         }
-        if (role !== "admin") {
+        if (role !== "admin" && role !== "module_admin") {
           return res.status(403).json({ message: "Only Admin can approve Long-Stay Leave." });
         }
 
@@ -547,7 +547,7 @@ module.exports = (poolPromise, sql) => {
       if (leave_type === "emergency") {
 
         if (status === "pending_subadmin2") {
-          if (!["sub_admin_2", "admin"].includes(role)) {
+          if (!["sub_admin_2", "admin", "module_admin"].includes(role)) {
             return res.status(403).json({ message: "Only Sub-Admin 2 (or Admin) can process this stage of Emergency Leave." });
           }
 
@@ -586,7 +586,7 @@ module.exports = (poolPromise, sql) => {
         }
 
         if (status === "pending_final") {
-          if (!["sub_admin", "admin"].includes(role)) {
+          if (!["sub_admin", "admin", "module_admin"].includes(role)) {
             return res.status(403).json({ message: "Only Sub-Admin 1 (or Admin) can give final approval for Emergency Leave." });
           }
 
@@ -698,9 +698,9 @@ module.exports = (poolPromise, sql) => {
       // Which stages this leave_type can currently be rejected from, and
       // who's allowed to reject at that stage.
       const REJECTABLE_STAGES = {
-        long: { pending_admin: ["admin"] },
-        emergency: { pending_subadmin2: ["sub_admin_2", "admin"], pending_final: ["sub_admin", "admin"] },
-        short_stay: { pending: ["admin", "sub_admin", "sub_admin_2"] },
+        long: { pending_admin: ["admin", "module_admin"] },
+        emergency: { pending_subadmin2: ["sub_admin_2", "admin", "module_admin"], pending_final: ["sub_admin", "admin", "module_admin"] },
+        short_stay: { pending: ["admin", "sub_admin", "sub_admin_2", "module_admin"] },
       };
       const stages = REJECTABLE_STAGES[leave_type] || REJECTABLE_STAGES.short_stay;
       const allowedRoles = stages[status];
@@ -891,8 +891,9 @@ module.exports = (poolPromise, sql) => {
       }
 
       // Sub-admins may never revoke a Long-Stay Leave (same rule as
-      // approve/deny) — only Admin manages that workflow end-to-end.
-      if (data.leave_type === "long" && req.user.role !== "admin") {
+      // approve/deny) — only Admin (and module_admin, full admin
+      // capabilities) manages that workflow end-to-end.
+      if (data.leave_type === "long" && req.user.role !== "admin" && req.user.role !== "module_admin") {
         return res.status(403).json({ message: "Only Admin can manage Long-Stay Leave." });
       }
 

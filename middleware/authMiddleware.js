@@ -214,9 +214,15 @@ const authorize = (...allowedRoles) => {
 
       /* ===================================================
          ADMIN BYPASS FIX
-         ADMIN CAN ACCESS EVERYTHING
+         ADMIN CAN ACCESS EVERYTHING. "module_admin" is a second
+         full-privilege tier (see requirePage() below for the part
+         that's actually restricted for them — which pages they can
+         reach) and gets the exact same bypass here, so every
+         authorize("admin")/adminOnly-gated action (creating other
+         accounts, raw records, notification settings, etc.) works
+         identically for both roles.
       =================================================== */
-      if (userRole === "admin") {
+      if (userRole === "admin" || userRole === "module_admin") {
         return next();
       }
 
@@ -245,12 +251,15 @@ const authorize = (...allowedRoles) => {
 };
 
 /* =========================================================
-   PAGE-LEVEL AUTHORIZATION (sub-admins)
+   PAGE-LEVEL AUTHORIZATION (sub-admins + module admins)
    Unlike `authorize`, which only checks a role name, this
-   checks whether the specific page was granted to a
-   "sub_admin" or "sub_admin_2" account at setup time. "admin"
-   always passes, exactly like the admin bypass in `authorize`
-   above.
+   checks whether the specific page was granted at setup time.
+   "admin" always passes, exactly like the admin bypass in
+   `authorize` above. "sub_admin" / "sub_admin_2" / "module_admin"
+   all go through the same permissions-array check — a
+   "module_admin" has every admin CAPABILITY (see the authorize()
+   bypass above) but, like a sub-admin, can only open the specific
+   pages granted to their account.
 ========================================================= */
 const requirePage = (pageKey) => {
   return (req, res, next) => {
@@ -275,7 +284,7 @@ const requirePage = (pageKey) => {
         : [];
 
       if (
-        (userRole === "sub_admin" || userRole === "sub_admin_2") &&
+        (userRole === "sub_admin" || userRole === "sub_admin_2" || userRole === "module_admin") &&
         permissions.includes(pageKey)
       ) {
         return next();

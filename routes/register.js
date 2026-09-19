@@ -187,14 +187,19 @@ router.post("/teacher", async (req, res) => {
    accounts one at a time, each with a random one-time
    password that must be changed on first login.
 
-   role: "admin" (full access), "sub_admin", or "sub_admin_2"
-   (both sub-admin tiers are limited to whichever pages are
-   listed in `permissions`, chosen right here at setup time —
-   there's no separate step to grant access later, so a
-   sub-admin's pages are locked in now). sub_admin and
-   sub_admin_2 are two independent, equally-capable tiers —
-   useful when an admin wants to create a second, separate
-   batch of limited-access accounts.
+   role: "admin" (full access, unrestricted pages), "sub_admin" or
+   "sub_admin_2" (limited admin CAPABILITIES — gated by authorize()
+   checks elsewhere in the app — and limited to whichever pages are
+   listed in `permissions`), or "module_admin" (full admin
+   CAPABILITIES, same as "admin", but STILL limited to whichever
+   pages are listed in `permissions` — for someone who should be able
+   to fully manage whatever they're let into, without being handed
+   every page in the system). Permissions are chosen right here at
+   setup time — there's no separate step to grant access later, so a
+   page-scoped account's pages are locked in now. sub_admin and
+   sub_admin_2 are two independent, equally-capable tiers — useful
+   when an admin wants to create a second, separate batch of
+   limited-access accounts.
 ========================================================= */
 router.post("/user", protect, adminOnly, async (req, res) => {
   try {
@@ -207,23 +212,29 @@ router.post("/user", protect, adminOnly, async (req, res) => {
     }
 
     const normalizedRole = String(role).toLowerCase().trim();
-    const SUB_ADMIN_ROLES = ["sub_admin", "sub_admin_2"];
+    // Both plain sub-admin tiers AND "module_admin" are page-scoped:
+    // they need a permissions list and can't proceed without at least
+    // one page picked. "module_admin" additionally gets full admin
+    // CAPABILITIES everywhere (see authMiddleware.js's authorize()
+    // bypass) — it's only page NAVIGATION that stays limited, exactly
+    // like a sub-admin.
+    const PAGE_SCOPED_ROLES = ["sub_admin", "sub_admin_2", "module_admin"];
 
-    if (!["admin", ...SUB_ADMIN_ROLES].includes(normalizedRole)) {
+    if (!["admin", ...PAGE_SCOPED_ROLES].includes(normalizedRole)) {
       return res.status(400).json({
-        message: `Invalid role. Must be "admin", "sub_admin", or "sub_admin_2".`,
+        message: `Invalid role. Must be "admin", "sub_admin", "sub_admin_2", or "module_admin".`,
       });
     }
 
-    // Admins always have full access; either sub-admin tier needs a
+    // Admins always have full access; every page-scoped role needs a
     // permissions list, and it must contain at least one page —
     // otherwise the account would be created with nowhere to go.
-    if (SUB_ADMIN_ROLES.includes(normalizedRole)) {
+    if (PAGE_SCOPED_ROLES.includes(normalizedRole)) {
       permissions = sanitizePermissions(permissions);
 
       if (permissions.length === 0) {
         return res.status(400).json({
-          message: "Select at least one page this sub-admin can access.",
+          message: "Select at least one page this account can access.",
           availablePages: PAGE_KEYS,
         });
       }
