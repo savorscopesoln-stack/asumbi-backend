@@ -203,6 +203,47 @@ const getSyncLogs = async (req, res) => {
 };
 
 /* =========================================================================
+   ADMIN — DELETE SYNC LOGS
+   DELETE /api/local-sync/logs?scope=all|failed[&device_id=]   clear many
+   DELETE /api/local-sync/logs/:id                              clear one
+   Only removes rows from the activity history. Push idempotency is
+   tracked on e_assessment_submissions.sync_batch_id (not on this
+   table), so clearing logs can never cause a batch to be re-applied,
+   and devices, tokens and pulled/pushed data are untouched.
+========================================================================= */
+const deleteSyncLogs = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const scope = req.query.scope === "failed" ? "failed" : "all";
+    const result = await pool.request()
+      .input("device_id", sql.Int, req.query.device_id ? parseInt(req.query.device_id, 10) : null)
+      .query(`
+        DELETE FROM e_assessment_sync_logs
+        WHERE (@device_id IS NULL OR device_id = @device_id)
+          ${scope === "failed" ? "AND status = 'error'" : ""}
+      `);
+    res.json({ success: true, deleted: result.rowsAffected?.[0] ?? 0 });
+  } catch (err) {
+    console.error("DELETE SYNC LOGS ERROR:", err);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+};
+
+const deleteSyncLog = async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ success: false, message: "Invalid log id" });
+    const result = await req.pool.request()
+      .input("id", sql.Int, id)
+      .query(`DELETE FROM e_assessment_sync_logs WHERE id = @id`);
+    res.json({ success: true, deleted: result.rowsAffected?.[0] ?? 0 });
+  } catch (err) {
+    console.error("DELETE SYNC LOG ERROR:", err);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+};
+
+/* =========================================================================
    DEVICE-AUTHENTICATED — PULL PACKAGE
    GET /api/local-sync/pull/:assessmentId   (header: X-Sync-Token)
 ========================================================================= */
@@ -653,6 +694,6 @@ const getMyAssessments = async (req, res) => {
 };
 
 module.exports = {
-  createSyncDevice, getSyncDevices, revokeSyncDevice, reissueSyncDevice, getSyncLogs,
+  createSyncDevice, getSyncDevices, revokeSyncDevice, reissueSyncDevice, getSyncLogs, deleteSyncLogs, deleteSyncLog,
   pullPackage, pullExamPackage, pushResults, getMyAssessments,
 };

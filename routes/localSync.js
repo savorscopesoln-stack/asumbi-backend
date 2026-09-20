@@ -2,7 +2,7 @@ const express = require("express");
 const router = express.Router();
 
 const {
-  createSyncDevice, getSyncDevices, revokeSyncDevice, reissueSyncDevice, getSyncLogs,
+  createSyncDevice, getSyncDevices, revokeSyncDevice, reissueSyncDevice, getSyncLogs, deleteSyncLogs, deleteSyncLog,
   pullPackage, pullExamPackage, pushResults, getMyAssessments,
 } = require("../controllers/syncController");
 
@@ -15,6 +15,8 @@ router.get("/devices", protect, requirePage("E-Assessments"), getSyncDevices);
 router.put("/devices/:id/revoke", protect, requirePage("E-Assessments"), revokeSyncDevice);
 router.put("/devices/:id/reissue", protect, requirePage("E-Assessments"), reissueSyncDevice);
 router.get("/logs", protect, requirePage("E-Assessments"), getSyncLogs);
+router.delete("/logs", protect, requirePage("E-Assessments"), deleteSyncLogs);
+router.delete("/logs/:id", protect, requirePage("E-Assessments"), deleteSyncLog);
 
 /* ===== Local-server-facing endpoints (sync-token auth, no JWT) ===== */
 router.get("/pull/:assessmentId", authenticateSyncDevice, pullPackage);
