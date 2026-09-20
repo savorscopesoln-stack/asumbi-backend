@@ -47,6 +47,30 @@ const DISCRIMINATION_GROUP_FRACTION = 0.27; // standard top/bottom 27% split
 const round1 = (n) => (n == null ? null : Math.round(n * 10) / 10);
 const pct = (num, denom) => (denom > 0 ? round1((num / denom) * 100) : null);
 
+// Same default the standalone Grading System settings page falls back to
+// (see getGradingSystem in eAssessment.controller.js) — kept in sync so a
+// tenant that has never opened that settings page still gets the exact
+// same 40% every other report/result screen in the app already assumes.
+const DEFAULT_PASS_MARK = 40;
+
+// The pass rate here is now read from the same GradingSystem table the
+// admin's "Grading System" settings screen (Admin → E-Assessments →
+// Grading System) writes to — not a second, independently-configured
+// pass mark. If that row hasn't been saved yet on this tenant, we fall
+// back to the same 40% every other screen in the app already defaults
+// to, so a fresh tenant never sees a broken/missing pass rate.
+async function getPassMark(pool) {
+  try {
+    const result = await pool.request().query(`SELECT TOP 1 passMark FROM GradingSystem WHERE id = 1`);
+    const raw = result.recordset[0]?.passMark;
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : DEFAULT_PASS_MARK;
+  } catch (_) {
+    // Table not migrated on this tenant yet — same fallback as above.
+    return DEFAULT_PASS_MARK;
+  }
+}
+
 function difficultyLabel(correctPct, sampleSize) {
   if (sampleSize < MIN_DIFFICULTY_SAMPLE || correctPct == null) return "Insufficient data";
   if (correctPct >= 75) return "Easy";
@@ -100,12 +124,13 @@ async function computeMainExaminationSummary(pool, id) {
 
   const subjects = await loadSubjectsWithAssessment(pool, id);
   const eAssessmentIds = [...new Set(subjects.map((s) => s.e_assessment_id).filter(Boolean))];
+  const passMark = await getPassMark(pool);
 
   const emptySummary = {
     examination,
     candidate_stats: { registered: 0, attempted: 0, completed: 0, incomplete: 0, absent: 0 },
     performance: { mean: null, median: null, highest: null, lowest: null, std_dev: null, pass_rate: null,
-      pass_rate_note: "Unavailable — no pass mark is configured for these assessments." },
+      pass_rate_note: "Unavailable — no candidates have been scored yet." },
     grade_distribution: null,
     grade_distribution_note: "Unavailable — no grading scale is configured in this system yet (§16).",
     subjects: [],
@@ -153,13 +178,14 @@ async function computeMainExaminationSummary(pool, id) {
   const absent = Math.max(0, registered - attempted);
 
   // ---- Overall performance (pooled across all subject submissions, §16) ----
-  const perfResult = await withIds(pool.request()).query(`
+  const perfResult = await withIds(pool.request()).input("passMark", sql.Float, passMark).query(`
     SELECT
       COUNT(*) AS n,
       AVG(pct.p)                                           AS mean,
       MIN(pct.p)                                            AS lowest,
       MAX(pct.p)                                            AS highest,
       STDEV(pct.p)                                          AS std_dev,
+      SUM(CASE WHEN pct.p >= @passMark THEN 1 ELSE 0 END)   AS passed,
       (SELECT TOP 1 PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY pct2.p) OVER () FROM (
           SELECT CAST(s2.score AS FLOAT) * 100.0 / ea2.total_marks AS p
           FROM e_assessment_submissions s2
@@ -174,6 +200,10 @@ async function computeMainExaminationSummary(pool, id) {
     ) pct
   `);
   const perfRow = perfResult.recordset[0] || {};
+  // §51 "one source of truth": the pass mark used here is whatever is
+  // currently saved on the admin's Grading System settings screen
+  // (falls back to 40% if that's never been configured on this
+  // tenant) — never a second, independently-set number.
   const performance = {
     mean: round1(perfRow.mean),
     median: round1(perfRow.median),
@@ -181,18 +211,20 @@ async function computeMainExaminationSummary(pool, id) {
     lowest: round1(perfRow.lowest),
     std_dev: round1(perfRow.std_dev),
     sample_size: perfRow.n || 0,
-    pass_rate: null,
-    pass_rate_note: "Unavailable — no pass mark is configured for these assessments.",
+    pass_mark: passMark,
+    pass_rate: perfRow.n ? pct(perfRow.passed, perfRow.n) : null,
+    pass_rate_note: perfRow.n ? `Candidates scoring at or above the configured pass mark (${passMark}%).` : "Unavailable — no candidates have been scored yet.",
   };
 
   // ---- Per-subject performance (§17) ----
-  const bySubjectResult = await withIds(pool.request()).query(`
+  const bySubjectResult = await withIds(pool.request()).input("passMark", sql.Float, passMark).query(`
     SELECT
       s.e_assessment_id,
       COUNT(*) AS completed,
       AVG(CASE WHEN ea.total_marks > 0 THEN CAST(s.score AS FLOAT) * 100.0 / ea.total_marks END) AS mean,
       MIN(CASE WHEN ea.total_marks > 0 THEN CAST(s.score AS FLOAT) * 100.0 / ea.total_marks END) AS lowest,
-      MAX(CASE WHEN ea.total_marks > 0 THEN CAST(s.score AS FLOAT) * 100.0 / ea.total_marks END) AS highest
+      MAX(CASE WHEN ea.total_marks > 0 THEN CAST(s.score AS FLOAT) * 100.0 / ea.total_marks END) AS highest,
+      SUM(CASE WHEN ea.total_marks > 0 AND (CAST(s.score AS FLOAT) * 100.0 / ea.total_marks) >= @passMark THEN 1 ELSE 0 END) AS passed
     FROM e_assessment_submissions s
     JOIN e_assessments ea ON ea.id = s.e_assessment_id
     WHERE s.e_assessment_id IN (${idParams}) AND s.score IS NOT NULL
@@ -240,7 +272,7 @@ async function computeMainExaminationSummary(pool, id) {
         mean: round1(perf.mean),
         highest: round1(perf.highest),
         lowest: round1(perf.lowest),
-        pass_rate: null,
+        pass_rate: perf.completed ? pct(perf.passed, perf.completed) : null,
       };
     });
 
@@ -258,8 +290,11 @@ async function computeMainExaminationSummary(pool, id) {
    Nominal Roll — the official candidate list for a Main Examination
    (§30.1's "Summary" report), in the school's usual class-list layout:
    one row per candidate (ranked by Class Position), one column per
-   subject scheduled in this Main Examination (by name, not a code —
-   this schema has no subject-code table), with that candidate's mark
+   subject scheduled in this Main Examination (by a short generated
+   code — see assignSubjectCodes() below; this schema has no
+   subject-code table of its own, so codes are derived from the name
+   and shipped alongside a code→name key so the roll is never ambiguous
+   about which column is which subject), with that candidate's mark
    underneath the subject they sat, and "—" under any subject they
    weren't entered for. Uses the exact same class/year "registered
    candidate" / subject-audience matching rule as
@@ -302,11 +337,40 @@ function assignClassPositions(rows) {
   });
 }
 
+// Short column codes for the Nominal Roll (§30.1) — this schema has no
+// subject-code table, so codes are derived deterministically from the
+// subject name (first 4 letters/digits, uppercased) and de-duplicated
+// within THIS exam's subject list only. Re-derived on every request
+// rather than stored, so renaming a subject or adding a new one that
+// happens to collide never leaves a stale code lying around — the
+// trade-off is a subject's code can shift if another subject with a
+// clashing prefix is added/removed later in the same exam, which is
+// why the roll always ships a code→name key alongside it (§51 — never
+// show a code without also showing what it means).
+function assignSubjectCodes(subjects) {
+  const taken = new Set();
+  const codeBySessionId = new Map();
+  subjects.forEach((s) => {
+    const clean = String(s.subject || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+    const base = clean.slice(0, 4) || "SUBJ";
+    let code = base;
+    let suffix = 1;
+    while (taken.has(code)) {
+      suffix += 1;
+      code = `${base.slice(0, 3)}${suffix}`;
+    }
+    taken.add(code);
+    codeBySessionId.set(s.session_id, code);
+  });
+  return codeBySessionId;
+}
+
 async function loadNominalRoll(pool, mainExaminationId) {
   const allSubjects = await loadSubjectsWithAssessment(pool, mainExaminationId);
   const subjects = allSubjects.filter((s) => s.e_assessment_id);
   if (!subjects.length) return { subjects: [], rows: [] };
 
+  const subjectCodes = assignSubjectCodes(subjects);
   const eAssessmentIds = [...new Set(subjects.map((s) => s.e_assessment_id))];
 
   // Every registered candidate — same EXISTS matching rule as
@@ -323,7 +387,7 @@ async function loadNominalRoll(pool, mainExaminationId) {
     )
   `);
   const candidates = candidatesResult.recordset;
-  if (!candidates.length) return { subjects: subjects.map((s) => ({ session_id: s.session_id, subject: s.subject, total_marks: s.total_marks })), rows: [] };
+  if (!candidates.length) return { subjects: subjects.map((s) => ({ session_id: s.session_id, subject: s.subject, code: subjectCodes.get(s.session_id), total_marks: s.total_marks })), rows: [] };
 
   const idParams = eAssessmentIds.map((_, i) => `@eid${i}`).join(",");
   const subReq = pool.request();
@@ -380,7 +444,7 @@ async function loadNominalRoll(pool, mainExaminationId) {
   });
 
   return {
-    subjects: subjects.map((s) => ({ session_id: s.session_id, subject: s.subject, total_marks: s.total_marks })),
+    subjects: subjects.map((s) => ({ session_id: s.session_id, subject: s.subject, code: subjectCodes.get(s.session_id), total_marks: s.total_marks })),
     rows,
   };
 }
@@ -474,10 +538,12 @@ const getSubjectAnalytics = async (req, res) => {
     const candidate_stats = { registered, attempted, completed, absent };
 
     // ---- Performance ----
-    const perfResult = await pool.request().input("eid", sql.Int, eAssessmentId).query(`
+    const passMark = await getPassMark(pool);
+    const perfResult = await pool.request().input("eid", sql.Int, eAssessmentId).input("passMark", sql.Float, passMark).query(`
       SELECT
         COUNT(*) AS n,
         AVG(pct.p) AS mean, MIN(pct.p) AS lowest, MAX(pct.p) AS highest, STDEV(pct.p) AS std_dev,
+        SUM(CASE WHEN pct.p >= @passMark THEN 1 ELSE 0 END) AS passed,
         (SELECT TOP 1 PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY pct2.p) OVER () FROM (
             SELECT CAST(s2.score AS FLOAT) * 100.0 / ea2.total_marks AS p
             FROM e_assessment_submissions s2 JOIN e_assessments ea2 ON ea2.id = s2.e_assessment_id
@@ -494,8 +560,9 @@ const getSubjectAnalytics = async (req, res) => {
       mean: round1(perfRow.mean), median: round1(perfRow.median),
       highest: round1(perfRow.highest), lowest: round1(perfRow.lowest),
       std_dev: round1(perfRow.std_dev), sample_size: perfRow.n || 0,
-      pass_rate: null,
-      pass_rate_note: "Unavailable — no pass mark is configured for this assessment.",
+      pass_mark: passMark,
+      pass_rate: perfRow.n ? pct(perfRow.passed, perfRow.n) : null,
+      pass_rate_note: perfRow.n ? `Candidates scoring at or above the configured pass mark (${passMark}%).` : "Unavailable — no candidates have been scored yet.",
     };
 
     // ---- Question-level analytics (§19-§21) ----

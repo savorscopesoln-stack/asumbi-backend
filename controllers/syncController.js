@@ -206,6 +206,65 @@ const getSyncLogs = async (req, res) => {
    DEVICE-AUTHENTICATED — PULL PACKAGE
    GET /api/local-sync/pull/:assessmentId   (header: X-Sync-Token)
 ========================================================================= */
+// Builds the same flat {assessment, questions, options, images, roster}
+// package pullPackage always returned for a single e_assessment — pulled
+// out into its own helper so pullExamPackage (whole-Main-Examination
+// bundle, see below) can build one of these per subject without
+// duplicating the question/option/image/roster queries.
+async function buildAssessmentPackage(pool, assessmentId) {
+  const aRes = await pool.request()
+    .input("id", sql.Int, assessmentId)
+    .query(`
+      SELECT id, title, subject, class_id, year_of_study, duration_minutes,
+             total_marks, instructions, exam_password, cover_page_url
+      FROM e_assessments WHERE id = @id
+    `);
+  if (!aRes.recordset.length) return null;
+  const assessment = aRes.recordset[0];
+
+  const qRes = await pool.request()
+    .input("aid", sql.Int, assessmentId)
+    .query(`
+      SELECT id, question_text, question_type, marks, time_limit, correct_answer, marking_guide
+      FROM e_assessment_questions WHERE e_assessment_id = @aid ORDER BY id
+    `);
+  const questions = qRes.recordset;
+
+  const qIds = questions.map((q) => q.id);
+  let options = [], images = [];
+  if (qIds.length) {
+    const idList = qIds.join(",");
+    const oRes = await pool.request().query(`
+      SELECT question_id, option_label, option_text
+      FROM e_assessment_options WHERE question_id IN (${idList})
+    `);
+    options = oRes.recordset;
+    const iRes = await pool.request().query(`
+      SELECT question_id, image_url, sort_order
+      FROM e_assessment_question_images WHERE question_id IN (${idList}) ORDER BY sort_order
+    `);
+    images = iRes.recordset;
+  }
+
+  // Roster: students in the assessment's class, so the local server can
+  // validate exam logins entirely offline. Students has no class_id
+  // column — class membership is matched by name (Students.studentClass
+  // = Classes.name), same as everywhere else in this codebase. Also
+  // honor year_of_study-targeted assessments the same way, or a
+  // whole-year assessment would pull an empty roster.
+  const rosterRes = await pool.request()
+    .input("class_id", sql.Int, assessment.class_id)
+    .input("year_of_study", sql.Int, assessment.year_of_study)
+    .query(`
+      SELECT DISTINCT st.id, st.username, st.name
+      FROM Students st
+      WHERE st.studentClass = (SELECT name FROM Classes WHERE id = @class_id)
+         OR (@year_of_study IS NOT NULL AND st.yearOfStudy = @year_of_study)
+    `);
+
+  return { assessment, questions, options, images, roster: rosterRes.recordset };
+}
+
 const pullPackage = async (req, res) => {
   try {
     const pool = req.pool;
@@ -229,64 +288,15 @@ const pullPackage = async (req, res) => {
       return res.status(403).json({ success: false, message: "This device is not authorized for that assessment" });
     }
 
-    const aRes = await pool.request()
-      .input("id", sql.Int, assessmentId)
-      .query(`
-        SELECT id, title, subject, class_id, year_of_study, duration_minutes,
-               total_marks, instructions, exam_password, cover_page_url
-        FROM e_assessments WHERE id = @id
-      `);
-    if (!aRes.recordset.length) {
+    const built = await buildAssessmentPackage(pool, assessmentId);
+    if (!built) {
       await logSyncAttempt(pool, {
         deviceId, assessmentId, direction: "pull", status: "error",
         message: "Assessment not found",
       });
       return res.status(404).json({ success: false, message: "Assessment not found" });
     }
-    const assessment = aRes.recordset[0];
-
-    const qRes = await pool.request()
-      .input("aid", sql.Int, assessmentId)
-      .query(`
-        SELECT id, question_text, question_type, marks, time_limit, correct_answer, marking_guide
-        FROM e_assessment_questions WHERE e_assessment_id = @aid ORDER BY id
-      `);
-    const questions = qRes.recordset;
-
-    const qIds = questions.map((q) => q.id);
-    let options = [], images = [];
-    if (qIds.length) {
-      const idList = qIds.join(",");
-      const oRes = await pool.request().query(`
-        SELECT question_id, option_label, option_text
-        FROM e_assessment_options WHERE question_id IN (${idList})
-      `);
-      options = oRes.recordset;
-      const iRes = await pool.request().query(`
-        SELECT question_id, image_url, sort_order
-        FROM e_assessment_question_images WHERE question_id IN (${idList}) ORDER BY sort_order
-      `);
-      images = iRes.recordset;
-    }
-
-    // Roster: students in the assessment's class, so the local server
-    // can validate exam logins entirely offline.
-    //
-    // Students has no class_id column — class membership is matched by
-    // name (Students.studentClass = Classes.name), same as everywhere
-    // else in this codebase (see eAssessment.controller.js's
-    // getEAssessments student filter). Also honor year_of_study-targeted
-    // assessments the same way, or a whole-year assessment would pull an
-    // empty roster.
-    const rosterRes = await pool.request()
-      .input("class_id", sql.Int, assessment.class_id)
-      .input("year_of_study", sql.Int, assessment.year_of_study)
-      .query(`
-        SELECT DISTINCT st.id, st.username, st.name
-        FROM Students st
-        WHERE st.studentClass = (SELECT name FROM Classes WHERE id = @class_id)
-           OR (@year_of_study IS NOT NULL AND st.yearOfStudy = @year_of_study)
-      `);
+    const { assessment, questions, options, images, roster } = built;
 
     // Attach options/images to their question client-side (keeps the
     // package simple and flat — the local server can nest them itself).
@@ -297,13 +307,13 @@ const pullPackage = async (req, res) => {
       questions,
       options,
       images,
-      roster: rosterRes.recordset,
+      roster,
     };
 
     await logSyncAttempt(pool, {
       deviceId, assessmentId, direction: "pull", status: "ok",
       recordCount: questions.length,
-      message: `${questions.length} question(s), ${rosterRes.recordset.length} student(s)`,
+      message: `${questions.length} question(s), ${roster.length} student(s)`,
     });
     await pool.request()
       .input("id", sql.Int, deviceId)
@@ -315,6 +325,127 @@ const pullPackage = async (req, res) => {
     await logSyncAttempt(req.pool, {
       deviceId: req.syncDevice?.id, assessmentId: parseInt(req.params.assessmentId),
       direction: "pull", status: "error", message: "Server error while building package",
+    });
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+};
+
+/* =========================================================================
+   DEVICE-AUTHENTICATED — PULL WHOLE MAIN EXAMINATION BY EXAM CODE
+   GET /api/local-sync/pull-exam/:examCode   (header: X-Sync-Token[, X-Tenant-Key])
+
+   The single-assessment pullPackage above needs every subject
+   individually authorized in e_assessment_sync_device_assessments
+   first. For a whole Main Examination that's a lot of manual per-
+   subject setup for what's really one event — instead, the exam_code
+   itself (see generateExamCode() in mainExam.controller.js) IS the
+   authorization: any device with a valid sync token for this tenant
+   that also knows the exam code may pull the whole bundle. That code
+   is meant to be treated like the existing per-assessment exam_password
+   — shared only with whoever is actually running the local server for
+   that sitting.
+
+   Returns the timetable (§5-§6, all exam_subject_sessions rows) plus
+   one buildAssessmentPackage() bundle per subject that has an
+   e_assessment_id attached — so the local server's "pull whole exam"
+   button downloads everything it needs (every subject's questions,
+   options, images and roster, plus the schedule to run them by) in a
+   single call, offline-ready after that.
+========================================================================= */
+const pullExamPackage = async (req, res) => {
+  const pool = req.pool;
+  const deviceId = req.syncDevice?.id;
+  const examCode = String(req.params.examCode || "").trim().toUpperCase();
+  try {
+    if (!examCode) {
+      return res.status(400).json({ success: false, message: "Missing exam code" });
+    }
+
+    const examRes = await pool.request()
+      .input("code", sql.NVarChar(20), examCode)
+      .query(`SELECT id, name, academic_year, term FROM main_examinations WHERE exam_code = @code`);
+    const examination = examRes.recordset[0];
+    if (!examination) {
+      await logSyncAttempt(pool, {
+        deviceId, direction: "pull", status: "error",
+        message: `Unknown exam code "${examCode}"`,
+      });
+      return res.status(404).json({ success: false, message: "No examination found for that exam code" });
+    }
+
+    const sessionsRes = await pool.request()
+      .input("mainExaminationId", sql.Int, examination.id)
+      .query(`
+        SELECT id, subject, class_id, e_assessment_id, exam_date, start_time, end_time,
+               duration_minutes, venue, max_marks, instructions, status
+        FROM exam_subject_sessions
+        WHERE main_examination_id = @mainExaminationId
+        ORDER BY start_time ASC, exam_date ASC, id ASC
+      `);
+    const sessions = sessionsRes.recordset;
+
+    // Timetable is returned as its own flat list — exactly the rows
+    // getTimetable() already serves the admin dashboard — so the local
+    // server can show/print a schedule even for subjects it has no
+    // assessment content for yet (e.g. a paper-based subject sitting
+    // inside the same Main Examination).
+    const timetable = sessions.map((s) => ({
+      id: s.id, subject: s.subject, class_id: s.class_id, exam_date: s.exam_date,
+      start_time: s.start_time, end_time: s.end_time, duration_minutes: s.duration_minutes,
+      venue: s.venue, status: s.status,
+    }));
+
+    const subjects = [];
+    let totalQuestions = 0;
+    for (const s of sessions) {
+      if (!s.e_assessment_id) {
+        subjects.push({ session_id: s.id, subject: s.subject, e_assessment_id: null, package: null });
+        continue;
+      }
+      const built = await buildAssessmentPackage(pool, s.e_assessment_id);
+      if (!built) {
+        subjects.push({ session_id: s.id, subject: s.subject, e_assessment_id: s.e_assessment_id, package: null });
+        continue;
+      }
+      totalQuestions += built.questions.length;
+      subjects.push({
+        session_id: s.id, subject: s.subject, e_assessment_id: s.e_assessment_id,
+        package: {
+          package_format: 1,
+          assessment: built.assessment,
+          questions: built.questions,
+          options: built.options,
+          images: built.images,
+          roster: built.roster,
+        },
+      });
+    }
+
+    await logSyncAttempt(pool, {
+      deviceId, direction: "pull", status: "ok",
+      recordCount: totalQuestions,
+      message: `Whole-exam pull "${examination.name}": ${sessions.length} subject(s), ${totalQuestions} question(s) total`,
+    });
+    if (deviceId) {
+      await pool.request()
+        .input("id", sql.Int, deviceId)
+        .query(`UPDATE e_assessment_sync_devices SET last_pull_at = GETDATE() WHERE id = @id`);
+    }
+
+    res.json({
+      success: true,
+      package: {
+        package_format: 1,
+        exported_at: new Date().toISOString(),
+        examination: { id: examination.id, name: examination.name, academic_year: examination.academic_year, term: examination.term, exam_code: examCode },
+        timetable,
+        subjects,
+      },
+    });
+  } catch (err) {
+    console.error("PULL EXAM PACKAGE ERROR:", err);
+    await logSyncAttempt(pool, {
+      deviceId, direction: "pull", status: "error", message: "Server error while building whole-exam package",
     });
     res.status(500).json({ success: false, message: "Server error" });
   }
@@ -493,5 +624,5 @@ const getMyAssessments = async (req, res) => {
 
 module.exports = {
   createSyncDevice, getSyncDevices, revokeSyncDevice, reissueSyncDevice, getSyncLogs,
-  pullPackage, pushResults, getMyAssessments,
+  pullPackage, pullExamPackage, pushResults, getMyAssessments,
 };

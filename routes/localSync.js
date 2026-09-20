@@ -3,7 +3,7 @@ const router = express.Router();
 
 const {
   createSyncDevice, getSyncDevices, revokeSyncDevice, reissueSyncDevice, getSyncLogs,
-  pullPackage, pushResults, getMyAssessments,
+  pullPackage, pullExamPackage, pushResults, getMyAssessments,
 } = require("../controllers/syncController");
 
 const { protect, requirePage } = require("../middleware/authMiddleware");
@@ -18,6 +18,10 @@ router.get("/logs", protect, requirePage("E-Assessments"), getSyncLogs);
 
 /* ===== Local-server-facing endpoints (sync-token auth, no JWT) ===== */
 router.get("/pull/:assessmentId", authenticateSyncDevice, pullPackage);
+// Whole Main Examination in one shot — authorized by the exam_code
+// itself rather than the per-assessment scope table (see generateExamCode
+// in mainExam.controller.js and pullExamPackage in syncController.js).
+router.get("/pull-exam/:examCode", authenticateSyncDevice, pullExamPackage);
 router.post("/push", authenticateSyncDevice, pushResults);
 // Was missing entirely — the local server's "Check sync token status"
 // button (GET /local-sync/my-assessments) had nothing to hit and always

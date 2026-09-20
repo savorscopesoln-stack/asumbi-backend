@@ -15,13 +15,39 @@ const toInt = (v) => {
   return Number.isNaN(n) ? null : n;
 };
 
+// BUGFIX (subject time selection saving 2h off, e.g. typing 7:00 shows
+// back as 9:00): the dashboard sends a naive "YYYY-MM-DDTHH:mm:00"
+// wall-clock string with NO timezone offset (see combineDateTime in
+// MainExaminationDashboard.jsx). Per the ES2015 Date Time String
+// Format, a datetime string with no offset is parsed as LOCAL time of
+// whatever machine runs the parsing code — i.e. this server's own TZ
+// setting, which has nothing to do with the school's timezone. mssql
+// then reads that Date back out with its own (default useUTC:true)
+// UTC getters when building the value it sends to SQL Server. Those
+// two independent, invisible conversions stacking on top of each
+// other is exactly what produced the offset. Appending "Z" pins the
+// string to be parsed as that literal instant, so the wall-clock
+// numbers the admin typed pass through unchanged regardless of this
+// server process's TZ — matching how mssql's useUTC:true will read it
+// back later (see splitDateTime()'s matching UTC getters on the
+// frontend, and fmtTime/fmtDate in shared.jsx).
 const toDateTime = (v) => {
+  if (!v) return null;
+  const s = String(v);
+  const isBareDateTime = s.includes("T") && !/Z$|[+-]\d\d:\d\d$/.test(s);
+  const d = new Date(isBareDateTime ? `${s}Z` : s);
+  return Number.isNaN(d.getTime()) ? null : d;
+};
+
+// Date-only strings ("YYYY-MM-DD") are already spec'd as UTC midnight
+// with no ambiguity, so they don't need the "Z" treatment above — kept
+// as a separate alias (rather than sharing toDateTime's body) so that
+// stays true even if toDateTime's datetime-specific logic changes later.
+const toDateOnly = (v) => {
   if (!v) return null;
   const d = new Date(v);
   return Number.isNaN(d.getTime()) ? null : d;
 };
-
-const toDateOnly = toDateTime;
 
 /* Loads the parent Main Examination or null. Used everywhere below so a
    subject session can never be created/edited against a main exam id

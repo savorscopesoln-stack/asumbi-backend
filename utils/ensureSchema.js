@@ -1402,6 +1402,31 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       )
     `);
 
+    // exam_code patch: a short, human-typeable code an admin can hand to
+    // an invigilator so the local exam server can pull the WHOLE main
+    // examination (every subject's questions/roster + the timetable) in
+    // one shot, instead of authorizing/pulling each subject's assessment
+    // one at a time. Nullable/unique so existing rows are unaffected
+    // until someone actually generates one (see generateExamCode() in
+    // mainExam.controller.js). See modules/sync/routes.js on the local
+    // exam server + GET /local-sync/pull-exam/:examCode below for how
+    // it's consumed.
+    await pool.request().query(`
+      IF NOT EXISTS (
+        SELECT * FROM sys.columns
+        WHERE Name = N'exam_code' AND Object_ID = Object_ID(N'main_examinations')
+      )
+      ALTER TABLE main_examinations ADD exam_code NVARCHAR(20) NULL
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (
+        SELECT * FROM sys.indexes
+        WHERE name = N'UQ_main_examinations_exam_code' AND object_id = Object_ID(N'main_examinations')
+      )
+      CREATE UNIQUE NONCLUSTERED INDEX UQ_main_examinations_exam_code
+      ON main_examinations(exam_code) WHERE exam_code IS NOT NULL
+    `);
+
     /* ---------------- exam_subject_sessions ----------------
        One row per subject/learning-area sitting inside a Main
        Examination (§4). Holds ONLY the scheduling/venue metadata —

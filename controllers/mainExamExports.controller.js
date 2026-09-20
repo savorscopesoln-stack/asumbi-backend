@@ -99,7 +99,13 @@ const SHAPES = {
       { header: "Assessment No", key: "admission_no", width: 16 },
       { header: "Gender", key: "gender", width: 8 },
       { header: "Name", key: "name", width: 26 },
-      ...nominalSubjects.map((s, i) => ({ header: s.subject, key: `subj_${i}`, width: 12 })),
+      // Columns are headed by a short generated code, not the full
+      // subject name — this schema has no subject-code table, so
+      // assignSubjectCodes() in mainExamAnalytics.controller.js derives
+      // one per exam. The "Nominal Roll Key" section right after this
+      // table is what makes that unambiguous — never ship the codes
+      // without it (§51).
+      ...nominalSubjects.map((s, i) => ({ header: s.code || s.subject, key: `subj_${i}`, width: 12 })),
       { header: "Average %", key: "average_percentage", width: 10, percent: true },
     ];
     const nominalRows = (nr.rows || []).map((r) => {
@@ -114,6 +120,9 @@ const SHAPES = {
       return row;
     });
 
+    const keyCols = [{ header: "Code", key: "code", width: 10 }, { header: "Subject", key: "subject", width: 30 }];
+    const keyRows = nominalSubjects.map((s) => ({ code: s.code || "—", subject: s.subject }));
+
     return {
       title: "Main Examination Summary",
       excelSheets: [
@@ -122,6 +131,7 @@ const SHAPES = {
         { name: "Subject Summary", title: "Performance by Subject", columns: subjectCols, rows: subjectRows },
         { name: "Grade Distribution", title: "Grade Distribution", columns: gradeCols, rows: gradeRows, note: gradeNote },
         { name: "Nominal Roll", title: "Nominal Roll", columns: nominalCols, rows: nominalRows, note: !nominalRows.length ? "No registered candidates found." : null },
+        { name: "Nominal Roll Key", title: "Nominal Roll — Subject Code Key", columns: keyCols, rows: keyRows, note: !keyRows.length ? "No subjects with an attached assessment yet." : null },
       ],
       pdfSections: [
         { heading: "Candidate Statistics", columns: overviewCols, rows: overviewRows },
@@ -129,6 +139,7 @@ const SHAPES = {
         { heading: "Performance by Subject", columns: subjectCols, rows: subjectRows },
         { heading: "Grade Distribution", columns: gradeCols, rows: gradeRows, text: gradeNote || undefined },
         { heading: "Nominal Roll", columns: nominalCols, rows: nominalRows },
+        { heading: "Nominal Roll — Subject Code Key", columns: keyCols, rows: keyRows },
       ],
     };
   },
@@ -269,11 +280,15 @@ const SHAPES = {
       { header: "Venue", key: "venue", width: 16 },
       { header: "Status", key: "status", width: 12 },
     ];
+    // timeZone: "UTC" — see the note on fmtTime/fmtDate in shared.jsx.
+    // Without it, this export would print the schedule shifted by
+    // whatever timezone this Node server process happens to be
+    // running in, instead of the wall-clock time actually stored.
     const rows = (data.timetable || []).map((r) => ({
       ...r,
-      exam_date: r.exam_date ? new Date(r.exam_date).toLocaleDateString() : "-",
-      start_time: r.start_time ? new Date(r.start_time).toLocaleString() : "-",
-      end_time: r.end_time ? new Date(r.end_time).toLocaleString() : "-",
+      exam_date: r.exam_date ? new Date(r.exam_date).toLocaleDateString(undefined, { timeZone: "UTC" }) : "-",
+      start_time: r.start_time ? new Date(r.start_time).toLocaleString(undefined, { timeZone: "UTC" }) : "-",
+      end_time: r.end_time ? new Date(r.end_time).toLocaleString(undefined, { timeZone: "UTC" }) : "-",
     }));
     return {
       title: "Examination Timetable",
@@ -291,11 +306,12 @@ const SHAPES = {
       { header: "Venue", key: "venue", width: 16 },
       { header: "Status", key: "status", width: 12 },
     ];
+    // timeZone: "UTC" — see the note in the timetable() export just above.
     const rows = (data.rows || []).map((r) => ({
       ...r,
-      exam_date: r.exam_date ? new Date(r.exam_date).toLocaleDateString() : "-",
-      start_time: r.start_time ? new Date(r.start_time).toLocaleString() : "-",
-      end_time: r.end_time ? new Date(r.end_time).toLocaleString() : "-",
+      exam_date: r.exam_date ? new Date(r.exam_date).toLocaleDateString(undefined, { timeZone: "UTC" }) : "-",
+      start_time: r.start_time ? new Date(r.start_time).toLocaleString(undefined, { timeZone: "UTC" }) : "-",
+      end_time: r.end_time ? new Date(r.end_time).toLocaleString(undefined, { timeZone: "UTC" }) : "-",
     }));
     return {
       title: `Candidate Schedule — ${data.student?.name || ""}`,

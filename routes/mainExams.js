@@ -10,6 +10,7 @@ const {
   deleteMainExamination,
   getMainExaminationDashboard,
   getMainExaminationAuditLog,
+  generateExamCode,
 } = require("../controllers/mainExam.controller");
 
 const {
@@ -67,6 +68,9 @@ router.delete("/:id", deleteMainExamination);
 /* ---------------- Dashboard summary + audit log (§10, §53 — Phase 7) ---------------- */
 router.get("/:id/dashboard", getMainExaminationDashboard);
 router.get("/:id/audit-log", getMainExaminationAuditLog);
+
+/* ---------------- Exam code (whole-exam local download) ---------------- */
+router.post("/:id/exam-code", generateExamCode);
 
 /* ---------------- Subject / learning-area scheduling (§4-§6) ---------------- */
 router.get("/:mainExamId/subjects", getSubjectSessions);

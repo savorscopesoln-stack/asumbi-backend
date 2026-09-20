@@ -1,4 +1,5 @@
 const sql = require("mssql");
+const crypto = require("crypto");
 const { logExamAudit } = require("../utils/examAuditLog");
 
 /* =========================================================================
@@ -534,6 +535,81 @@ const getMainExaminationAuditLog = async (req, res) => {
   }
 };
 
+/* =========================================================================
+   EXAM CODE (whole-exam local download)
+   Generates (or, on request, regenerates) a short, human-typeable code
+   for this Main Examination — an invigilator types this once into the
+   local exam server's admin panel to pull down EVERY subject's
+   questions/roster plus the timetable in one shot, instead of
+   authorizing and pulling each subject's assessment individually. See
+   GET /local-sync/pull-exam/:examCode in syncController.js for the
+   consuming side.
+
+   8 chars drawn from an unambiguous alphabet (no 0/O/1/I/L) so it reads
+   and re-types cleanly off a whiteboard/screen; re-rolls on the rare
+   collision against the unique index rather than trusting randomness
+   alone.
+========================================================================= */
+const EXAM_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+function randomExamCode() {
+  let out = "";
+  const bytes = crypto.randomBytes(8);
+  for (let i = 0; i < 8; i++) out += EXAM_CODE_ALPHABET[bytes[i] % EXAM_CODE_ALPHABET.length];
+  return out;
+}
+
+const generateExamCode = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const id = toInt(req.params.id);
+    if (!id) return res.status(400).json({ success: false, message: "Invalid id" });
+
+    const examResult = await pool.request()
+      .input("id", sql.Int, id)
+      .query(`SELECT id, exam_code FROM main_examinations WHERE id = @id`);
+    const examination = examResult.recordset[0];
+    if (!examination) return res.status(404).json({ success: false, message: "Main examination not found" });
+
+    // Already has one and the caller didn't explicitly ask to roll a new
+    // one — just hand back the existing code so re-clicking "Generate"
+    // doesn't invalidate a code an invigilator may already have written
+    // down, unless they explicitly asked to regenerate.
+    if (examination.exam_code && !req.body?.regenerate) {
+      return res.json({ success: true, exam_code: examination.exam_code });
+    }
+
+    let code = null;
+    for (let attempt = 0; attempt < 5 && !code; attempt++) {
+      const candidate = randomExamCode();
+      const clash = await pool.request()
+        .input("code", sql.NVarChar(20), candidate)
+        .query(`SELECT 1 FROM main_examinations WHERE exam_code = @code`);
+      if (!clash.recordset.length) code = candidate;
+    }
+    if (!code) {
+      return res.status(500).json({ success: false, message: "Could not generate a unique exam code — please try again" });
+    }
+
+    await pool.request()
+      .input("id", sql.Int, id)
+      .input("code", sql.NVarChar(20), code)
+      .query(`UPDATE main_examinations SET exam_code = @code, updatedAt = GETDATE() WHERE id = @id`);
+
+    await logExamAudit(pool, {
+      mainExaminationId: id,
+      action: "exam_code_generated",
+      actorId: req.user?.id,
+      actorRole: req.user?.role,
+      details: { regenerated: !!examination.exam_code },
+    });
+
+    res.json({ success: true, exam_code: code });
+  } catch (err) {
+    console.error("GENERATE EXAM CODE ERROR:", err);
+    res.status(500).json({ success: false, message: "Server error generating exam code" });
+  }
+};
+
 module.exports = {
   createMainExamination,
   getMainExaminations,
@@ -543,4 +619,5 @@ module.exports = {
   deleteMainExamination,
   getMainExaminationDashboard,
   getMainExaminationAuditLog,
+  generateExamCode,
 };
