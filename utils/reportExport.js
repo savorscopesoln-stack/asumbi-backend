@@ -306,6 +306,118 @@ function addPageNumbers(doc) {
   doc.fillColor("#000");
 }
 
+
+/* ── Official-style examination timetable (matches the on-screen
+   Timetable tab): # | Day / Date (merged down the day) | Time | S/N |
+   Subject | Duration | Venue, with green "Break" rows derived from the
+   gap between one session's end and the next one's start that day.
+   `days` is [{ key: "2026-09-21", dayName, dateLabel, rows: [
+     { type: "exam", time, sn, subject, duration, venue } |
+     { type: "break", time, duration } ] }]. Built by SHAPES.timetable
+   in mainExamExports.controller.js. Long days split across pages with
+   the day cell repeated on the continuation. ── */
+function drawTimetablePdf(doc, { days }) {
+  const left = doc.page.margins.left;
+  const usable = doc.page.width - doc.page.margins.left - doc.page.margins.right;
+  const fixed = { num: 26, day: 100, time: 112, sn: 30, dur: 86, venue: 84 };
+  const subjW = usable - (fixed.num + fixed.day + fixed.time + fixed.sn + fixed.dur + fixed.venue);
+  const X = {};
+  let cx = left;
+  [["num", fixed.num], ["day", fixed.day], ["time", fixed.time], ["sn", fixed.sn], ["subject", subjW], ["dur", fixed.dur], ["venue", fixed.venue]]
+    .forEach(([k, w]) => { X[k] = { x: cx, w }; cx += w; });
+
+  const PAD = 4;
+  const LINE = "#7B8494";
+  const GREEN = "#C6E0B4";
+  const bottomLimit = () => doc.page.height - doc.page.margins.bottom - 20;
+  let y = doc.y;
+
+  const cell = (k, top, h, text, opts = {}) => {
+    const { x, w } = X[k];
+    if (opts.fill) doc.rect(x, top, w, h).fill(opts.fill);
+    doc.lineWidth(0.5).strokeColor(LINE).rect(x, top, w, h).stroke();
+    if (text != null && text !== "") {
+      doc.fillColor("#000").font(opts.bold ? "Helvetica-Bold" : "Helvetica").fontSize(opts.size || 8)
+        .text(String(text), x + PAD, top + PAD, { width: w - PAD * 2, align: opts.align || "left" });
+    }
+  };
+
+  const header = () => {
+    const h = 18;
+    doc.rect(left, y, usable, h).fill("#2c3e50");
+    doc.fillColor("#fff").font("Helvetica-Bold").fontSize(7.5);
+    [["num", "#", "center"], ["day", "DAY / DATE"], ["time", "TIME"], ["sn", "S/N", "center"], ["subject", "SUBJECT"], ["dur", "DURATION"], ["venue", "VENUE"]]
+      .forEach(([k, label, align]) => doc.text(label, X[k].x + PAD, y + 5, { width: X[k].w - PAD * 2, align: align || "left" }));
+    doc.fillColor("#000");
+    y += h;
+  };
+
+  const rowHeight = (r) => {
+    if (r.type === "break") return 18;
+    doc.font("Helvetica-Bold").fontSize(8);
+    const hs = doc.heightOfString(String(r.subject || ""), { width: subjW - PAD * 2 });
+    doc.font("Helvetica");
+    const hd = doc.heightOfString(String(r.duration || ""), { width: fixed.dur - PAD * 2 });
+    const hv = doc.heightOfString(String(r.venue || "-"), { width: fixed.venue - PAD * 2 });
+    return Math.max(18, Math.max(hs, hd, hv) + PAD * 2);
+  };
+
+  if (!days.length) {
+    doc.fontSize(9).fillColor("#777").text("No subjects scheduled yet.", left, y + 6);
+    doc.fillColor("#000");
+    return;
+  }
+
+  header();
+
+  days.forEach((day, dayIdx) => {
+    let segment = [];
+    let segTop = y;
+
+    const flushSegment = () => {
+      if (!segment.length) return;
+      const total = segment.reduce((sum, r) => sum + r.h, 0);
+      // merged # and Day/Date cells spanning the whole segment
+      cell("num", segTop, total, `${dayIdx + 1}.`, { bold: true, align: "center" });
+      const { x, w } = X.day;
+      doc.lineWidth(0.5).strokeColor(LINE).rect(x, segTop, w, total).stroke();
+      doc.fillColor("#000").font("Helvetica-Bold").fontSize(8)
+        .text(String(day.dayName || "").toUpperCase(), x + PAD, segTop + PAD, { width: w - PAD * 2 });
+      doc.text(day.dateLabel, x + PAD, doc.y + 4, { width: w - PAD * 2 });
+      segment = [];
+    };
+
+    day.rows.forEach((r) => {
+      const h = rowHeight(r);
+      if (y + h > bottomLimit()) {
+        flushSegment();
+        doc.addPage();
+        y = doc.page.margins.top;
+        header();
+        segTop = y;
+      }
+      if (r.type === "break") {
+        cell("time", y, h, r.time, { bold: true, fill: GREEN });
+        cell("sn", y, h, "", { fill: GREEN });
+        cell("subject", y, h, "Break", { bold: true, fill: GREEN });
+        cell("dur", y, h, r.duration, { bold: true, fill: GREEN });
+        cell("venue", y, h, "", { fill: GREEN });
+      } else {
+        cell("time", y, h, r.time);
+        cell("sn", y, h, `${r.sn}.`, { align: "center" });
+        cell("subject", y, h, r.subject, { bold: true });
+        cell("dur", y, h, r.duration);
+        cell("venue", y, h, r.venue || "-");
+      }
+      segment.push({ h });
+      y += h;
+    });
+    flushSegment();
+  });
+
+  doc.y = y + 10;
+}
+
 /* Builds a full PDF report: header + one or more tables (with an
    optional section heading between them, for reports like the Summary
    that combine a few small tables — §30.1's "candidate statistics /
@@ -332,7 +444,9 @@ function buildReportPdf({ institution, examinationName, academicYear, reportTitl
         doc.fontSize(9).font("Helvetica").text(section.text);
         doc.moveDown(0.3);
       }
-      if (section.columns) {
+      if (section.timetable) {
+        drawTimetablePdf(doc, section.timetable);
+      } else if (section.columns) {
         drawPdfTable(doc, { columns: section.columns, rows: section.rows || [] });
       }
     });

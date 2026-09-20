@@ -56,6 +56,56 @@ const slug = (s) => String(s || "report").toLowerCase().replace(/[^a-z0-9]+/g, "
    a column added to one format is obviously missing if not added to the
    other.
 ------------------------------------------------------------------------- */
+
+/* Groups the timetable into days for the official-style PDF layout and
+   derives "Break" rows from gaps between consecutive sessions on the
+   same day — same logic as the on-screen Timetable tab. All times are
+   read with UTC getters (see the timezone note in SHAPES.timetable). */
+function buildTimetableDays(list) {
+  const mins = (v) => { if (!v) return null; const d = new Date(v); return Number.isNaN(d.getTime()) ? null : d.getUTCHours() * 60 + d.getUTCMinutes(); };
+  const clock = (m) => { const h = Math.floor(m / 60) % 24; return `${h % 12 === 0 ? 12 : h % 12}.${String(m % 60).padStart(2, "0")} ${h >= 12 ? "pm" : "am"}`; };
+  const dur = (m) => { if (!m || m <= 0) return "-"; const h = Math.floor(m / 60); const r = m % 60; return [h ? `${h} hour${h > 1 ? "s" : ""}` : "", r ? `${r} minutes` : ""].filter(Boolean).join(" "); };
+  const keyOf = (v) => { if (!v) return null; const d = new Date(v); return Number.isNaN(d.getTime()) ? null : d.toISOString().slice(0, 10); };
+
+  const sorted = [...list].sort((a, b) => new Date(a.start_time || a.exam_date || 0) - new Date(b.start_time || b.exam_date || 0));
+  const groups = new Map();
+  sorted.forEach((s) => {
+    const key = keyOf(s.exam_date || s.start_time);
+    if (!key) return;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(s);
+  });
+
+  let sn = 0;
+  return [...groups.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([key, sessions]) => {
+    const d = new Date(`${key}T00:00:00Z`);
+    const rows = [];
+    let prevEnd = null;
+    sessions.forEach((s) => {
+      const st = mins(s.start_time);
+      let en = mins(s.end_time);
+      if (en === null && st !== null && s.duration_minutes) en = st + Number(s.duration_minutes);
+      if (prevEnd !== null && st !== null && st > prevEnd) {
+        rows.push({ type: "break", time: `${clock(prevEnd)} - ${clock(st)}`, duration: dur(st - prevEnd) });
+      }
+      sn += 1;
+      const dm = s.duration_minutes ? Number(s.duration_minutes) : (st !== null && en !== null ? en - st : 0);
+      rows.push({
+        type: "exam", sn,
+        time: st !== null ? `${clock(st)}${en !== null ? ` - ${clock(en)}` : ""}` : "-",
+        subject: s.subject, duration: dur(dm), venue: s.venue,
+      });
+      if (en !== null) prevEnd = en;
+    });
+    return {
+      key,
+      dayName: d.toLocaleDateString("en-GB", { weekday: "long", timeZone: "UTC" }),
+      dateLabel: d.toLocaleDateString("en-GB", { day: "2-digit", month: "2-digit", year: "numeric", timeZone: "UTC" }),
+      rows,
+    };
+  });
+}
+
 const SHAPES = {
   summary(data) {
     const cs = data.candidate_stats || {};
@@ -293,7 +343,7 @@ const SHAPES = {
     return {
       title: "Examination Timetable",
       excelSheets: [{ name: "Timetable", title: "Examination Timetable", columns, rows }],
-      pdfSections: [{ columns, rows }],
+      pdfSections: [{ timetable: { days: buildTimetableDays(data.timetable || []) } }],
     };
   },
 
