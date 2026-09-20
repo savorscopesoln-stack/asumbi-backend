@@ -419,6 +419,36 @@ const pullExamPackage = async (req, res) => {
           roster: built.roster,
         },
       });
+
+      // BUGFIX ("can pull the whole exam but can't push it back"): the
+      // per-assessment pullPackage() above only ever runs for an
+      // assessment the admin explicitly authorized in
+      // e_assessment_sync_device_assessments first, and pushResults()
+      // checks that SAME table before accepting results. This
+      // whole-exam pull skips that per-assessment authorization step
+      // entirely (see the big comment on this function) — so without
+      // this insert, a device that only ever pulled via an exam code
+      // was never in that table for any of these subjects, and every
+      // single push it tried afterwards would be rejected with "This
+      // device is not authorized for that assessment". Knowing the
+      // exam code was already treated as sufficient authorization to
+      // pull; this makes it sufficient to push back, too, by recording
+      // it in the same table pushResults()/pullPackage() already trust
+      // — INSERT only if the pairing doesn't already exist, so this is
+      // safe to run again on every re-pull.
+      if (deviceId) {
+        await pool.request()
+          .input("device_id", sql.Int, deviceId)
+          .input("assessment_id", sql.Int, s.e_assessment_id)
+          .query(`
+            IF NOT EXISTS (
+              SELECT 1 FROM e_assessment_sync_device_assessments
+              WHERE device_id = @device_id AND e_assessment_id = @assessment_id
+            )
+            INSERT INTO e_assessment_sync_device_assessments (device_id, e_assessment_id)
+            VALUES (@device_id, @assessment_id)
+          `);
+      }
     }
 
     await logSyncAttempt(pool, {
