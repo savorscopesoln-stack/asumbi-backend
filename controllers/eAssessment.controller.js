@@ -588,10 +588,7 @@ const examLogin = async (req, res) => {
     if (assessment.exam_password !== examPassword) {
       return res.status(400).json({ success: false, message: "Incorrect exam password" });
     }
-    if (assessment.status && assessment.status !== "approved") {
-      return res.status(400).json({ success: false, message: "This assessment isn't open yet — check with your teacher." });
-    }
-    if (assessment.active_status && assessment.active_status !== "Active") {
+        if (assessment.active_status !== "Active") {
       return res.status(400).json({ success: false, message: "This assessment isn't active right now." });
     }
 
