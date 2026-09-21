@@ -319,10 +319,9 @@ const getEAssessments = async (req, res) => {
     // already used for the "assessment now open" notification), or a
     // whole-year assessment (ea.year_of_study matching their own
     // Students.yearOfStudy — see the ClassMultiSelect/year-of-study
-    // work on the admin side). Before this, every student saw every
-    // assessment ever created regardless of class — StudentEAssessments
-    // and TakeAssessmentPicker only ever filtered by approval status,
-    // never by class, because the API handed them everyone's exams.
+    // work on the admin side) — AND only ones that are currently Active
+    // (ea.active_status = 'Active'). Approval status no longer decides
+    // what a student sees; the Start/Stop (active_status) toggle does.
     const isTeacher = req.user?.role === "teacher";
     const isStudent = req.user?.role === "student";
 
@@ -355,12 +354,15 @@ const getEAssessments = async (req, res) => {
               SELECT 1 FROM e_assessment_question_setters qs
               WHERE qs.e_assessment_id = ea.id AND qs.teacher_id = @teacherId
             )` : isStudent ? `
-      WHERE ea.class_id IN (
-              SELECT c2.id FROM Classes c2
-              JOIN Students st ON st.studentClass = c2.name
-              WHERE st.id = @studentId
+      WHERE (
+              ea.class_id IN (
+                SELECT c2.id FROM Classes c2
+                JOIN Students st ON st.studentClass = c2.name
+                WHERE st.id = @studentId
+              )
+              OR ea.year_of_study = (SELECT yearOfStudy FROM Students WHERE id = @studentId)
             )
-         OR ea.year_of_study = (SELECT yearOfStudy FROM Students WHERE id = @studentId)` : ""}
+        AND ea.active_status = 'Active'` : ""}
       ORDER BY ea.id DESC
     `);
     const rows = (result.recordset || []).map((r) => redactForRole(r, req.user?.role));
@@ -588,7 +590,11 @@ const examLogin = async (req, res) => {
     if (assessment.exam_password !== examPassword) {
       return res.status(400).json({ success: false, message: "Incorrect exam password" });
     }
-        if (assessment.active_status !== "Active") {
+    // Only the Start/Stop (active_status) toggle decides whether students
+    // can enter — approval status is no longer checked here. Strict
+    // comparison on purpose: a NULL active_status is NOT treated as active,
+    // matching the student list query in getEAssessments.
+    if (assessment.active_status !== "Active") {
       return res.status(400).json({ success: false, message: "This assessment isn't active right now." });
     }
 
