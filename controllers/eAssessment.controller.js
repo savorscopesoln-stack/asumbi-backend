@@ -9,6 +9,7 @@ const { notifyUsers, notifyOne } = require("../utils/notify");
 const { withTransientRetry, isTransientDbError } = require("../utils/transientDbRetry");
 const { coverPageUrlFor, deleteCoverPageByUrl } = require("../middleware/coverPageUpload");
 const { QUESTION_IMAGES_DIR, questionImageUrlFor, deleteQuestionImageByUrl } = require("../middleware/questionImageUpload");
+const { saveViolationPhoto, violationPhotoUrlFor } = require("../middleware/violationPhotoUpload");
 const { getPool, listTenantKeys } = require("../config/db");
 
 /* =========================================================================
@@ -1544,6 +1545,96 @@ const unlockExamSession = async (req, res) => {
 };
 
 /* =========================================================================
+   CAMERA VIOLATION PHOTOS
+   Student side: TakeEAssessment.jsx's webcam eye/gaze check no longer
+   locks the exam on its own (see the HONEST SCOPE NOTE at the top of
+   that file) — instead it silently, continuously uploads a timestamped,
+   captioned snapshot from the student's own camera every time their
+   eyes are off the screen, for an invigilator to review afterward.
+   Admin side: getViolationPhotos lets that review actually happen —
+   listed per exam session, newest first, alongside the same student/
+   assessment context as getExamSessions above.
+========================================================================= */
+const uploadViolationPhoto = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const student_id = req.user?.id;
+    const { assessment_id, token, device_id, image, reason } = req.body;
+    const e_assessment_id = toInt(assessment_id);
+
+    if (!student_id) return res.status(401).json({ success: false, message: "Unauthorized" });
+    if (!e_assessment_id || !token || !image) {
+      return res.status(400).json({ success: false, message: "assessment_id, token and image are required" });
+    }
+    // Same guardrail as every other exam-session endpoint: an exam-only
+    // token is only ever valid for the one assessment it was issued for.
+    if (req.user?.examOnly && req.user.examAssessmentId !== e_assessment_id) {
+      return res.status(403).json({ success: false, message: "This exam session isn't valid for this assessment" });
+    }
+
+    const sessionRes = await pool.request()
+      .input("token", sql.Char(6), token)
+      .input("sid", sql.Int, student_id)
+      .input("aid", sql.Int, e_assessment_id)
+      .query(`SELECT id FROM e_assessment_exam_sessions WHERE token = @token AND student_id = @sid AND e_assessment_id = @aid`);
+    if (!sessionRes.recordset.length) {
+      return res.status(404).json({ success: false, message: "Exam session not found" });
+    }
+    const sessionId = sessionRes.recordset[0].id;
+
+    let filename;
+    try {
+      filename = saveViolationPhoto(image);
+    } catch (imgErr) {
+      return res.status(400).json({ success: false, message: imgErr.message || "Invalid image" });
+    }
+
+    await pool.request()
+      .input("session_id", sql.Int, sessionId)
+      .input("e_assessment_id", sql.Int, e_assessment_id)
+      .input("student_id", sql.Int, student_id)
+      .input("device_id", sql.NVarChar(200), device_id || "")
+      .input("reason", sql.NVarChar(300), (reason || "").slice(0, 300))
+      .input("photo_url", sql.NVarChar(500), violationPhotoUrlFor(filename))
+      .query(`
+        INSERT INTO e_assessment_violation_photos
+          (session_id, e_assessment_id, student_id, device_id, reason, photo_url)
+        VALUES (@session_id, @e_assessment_id, @student_id, @device_id, @reason, @photo_url)
+      `);
+
+    // Fire-and-forget from the student's point of view — this must never
+    // slow down or interrupt the exam they're sitting.
+    res.json({ success: true });
+  } catch (err) {
+    console.error("UPLOAD VIOLATION PHOTO ERROR:", err);
+    res.status(500).json({ success: false, message: "Failed to save violation photo" });
+  }
+};
+
+// Admin: review the evidence photos captured for one exam session (see
+// getExamSessions above for the row this drills into).
+const getViolationPhotos = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const sessionId = toInt(req.params.sessionId);
+    if (!sessionId) return res.status(400).json({ message: "sessionId is required" });
+
+    const result = await pool.request()
+      .input("session_id", sql.Int, sessionId)
+      .query(`
+        SELECT id, session_id, e_assessment_id, student_id, device_id, reason, photo_url, createdAt
+        FROM e_assessment_violation_photos
+        WHERE session_id = @session_id
+        ORDER BY createdAt DESC
+      `);
+    res.json(result.recordset || []);
+  } catch (err) {
+    console.error("GET VIOLATION PHOTOS ERROR:", err);
+    res.status(500).json([]);
+  }
+};
+
+/* =========================================================================
    STUDENT — SUBMIT / RESULT
 ========================================================================= */
 const submitEAssessment = async (req, res) => {
@@ -2776,6 +2867,9 @@ module.exports = {
   // exam session / device lock
   startExamSession, activateExamSession, heartbeatExamSession, endExamSession,
   getExamSessions, unlockExamSession,
+
+  // camera violation photos (evidence capture, no longer a lock trigger)
+  uploadViolationPhoto, getViolationPhotos,
 
   // student
   submitEAssessment, getStudentResult,

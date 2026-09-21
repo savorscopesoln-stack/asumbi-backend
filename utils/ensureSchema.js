@@ -1132,6 +1132,39 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       )
     `);
 
+    /* ---------------- e_assessment_violation_photos ----------------
+       Evidence photos from TakeEAssessment.jsx's webcam eye/gaze check.
+       That check no longer locks the exam by itself (see the HONEST
+       SCOPE NOTE at the top of that file) — instead it continuously
+       uploads a timestamped, captioned snapshot from the student's own
+       camera every time their eyes are off the screen, for an admin/
+       invigilator to review afterward via getViolationPhotos. One row
+       per photo, not per session — a single session can (and often
+       will) have several. No FK constraint, same as the other
+       e_assessment_* support tables in this file. */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='e_assessment_violation_photos' AND xtype='U')
+      CREATE TABLE e_assessment_violation_photos (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        session_id INT NOT NULL,
+        e_assessment_id INT NOT NULL,
+        student_id INT NOT NULL,
+        device_id NVARCHAR(200) NULL,
+        reason NVARCHAR(300) NULL,
+        photo_url NVARCHAR(500) NOT NULL,
+        createdAt DATETIME NOT NULL DEFAULT GETDATE()
+      )
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (
+        SELECT * FROM sys.indexes
+        WHERE name = 'IX_e_assessment_violation_photos_session'
+        AND object_id = OBJECT_ID('e_assessment_violation_photos')
+      )
+      CREATE INDEX IX_e_assessment_violation_photos_session
+      ON e_assessment_violation_photos (session_id, createdAt DESC)
+    `);
+
     /* ---------------- newsletter_subscribers table ----------------
        Backs POST /api/contact/newsletter (public) — the email field in
        the public website's Footer, same "used to go nowhere" gap as
@@ -1486,7 +1519,7 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       )
     `);
 
-    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, PortalPageSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, leave_outs code-verification columns, meal_daily_codes, leave_auto_approve, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl, Students.profileCompleted, student_profile_change_requests, website_content, contact_messages, newsletter_subscribers, e_assessments.cover_page_url, e_assessments.cover_page_width/height, e_assessment_question_images, e_assessment_sync_devices, e_assessment_sync_devices.tenant_key, e_assessment_sync_device_assessments, e_assessment_sync_logs, e_assessment_submissions.sync_batch_id, SchoolSettings, SchoolOfficials, GradingSystem, main_examinations, exam_subject_sessions, exam_audit_log)");
+    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, PortalPageSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, leave_outs code-verification columns, meal_daily_codes, leave_auto_approve, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl, Students.profileCompleted, student_profile_change_requests, website_content, contact_messages, newsletter_subscribers, e_assessments.cover_page_url, e_assessments.cover_page_width/height, e_assessment_question_images, e_assessment_violation_photos, e_assessment_sync_devices, e_assessment_sync_devices.tenant_key, e_assessment_sync_device_assessments, e_assessment_sync_logs, e_assessment_submissions.sync_batch_id, SchoolSettings, SchoolOfficials, GradingSystem, main_examinations, exam_subject_sessions, exam_audit_log)");
   } catch (err) {
     console.error("⚠️  Schema ensure failed:", err.message);
   }

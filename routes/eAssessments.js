@@ -20,6 +20,9 @@ const {
   startExamSession, activateExamSession, heartbeatExamSession, endExamSession,
   getExamSessions, unlockExamSession,
 
+  // camera violation photos (evidence capture, no longer a lock trigger)
+  uploadViolationPhoto, getViolationPhotos,
+
   // student
   submitEAssessment, getStudentResult,
 
@@ -149,6 +152,11 @@ router.post("/:id/start-exam", protect, authorize("student"), startExamSession);
 router.post("/exam-session/activate", protect, authorize("student"), activateExamSession);
 router.post("/exam-session/heartbeat", protect, authorize("student"), heartbeatExamSession);
 router.post("/exam-session/end", protect, authorize("student"), endExamSession);
+
+/* camera violation photos — student uploads (fire-and-forget, evidence
+   only, never a lock trigger), admin reviews per session */
+router.post("/violation-photo", protect, authorize("student"), uploadViolationPhoto);
+router.get("/admin/exam-sessions/:sessionId/violation-photos", protect, requirePage("E-Assessments"), getViolationPhotos);
 
 /* =========================================================================
    TEACHER / MARKING
