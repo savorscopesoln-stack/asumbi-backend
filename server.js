@@ -1447,6 +1447,116 @@ app.get("/api/marks/filter", protect, async (req, res) => {
 });
 
 /* =========================================================
+   MARKS REPORT — pick ONE, SEVERAL, or ALL assessments
+   GET /api/marks/report
+
+   The building block for transcripts and any other report that needs
+   more than "every mark this student has ever sat" (/api/student/marks,
+   no filtering) or "exactly one assessment" (/api/marks/:assessmentId).
+
+   Query params (one of studentId / classLevel is required):
+     studentId      -> marks for one student
+     classLevel     -> marks for every student in a class (Students.studentClass)
+     assessmentIds  -> comma-separated Assessments.id list, e.g. "4,7,9"
+                       (picks specific assessments — one, a few, or all of them)
+     examScope      -> 'main' or 'subject', used instead of assessmentIds to
+                       pull every assessment of that kind (e.g. every main
+                       exam a student has sat, for an end-of-year transcript)
+     term, year     -> optional extra narrowing alongside examScope
+
+   With none of assessmentIds/examScope given, every assessment the
+   student(s) have marks for is returned (equivalent to "all exams").
+
+   Response: { assessments: [...distinct assessments involved...],
+               marks: [...one row per student+assessment+subject...] }
+   so a transcript can build its columns from `assessments` and its rows
+   from `marks` without a second round trip.
+========================================================= */
+app.get("/api/marks/report", protect, async (req, res) => {
+  try {
+    const pool = req.pool;
+    const studentId = toInt(req.query.studentId);
+    const classLevel = req.query.class || req.query.classLevel;
+    if (!studentId && !classLevel) {
+      return res.status(400).json({ message: "studentId or classLevel is required" });
+    }
+
+    const assessmentIds = String(req.query.assessmentIds || "")
+      .split(",")
+      .map((v) => toInt(v))
+      .filter((v) => v != null);
+    const examScope = ["main", "subject"].includes(req.query.examScope) ? req.query.examScope : null;
+    const term = req.query.term || null;
+    const year = req.query.year || null;
+
+    const request = pool.request();
+    const filters = [];
+
+    if (studentId) {
+      request.input("studentId", sql.Int, studentId);
+      filters.push("m.studentId = @studentId");
+    }
+    if (classLevel) {
+      request.input("classLevel", sql.NVarChar, classLevel);
+      filters.push("s.studentClass = @classLevel");
+    }
+    if (assessmentIds.length) {
+      filters.push(`m.assessmentId IN (${assessmentIds.join(",")})`); // already sanitized via toInt
+    } else if (examScope) {
+      request.input("examScope", sql.NVarChar, examScope);
+      filters.push("a.examScope = @examScope");
+    }
+    if (term) {
+      request.input("term", sql.NVarChar, term);
+      filters.push("a.term = @term");
+    }
+    if (year) {
+      request.input("year", sql.NVarChar, year);
+      filters.push("a.year = @year");
+    }
+
+    const result = await request.query(`
+      SELECT
+        s.id AS studentId, s.name AS studentName, s.studentClass,
+        a.id AS assessmentId, a.name AS assessmentName, a.assessmentType,
+        a.examScope, a.term, a.year, a.totalMarks AS assessmentTotalMarks,
+        sub.id AS subjectId, sub.name AS subjectName,
+        m.score, m.percentage, m.grade
+      FROM Marks m
+      JOIN Students s ON s.id = m.studentId
+      JOIN Assessments a ON a.id = m.assessmentId
+      LEFT JOIN Subjects sub ON sub.id = m.subjectId
+      WHERE ${filters.join(" AND ")}
+      ORDER BY a.year, a.term, a.id, s.name, sub.name
+    `);
+
+    const rows = result.recordset || [];
+    const assessmentsById = new Map();
+    for (const r of rows) {
+      if (!assessmentsById.has(r.assessmentId)) {
+        assessmentsById.set(r.assessmentId, {
+          id: r.assessmentId,
+          name: r.assessmentName,
+          assessmentType: r.assessmentType,
+          examScope: r.examScope,
+          term: r.term,
+          year: r.year,
+          totalMarks: r.assessmentTotalMarks,
+        });
+      }
+    }
+
+    res.json({
+      assessments: Array.from(assessmentsById.values()),
+      marks: rows,
+    });
+  } catch (err) {
+    console.log("MARKS REPORT ERROR:", err);
+    res.status(500).json({ message: "Failed to build marks report" });
+  }
+});
+
+/* =========================================================
    CLASSES / STUDENTS / SUBJECTS FROM ASSESSMENT
    (fixed: parameterized — was raw string interpolation)
 ========================================================= */

@@ -1519,7 +1519,100 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       )
     `);
 
-    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, PortalPageSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, leave_outs code-verification columns, meal_daily_codes, leave_auto_approve, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl, Students.profileCompleted, student_profile_change_requests, website_content, contact_messages, newsletter_subscribers, e_assessments.cover_page_url, e_assessments.cover_page_width/height, e_assessment_question_images, e_assessment_violation_photos, e_assessment_sync_devices, e_assessment_sync_devices.tenant_key, e_assessment_sync_device_assessments, e_assessment_sync_logs, e_assessment_submissions.sync_batch_id, SchoolSettings, SchoolOfficials, GradingSystem, main_examinations, exam_subject_sessions, exam_audit_log)");
+    /* ---------------- Assessments: examScope / sourceSystem / sourceRefId ----------------
+       Labels each Assessments row so Marks (which already carries
+       assessmentId + subjectId per row — see routes/marks.js /
+       server.js "MARKS" section) can be grouped and filtered
+       meaningfully when generating reports/transcripts:
+
+       - examScope: 'main' = a combined, whole-cohort event that spans
+         many subjects at once (an Endterm/Midterm exam series — one
+         Assessments row per subject paper, all sharing the same
+         name/term/year). 'subject' = a one-off, single-subject
+         assessment (a CAT, an assignment) with no sibling papers.
+         Nothing here auto-detects which is which for existing rows
+         beyond the AssessmentSubjects-count heuristic below; staff can
+         relabel individual assessments after this migration runs.
+
+       - sourceSystem / sourceRefId: which subsystem actually produced
+         this assessment record. 'manual' = created directly via
+         POST /api/assessments (routes/assessments.js), the normal
+         teacher/admin flow — sourceRefId stays NULL. 'e_assessment' =
+         auto-provisioned so an online e_assessments exam has a proper
+         Assessments row to hang its released Marks off of (see
+         ensureAssessmentForEAssessment() in eAssessment.controller.js);
+         sourceRefId is that e_assessments.id.
+
+         This directly fixes a real bug: releaseMarks()/bulkReleaseMarks()
+         in eAssessment.controller.js used to INSERT INTO Marks with
+         assessmentId = e_assessments.id, while every manually-entered
+         mark uses assessmentId = Assessments.id. Same column, two
+         unrelated id spaces, silently. From now on Marks.assessmentId
+         ALWAYS points at Assessments.id — e_assessment-sourced marks
+         included — via the ensure-or-create helper. */
+    await pool.request().query(`
+      IF NOT EXISTS (
+        SELECT * FROM sys.columns
+        WHERE Name = N'examScope' AND Object_ID = Object_ID(N'Assessments')
+      )
+      ALTER TABLE Assessments ADD examScope NVARCHAR(20) NOT NULL DEFAULT 'subject'
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (
+        SELECT * FROM sys.columns
+        WHERE Name = N'sourceSystem' AND Object_ID = Object_ID(N'Assessments')
+      )
+      ALTER TABLE Assessments ADD sourceSystem NVARCHAR(20) NOT NULL DEFAULT 'manual'
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (
+        SELECT * FROM sys.columns
+        WHERE Name = N'sourceRefId' AND Object_ID = Object_ID(N'Assessments')
+      )
+      ALTER TABLE Assessments ADD sourceRefId INT NULL
+    `);
+
+    // One-time backfill, guarded so it only ever runs against rows still
+    // sitting on the DEFAULT 'subject' label (i.e. never touches anything
+    // staff have since relabeled by hand): any Assessments row entered
+    // for more than one subject (AssessmentSubjects) is almost certainly
+    // a combined main-exam paper series rather than a single-subject
+    // assessment, so flip those to 'main'.
+    await pool.request().query(`
+      UPDATE a SET a.examScope = 'main'
+      FROM Assessments a
+      WHERE a.examScope = 'subject'
+        AND (SELECT COUNT(*) FROM AssessmentSubjects ast WHERE ast.assessmentId = a.id) > 1
+    `);
+
+    // Lets a report/transcript query pull "marks for these N assessments,
+    // for this student/subject" without a table scan on Marks.
+    await pool.request().query(`
+      IF NOT EXISTS (
+        SELECT * FROM sys.indexes
+        WHERE name = N'IX_Marks_assessmentId_subjectId_studentId' AND object_id = Object_ID(N'Marks')
+      )
+      CREATE NONCLUSTERED INDEX IX_Marks_assessmentId_subjectId_studentId
+      ON Marks(assessmentId, subjectId, studentId)
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (
+        SELECT * FROM sys.indexes
+        WHERE name = N'IX_Marks_studentId' AND object_id = Object_ID(N'Marks')
+      )
+      CREATE NONCLUSTERED INDEX IX_Marks_studentId
+      ON Marks(studentId)
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (
+        SELECT * FROM sys.indexes
+        WHERE name = N'IX_Assessments_sourceSystem_sourceRefId' AND object_id = Object_ID(N'Assessments')
+      )
+      CREATE NONCLUSTERED INDEX IX_Assessments_sourceSystem_sourceRefId
+      ON Assessments(sourceSystem, sourceRefId)
+    `);
+
+    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, PortalPageSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, leave_outs code-verification columns, meal_daily_codes, leave_auto_approve, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl, Students.profileCompleted, student_profile_change_requests, website_content, contact_messages, newsletter_subscribers, e_assessments.cover_page_url, e_assessments.cover_page_width/height, e_assessment_question_images, e_assessment_violation_photos, e_assessment_sync_devices, e_assessment_sync_devices.tenant_key, e_assessment_sync_device_assessments, e_assessment_sync_logs, e_assessment_submissions.sync_batch_id, SchoolSettings, SchoolOfficials, GradingSystem, main_examinations, exam_subject_sessions, exam_audit_log, Assessments.examScope/sourceSystem/sourceRefId, Marks indexes)");
   } catch (err) {
     console.error("⚠️  Schema ensure failed:", err.message);
   }

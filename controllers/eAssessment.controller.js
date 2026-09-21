@@ -2591,6 +2591,83 @@ ORDER BY s.released_at DESC
   }
 };
 
+/* =========================================================================
+   ENSURE ASSESSMENT FOR E-ASSESSMENT  (schema fix — §"Marks labeling")
+
+   Marks.assessmentId is meant to always point at Assessments.id — that's
+   how routes/assessments.js, server.js's /api/marks/* endpoints, and the
+   new /api/marks/report endpoint all read it. Historically, releasing an
+   online exam's marks broke that: it inserted e_assessments.id directly
+   into Marks.assessmentId instead, so the same column silently pointed
+   into two unrelated tables depending on where a mark came from.
+
+   This get-or-creates a real Assessments row for a given e_assessment
+   (tagged sourceSystem='e_assessment', sourceRefId=<e_assessments.id> so
+   it's never duplicated on a second release) and returns its id, so every
+   Marks row — manual or online — is consistent from here on.
+
+   Runs inside the caller's transaction so it commits/rolls back with the
+   rest of the release.
+========================================================================= */
+const ensureAssessmentForEAssessment = async (transaction, eAssessmentId, subjectId) => {
+  const existing = await new sql.Request(transaction)
+    .input("sourceRefId", sql.Int, eAssessmentId)
+    .query(`
+      SELECT TOP 1 id FROM Assessments
+      WHERE sourceSystem = 'e_assessment' AND sourceRefId = @sourceRefId
+    `);
+  if (existing.recordset.length) return existing.recordset[0].id;
+
+  const eaResult = await new sql.Request(transaction)
+    .input("id", sql.Int, eAssessmentId)
+    .query(`
+      SELECT ea.id, ea.title, ea.subject, ea.total_marks, ea.class_id,
+             c.name AS class_name,
+             ess.main_examination_id, me.term, me.academic_year
+      FROM e_assessments ea
+      LEFT JOIN Classes c ON c.id = ea.class_id
+      LEFT JOIN exam_subject_sessions ess ON ess.e_assessment_id = ea.id
+      LEFT JOIN main_examinations me ON me.id = ess.main_examination_id
+      WHERE ea.id = @id
+    `);
+  const ea = eaResult.recordset[0];
+
+  // A subject slot inside a Main Examination is a combined, multi-paper
+  // event ('main'); a standalone CAT/assignment turned into an
+  // e-assessment is a one-off single-subject assessment ('subject').
+  const examScope = ea?.main_examination_id ? "main" : "subject";
+
+  const insertResult = await new sql.Request(transaction)
+    .input("name", sql.NVarChar, ea?.title || "Online Assessment")
+    .input("assessmentType", sql.NVarChar, "E-Assessment")
+    .input("targetClass", sql.NVarChar, ea?.class_name || "")
+    .input("term", sql.NVarChar, ea?.term || "")
+    .input("year", sql.NVarChar, ea?.academic_year || "")
+    .input("totalMarks", sql.Int, ea?.total_marks || 100)
+    .input("examScope", sql.NVarChar, examScope)
+    .input("sourceRefId", sql.Int, eAssessmentId)
+    .query(`
+      INSERT INTO Assessments
+      (name, assessmentType, targetClass, term, year, totalMarks, status, examScope, sourceSystem, sourceRefId)
+      OUTPUT INSERTED.id
+      VALUES
+      (@name, @assessmentType, @targetClass, @term, @year, @totalMarks, 'Active', @examScope, 'e_assessment', @sourceRefId)
+    `);
+  const assessmentId = insertResult.recordset[0].id;
+
+  if (subjectId) {
+    await new sql.Request(transaction)
+      .input("assessmentId", sql.Int, assessmentId)
+      .input("subjectId", sql.Int, subjectId)
+      .query(`
+        IF NOT EXISTS (SELECT 1 FROM AssessmentSubjects WHERE assessmentId = @assessmentId AND subjectId = @subjectId)
+        INSERT INTO AssessmentSubjects (assessmentId, subjectId) VALUES (@assessmentId, @subjectId)
+      `);
+  }
+
+  return assessmentId;
+};
+
 const releaseMarks = async (req, res) => {
   const pool = req.pool;
   const transaction = new sql.Transaction(pool);
@@ -2621,10 +2698,16 @@ WHERE s.id = @id
       .query(`SELECT TOP 1 id FROM Subjects WHERE name = @subjectName`);
     const subjectId = subjectLookup.recordset[0]?.id || null;
 
+    // Get-or-create the Assessments row this e_assessment maps to, so
+    // Marks.assessmentId points at Assessments.id like every other mark
+    // (see ensureAssessmentForEAssessment above — this used to insert
+    // sub.assessment_id, which was actually e_assessments.id).
+    const assessmentId = await ensureAssessmentForEAssessment(transaction, sub.assessment_id, subjectId);
+
     await new sql.Request(transaction)
       .input("studentId", sql.Int, sub.student_id)
       .input("subjectId", sql.Int, subjectId)
-      .input("assessmentId", sql.Int, sub.assessment_id)
+      .input("assessmentId", sql.Int, assessmentId)
       .input("score", sql.Int, sub.score)
       .input("percentage", sql.Float, percentage)
       .query(`
@@ -2681,10 +2764,15 @@ const bulkReleaseMarks = async (req, res) => {
           .query(`SELECT TOP 1 id FROM Subjects WHERE name = @subjectName`);
         const subjectId = subjectLookup.recordset[0]?.id || null;
 
+        // Get-or-create the Assessments row this e_assessment maps to —
+        // see ensureAssessmentForEAssessment above; keeps this in sync
+        // with the single releaseMarks() fix.
+        const assessmentId = await ensureAssessmentForEAssessment(transaction, sub.assessment_id, subjectId);
+
         await new sql.Request(transaction)
           .input("studentId", sql.Int, sub.student_id)
           .input("subjectId", sql.Int, subjectId)
-          .input("assessmentId", sql.Int, sub.assessment_id)
+          .input("assessmentId", sql.Int, assessmentId)
           .input("score", sql.Int, sub.score)
           .input("percentage", sql.Float, percentage)
           .query(`

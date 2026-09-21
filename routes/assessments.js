@@ -98,9 +98,20 @@ router.post("/", async (req, res) => {
     const pool = req.pool;
     const a = req.body;
 
+    // examScope labels whether this is a combined, multi-subject event
+    // ('main' — an Endterm/Midterm series) or a single-subject one-off
+    // ('subject' — a CAT/assignment). Respect an explicit value from the
+    // caller; otherwise fall back to the same heuristic the schema
+    // backfill uses — more than one subject attached means it's almost
+    // certainly a paper series. Whitelisted, not interpolated raw, since
+    // it goes straight into the VALUES list below.
+    const examScope = a.examScope === "main" || a.examScope === "subject"
+      ? a.examScope
+      : (Array.isArray(a.subjects) && a.subjects.length > 1 ? "main" : "subject");
+
     const result = await pool.request().query(`
       INSERT INTO Assessments
-      (name, assessmentType, targetClass, term, year, totalMarks, startDate, endDate, status)
+      (name, assessmentType, targetClass, term, year, totalMarks, startDate, endDate, status, examScope)
       OUTPUT INSERTED.id
       VALUES
       (
@@ -112,7 +123,8 @@ router.post("/", async (req, res) => {
         ${Number(a.totalMarks || 100)},
         ${a.startDate ? `'${a.startDate}'` : "NULL"},
         ${a.endDate ? `'${a.endDate}'` : "NULL"},
-        'Active'
+        'Active',
+        '${examScope}'
       )
     `);
 
