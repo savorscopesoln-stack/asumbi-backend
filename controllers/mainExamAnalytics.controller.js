@@ -337,6 +337,74 @@ function assignClassPositions(rows) {
   });
 }
 
+// Overall (whole main-examination) rank by average_percentage descending —
+// same standard-competition-ranking (1, 2, 2, 4, ...) as
+// assignClassPositions above, but computed across every candidate in the
+// exam instead of within their own class/stream. This is the "Overall
+// Position" figure for the Main Examination Summary report — kept as its
+// own pass over the same rows (never re-deriving average_percentage) so it
+// can never disagree with either the per-class position or the Nominal
+// Roll's own average_percentage (§51). Candidates with no scored subject
+// yet get a null position rather than a fabricated rank.
+function assignOverallPositions(rows) {
+  const sorted = [...rows].sort((a, b) => {
+    if (a.average_percentage == null && b.average_percentage == null) return 0;
+    if (a.average_percentage == null) return 1;
+    if (b.average_percentage == null) return -1;
+    return b.average_percentage - a.average_percentage;
+  });
+  let rank = 0, seen = 0, lastScore = null;
+  sorted.forEach((r) => {
+    seen += 1;
+    if (r.average_percentage == null) { r.overall_position = null; return; }
+    if (lastScore === null || r.average_percentage !== lastScore) {
+      rank = seen;
+      lastScore = r.average_percentage;
+    }
+    r.overall_position = rank;
+  });
+}
+
+// Class Performance roll-up for the Main Examination Summary report — one
+// row per class/stream, built by grouping the Nominal Roll's own
+// candidate rows and averaging their average_percentage (§51: reuses the
+// exact same per-candidate figure the roll and the Overall Performance
+// ranking already show, rather than a second, independently-derived class
+// mean). `passMark` is whatever computeMainExaminationSummary's own
+// performance.pass_mark already resolved to, so the pass rate here always
+// agrees with the exam-wide pass rate on the same summary.
+function computeClassPerformance(rows, passMark) {
+  const byClass = new Map();
+  rows.forEach((r) => {
+    const key = r.class || "Unassigned";
+    if (!byClass.has(key)) byClass.set(key, []);
+    byClass.get(key).push(r);
+  });
+  const out = [];
+  byClass.forEach((group, className) => {
+    const scored = group.filter((r) => r.average_percentage != null);
+    const mean = scored.length ? scored.reduce((s, r) => s + r.average_percentage, 0) / scored.length : null;
+    out.push({
+      class: className,
+      registered: group.length,
+      scored: scored.length,
+      mean: round1(mean),
+      highest: scored.length ? round1(Math.max(...scored.map((r) => r.average_percentage))) : null,
+      lowest: scored.length ? round1(Math.min(...scored.map((r) => r.average_percentage))) : null,
+      pass_rate: scored.length ? pct(scored.filter((r) => r.average_percentage >= passMark).length, scored.length) : null,
+    });
+  });
+  // Ranked class-to-class, best mean first — same "no data never beats a
+  // real score" rule as the candidate rankings above.
+  out.sort((a, b) => {
+    if (a.mean == null && b.mean == null) return String(a.class).localeCompare(String(b.class));
+    if (a.mean == null) return 1;
+    if (b.mean == null) return -1;
+    return b.mean - a.mean;
+  });
+  return out;
+}
+
 // Short column codes for the Nominal Roll (§30.1) — this schema has no
 // subject-code table, so codes are derived deterministically from the
 // subject name (first 4 letters/digits, uppercased) and de-duplicated
@@ -434,6 +502,7 @@ async function loadNominalRoll(pool, mainExaminationId) {
   });
 
   assignClassPositions(rows);
+  assignOverallPositions(rows);
   rows.sort((a, b) => {
     const classCmp = String(a.class || "").localeCompare(String(b.class || ""));
     if (classCmp !== 0) return classCmp;
@@ -920,6 +989,7 @@ module.exports = {
   // dashboard and the downloadable "Main Examination Summary" /
   // "Grade Distribution" reports can never disagree (§51).
   computeMainExaminationSummary,
+  computeClassPerformance,
   loadSubjectsWithAssessment,
   loadNominalRoll,
   // Exported so the Overview dashboard (mainExam.controller.js's
