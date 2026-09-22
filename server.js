@@ -288,7 +288,7 @@ app.use("/api/student-council", studentCouncilRoutes);
 // Student profile change-request queue — router applies protect/role
 // checks per-route internally (student submit/check vs admin review).
 app.use("/api/student/profile-change-requests", profileChangeRequestsRoutes);
-app.use("/", metaRoutes);
+app.use("/api/meta", protect, metaRoutes);
 
 // Sweeps ScheduledNotifications once a minute for anything due and sends
 // it out over its configured channels (in-app / email / SMS / WhatsApp).
