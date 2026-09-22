@@ -298,6 +298,66 @@ const archiveMainExamination = async (req, res) => {
 };
 
 /* =========================================================================
+   SET / UNSET AS REPORT-CARD EXAM
+   Exactly one Main Examination can be flagged as "the one students see
+   on their report card" at a time (§ student report card exam
+   selection — the "Show on Report Cards" button on the Main
+   Examinations list). Selecting a new one automatically unflags
+   whatever was selected before, so admins never have to remember to
+   unset the old one first.
+
+   GET /api/student/marks (routes/marks.js) reads main_examinations.
+   is_report_exam to both label the report card with this exam's name
+   and restrict the marks it shows to just this exam's subject papers.
+========================================================================= */
+const setReportCardExam = async (req, res) => {
+  const pool = req.pool;
+  const transaction = new sql.Transaction(pool);
+  try {
+    const id = toInt(req.params.id);
+    if (!id) return res.status(400).json({ success: false, message: "Invalid id" });
+
+    // Body-less PUT (or { active: true }) selects this exam; { active: false }
+    // just clears the flag if this exam happens to be the current one.
+    const active = req.body?.active !== false;
+
+    const existing = await pool.request()
+      .input("id", sql.Int, id)
+      .query(`SELECT id, name FROM main_examinations WHERE id = @id`);
+    if (!existing.recordset[0]) {
+      return res.status(404).json({ success: false, message: "Main examination not found" });
+    }
+
+    await transaction.begin();
+    if (active) {
+      await new sql.Request(transaction).query(`UPDATE main_examinations SET is_report_exam = 0 WHERE is_report_exam = 1`);
+      await new sql.Request(transaction)
+        .input("id", sql.Int, id)
+        .query(`UPDATE main_examinations SET is_report_exam = 1, updatedAt = GETDATE() WHERE id = @id`);
+    } else {
+      await new sql.Request(transaction)
+        .input("id", sql.Int, id)
+        .query(`UPDATE main_examinations SET is_report_exam = 0, updatedAt = GETDATE() WHERE id = @id`);
+    }
+    await transaction.commit();
+
+    await logExamAudit(pool, {
+      mainExaminationId: id,
+      action: active ? "report_card_exam_selected" : "report_card_exam_unselected",
+      actorId: req.user?.id,
+      actorRole: req.user?.role,
+      details: { name: existing.recordset[0].name },
+    });
+
+    res.json({ success: true, is_report_exam: active });
+  } catch (err) {
+    try { await transaction.rollback(); } catch (_) {}
+    console.error("SET REPORT CARD EXAM ERROR:", err);
+    res.status(500).json({ success: false, message: "Server error setting report card exam" });
+  }
+};
+
+/* =========================================================================
    DELETE (hard delete)
    Only allowed while the examination has no subject sessions attached
    yet — i.e. an admin who created it by mistake before scheduling
@@ -626,6 +686,7 @@ module.exports = {
   getMainExaminationById,
   updateMainExamination,
   archiveMainExamination,
+  setReportCardExam,
   deleteMainExamination,
   getMainExaminationDashboard,
   getMainExaminationAuditLog,

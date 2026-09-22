@@ -1589,6 +1589,33 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       )
     `);
 
+    /* ---------------- main_examinations.is_report_exam ----------------
+       Flags exactly one Main Examination as "the one students see on
+       their report card" (E-Assessments → Main Examinations → a "Show
+       on Report Cards" button per exam — see mainExam.controller.js's
+       setReportCardExam()). GET /api/student/marks (routes/marks.js)
+       reads this flag to both label the report card with this exam's
+       name and restrict the marks it shows to just this exam's subject
+       papers, via Marks.assessmentId → Assessments (sourceSystem=
+       'e_assessment', sourceRefId=e_assessments.id) → exam_subject_
+       sessions.e_assessment_id → main_examinations.id. Defaults to 0 for
+       every existing exam so nothing changes until an admin picks one. */
+    await pool.request().query(`
+      IF NOT EXISTS (
+        SELECT * FROM sys.columns
+        WHERE Name = N'is_report_exam' AND Object_ID = Object_ID(N'main_examinations')
+      )
+      ALTER TABLE main_examinations ADD is_report_exam BIT NOT NULL DEFAULT 0
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (
+        SELECT * FROM sys.indexes
+        WHERE name = N'IX_main_examinations_is_report_exam' AND object_id = Object_ID(N'main_examinations')
+      )
+      CREATE NONCLUSTERED INDEX IX_main_examinations_is_report_exam
+      ON main_examinations(is_report_exam)
+    `);
+
     /* ---------------- Assessments: examScope / sourceSystem / sourceRefId ----------------
        Labels each Assessments row so Marks (which already carries
        assessmentId + subjectId per row — see routes/marks.js /
@@ -1682,7 +1709,7 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       ON Assessments(sourceSystem, sourceRefId)
     `);
 
-    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, PortalPageSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, leave_outs code-verification columns, meal_daily_codes, leave_auto_approve, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl, Students.profileCompleted, student_profile_change_requests, website_content, contact_messages, newsletter_subscribers, e_assessments.cover_page_url, e_assessments.cover_page_width/height, e_assessment_question_images, e_assessment_violation_photos, e_assessment_sync_devices, e_assessment_sync_devices.tenant_key, e_assessment_sync_device_assessments, e_assessment_sync_logs, e_assessment_submissions.sync_batch_id, SchoolSettings, SchoolOfficials, GradingSystem, main_examinations, exam_subject_sessions, exam_audit_log, Assessments.examScope/sourceSystem/sourceRefId, Marks indexes)");
+    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, PortalPageSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, leave_outs code-verification columns, meal_daily_codes, leave_auto_approve, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl, Students.profileCompleted, student_profile_change_requests, website_content, contact_messages, newsletter_subscribers, e_assessments.cover_page_url, e_assessments.cover_page_width/height, e_assessment_question_images, e_assessment_violation_photos, e_assessment_sync_devices, e_assessment_sync_devices.tenant_key, e_assessment_sync_device_assessments, e_assessment_sync_logs, e_assessment_submissions.sync_batch_id, SchoolSettings, SchoolOfficials, GradingSystem, main_examinations, exam_subject_sessions, exam_audit_log, Assessments.examScope/sourceSystem/sourceRefId, Marks indexes, main_examinations.is_report_exam)");
   } catch (err) {
     console.error("⚠️  Schema ensure failed:", err.message);
   }

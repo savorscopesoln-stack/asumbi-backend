@@ -193,7 +193,21 @@ app.get("/api/marks/:assessmentId", async (req, res) => {
 });
 /* =====================================================
    GET STUDENT MARKS (for result slip / student portal)
-===================================================== */
+
+   If an admin has picked a "report card exam" (E-Assessments → Main
+   Examinations → "Show on Report Cards" — see setReportCardExam() in
+   mainExam.controller.js), this only returns marks for that exam's
+   subject papers, and stamps each row with that exam's name so
+   StudentReport.jsx's report card can display it. The link from a
+   Marks row back to a Main Examination runs through the same chain
+   ensureAssessmentForEAssessment() (eAssessment.controller.js) already
+   set up for the "examScope" fix: Marks.assessmentId → Assessments
+   (sourceSystem='e_assessment', sourceRefId=e_assessments.id) →
+   exam_subject_sessions.e_assessment_id → main_examinations.id.
+
+   If no exam has been picked yet (a school that hasn't used this
+   feature, or between exams), this falls back to every mark on record
+   for the student — the same behaviour as before this feature existed. */
 app.get("/api/student/marks", async (req, res) => {
   try {
     const pool = req.pool || req.app.locals.pool;
@@ -201,24 +215,50 @@ app.get("/api/student/marks", async (req, res) => {
     const studentId = toNum(req.query.studentId);
     if (!studentId) return res.json([]);
 
-    const result = await pool.request()
-      .input("studentId", studentId)
-      .query(`
-        SELECT
-          m.studentId,
-          m.subjectId,
-          sub.name AS subjectName,
-          sub.code AS subjectCode,
-          m.assessmentId,
-          m.score,
-          m.percentage,
-          m.grade,
-          m.createdAt
-        FROM Marks m
-        LEFT JOIN Subjects sub ON sub.id = m.subjectId
-        WHERE m.studentId = @studentId
-        ORDER BY m.createdAt DESC
-      `);
+    const activeExamResult = await pool.request().query(`
+      SELECT TOP 1 id, name FROM main_examinations WHERE is_report_exam = 1
+    `);
+    const activeExam = activeExamResult.recordset?.[0] || null;
+
+    const request = pool.request().input("studentId", studentId);
+    let query = `
+      SELECT
+        m.studentId,
+        m.subjectId,
+        sub.name AS subjectName,
+        sub.code AS subjectCode,
+        m.assessmentId,
+        m.score,
+        m.percentage,
+        m.grade,
+        m.createdAt
+    `;
+
+    if (activeExam) {
+      request.input("mainExaminationId", activeExam.id);
+      query += `, @examName AS examName`;
+      request.input("examName", activeExam.name);
+    }
+
+    query += `
+      FROM Marks m
+      LEFT JOIN Subjects sub ON sub.id = m.subjectId
+    `;
+
+    if (activeExam) {
+      query += `
+        INNER JOIN Assessments a ON a.id = m.assessmentId
+          AND a.sourceSystem = 'e_assessment'
+          AND a.sourceRefId IN (
+            SELECT ess.e_assessment_id FROM exam_subject_sessions ess
+            WHERE ess.main_examination_id = @mainExaminationId AND ess.e_assessment_id IS NOT NULL
+          )
+      `;
+    }
+
+    query += ` WHERE m.studentId = @studentId ORDER BY m.createdAt DESC`;
+
+    const result = await request.query(query);
 
     return res.json(result.recordset || []);
 

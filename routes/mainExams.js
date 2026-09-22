@@ -7,6 +7,7 @@ const {
   getMainExaminationById,
   updateMainExamination,
   archiveMainExamination,
+  setReportCardExam,
   deleteMainExamination,
   getMainExaminationDashboard,
   getMainExaminationAuditLog,
@@ -64,6 +65,10 @@ router.post("/", createMainExamination);
 router.get("/:id", getMainExaminationById);
 router.put("/:id", updateMainExamination);
 router.put("/:id/archive", archiveMainExamination);
+// "Show on Report Cards" — flags this exam (unflagging any other) as
+// the one GET /api/student/marks filters to and labels the report
+// card with. Body { active: false } clears the flag instead.
+router.put("/:id/report-exam", setReportCardExam);
 router.delete("/:id", deleteMainExamination);
 
 /* ---------------- Dashboard summary + audit log (§10, §53 — Phase 7) ---------------- */
