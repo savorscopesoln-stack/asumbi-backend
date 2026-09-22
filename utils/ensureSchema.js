@@ -1312,28 +1312,6 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       END
     `);
 
-    /* ---------------- SchoolSettings.reportTheme ----------------
-       Which color palette every downloaded PDF report (Main Examination
-       Summary, Subject Results, Grade Distribution, Timetable, etc. —
-       see utils/reportExport.js's buildReportPdf, the one shared PDF
-       engine every report export goes through, §33/§51) is drawn in.
-       Stores a theme KEY (e.g. "slate", "navy") from the fixed catalog
-       in utils/reportThemes.js, not raw colors — keeps every school on
-       one of a small set of vetted, readable palettes rather than a
-       free-form color picker that could produce an unreadable report
-       (white text on white, etc.). NULL/unrecognized = the original
-       slate/charcoal look every report already had, so nothing changes
-       for a school that never opens the new "Report Theme" picker on
-       the School Settings page. */
-    await pool.request().query(`
-      IF EXISTS (SELECT * FROM sysobjects WHERE name='SchoolSettings' AND xtype='U')
-      AND NOT EXISTS (
-        SELECT * FROM sys.columns
-        WHERE Name = N'reportTheme' AND Object_ID = Object_ID(N'SchoolSettings')
-      )
-      ALTER TABLE SchoolSettings ADD reportTheme NVARCHAR(30) NULL
-    `);
-
     /* ---------------- SchoolOfficials table ----------------
        Replaces the hand-typed "Dean of Curriculum" / "Chief Principal"
        names/titles that used to be scattered across result slips and

@@ -2,7 +2,6 @@ const express = require("express");
 const router = express.Router();
 const { protect, requirePage } = require("../middleware/authMiddleware");
 const { runWebsiteImageUpload, websiteImageUrlFor, deleteWebsiteImageByUrl } = require("../middleware/websitePhotoUpload");
-const { listReportThemes, DEFAULT_THEME_KEY } = require("../utils/reportThemes");
 
 /* =========================================================
    SCHOOL SETTINGS
@@ -52,15 +51,6 @@ module.exports = (poolPromise, sql) => {
     }
   });
 
-  /* ================= REPORT THEMES (public) =================
-     The fixed catalog the School Settings "Report Theme" picker and
-     admin form render from — see utils/reportThemes.js. Public for the
-     same reason GET / is: nothing sensitive, and it's just a static
-     list of color swatches. */
-  router.get("/report-themes", (req, res) => {
-    res.json({ themes: listReportThemes(), default: DEFAULT_THEME_KEY });
-  });
-
   /* ================= UPDATE SETTINGS (admin) ================= */
   router.put("/", protect, requirePage("School Settings"), async (req, res) => {
     try {
@@ -68,20 +58,11 @@ module.exports = (poolPromise, sql) => {
       const {
         schoolName, shortName, motto, centreCode,
         address, phone, email, website, numberOfClasses, logoUrl,
-        reportTheme,
       } = req.body || {};
 
       if (!schoolName || !String(schoolName).trim()) {
         return res.status(400).json({ message: "School name is required" });
       }
-
-      // Only ever persist a key from the known catalog (or NULL to fall
-      // back to the default look) — never an arbitrary string, since
-      // reportExport.js's resolveReportTheme() already treats anything
-      // unrecognized as the default, so silently accepting a typo'd key
-      // here would just be a no-op that looks like a saved choice.
-      const knownKeys = listReportThemes().map((t) => t.key);
-      const cleanReportTheme = reportTheme && knownKeys.includes(reportTheme) ? reportTheme : null;
 
       await pool.request()
         .input("schoolName", sql.NVarChar, schoolName)
@@ -94,7 +75,6 @@ module.exports = (poolPromise, sql) => {
         .input("website", sql.NVarChar, website || null)
         .input("numberOfClasses", sql.Int, numberOfClasses ? parseInt(numberOfClasses, 10) : null)
         .input("logoUrl", sql.NVarChar, logoUrl || null)
-        .input("reportTheme", sql.NVarChar, cleanReportTheme)
         .input("updatedBy", sql.Int, req.user?.id || null)
         .query(`
           UPDATE SchoolSettings SET
@@ -108,7 +88,6 @@ module.exports = (poolPromise, sql) => {
             website = @website,
             numberOfClasses = @numberOfClasses,
             logoUrl = @logoUrl,
-            reportTheme = @reportTheme,
             updatedAt = GETDATE(),
             updatedBy = @updatedBy
           WHERE id = 1
