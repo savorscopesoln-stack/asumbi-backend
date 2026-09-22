@@ -331,7 +331,9 @@ const getEAssessments = async (req, res) => {
 
     const result = await request.query(`
       SELECT ea.*, t.name AS teacher_name, c.name AS class_name,
-        ${isTeacher ? "CASE WHEN ea.teacher_id = @teacherId THEN 0 ELSE 1 END" : "0"} AS assigned_only
+        ${isTeacher ? "CASE WHEN ea.teacher_id = @teacherId THEN 0 ELSE 1 END" : "0"} AS assigned_only,
+        (SELECT COUNT(*) FROM e_assessment_questions eq WHERE eq.e_assessment_id = ea.id) AS question_count,
+        (SELECT COUNT(*) FROM e_assessment_submissions es WHERE es.e_assessment_id = ea.id) AS submission_count
         ${isStudent ? `,
         sub.id AS my_submission_id, sub.status AS my_submission_status,
         sub.score AS my_score, sub.submitted_at AS my_submitted_at` : ""}
@@ -369,21 +371,59 @@ const getEAssessments = async (req, res) => {
 
     // Attach each assessment's permitted question-setter teacher ids
     // (admin/sub_admin only need this — it's what pre-fills the "Teachers
-    // allowed to add questions" picker when they reopen Edit).
+    // allowed to add questions" picker when they reopen Edit) — plus their
+    // names, so the assessment card's "Teacher" row can show who's actually
+    // assigned to add questions instead of always reading "Not assigned"
+    // (ea.teacher_id, which teacher_name above comes from, is the exam's
+    // *owner/creator* and is usually blank for an admin-created assessment
+    // — a completely separate thing from who was picked as a question setter).
     if (rows.length && ["admin", "sub_admin", "sub_admin_2", "module_admin"].includes(req.user?.role)) {
       const setterResult = await pool.request().query(`
-        SELECT e_assessment_id, teacher_id FROM e_assessment_question_setters
+        SELECT qs.e_assessment_id, qs.teacher_id, t.name AS teacher_name
+        FROM e_assessment_question_setters qs
+        LEFT JOIN Teachers t ON t.id = qs.teacher_id
       `);
-      const byAssessment = {};
+      const idsByAssessment = {};
+      const namesByAssessment = {};
       for (const s of setterResult.recordset || []) {
-        (byAssessment[s.e_assessment_id] ||= []).push(s.teacher_id);
+        (idsByAssessment[s.e_assessment_id] ||= []).push(s.teacher_id);
+        (namesByAssessment[s.e_assessment_id] ||= []).push(s.teacher_name || `Teacher #${s.teacher_id}`);
       }
-      for (const r of rows) r.question_setter_teacher_ids = byAssessment[r.id] || [];
+      for (const r of rows) {
+        r.question_setter_teacher_ids = idsByAssessment[r.id] || [];
+        r.question_setter_names = namesByAssessment[r.id] || [];
+      }
     }
 
     res.json(rows);
   } catch (err) {
     console.error("GET ASSESSMENTS ERROR:", err);
+    res.status(500).json([]);
+  }
+};
+
+// Public (no-auth) preview — feeds the cover-page banner shown on the
+// standalone /take-assessment picker BEFORE a student logs in. A
+// student landing on that link has no session yet, so this can't use
+// getEAssessments' class/year targeting; it just returns the currently
+// Active, approved assessments that actually have a cover page
+// uploaded, and only the handful of non-sensitive fields needed to
+// render that banner (no questions, password, instructions, etc.).
+const getPublicAssessmentCovers = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const result = await pool.request().query(`
+      SELECT TOP 5 ea.id, ea.title, ea.subject,
+        ea.cover_page_url, ea.cover_page_width, ea.cover_page_height
+      FROM e_assessments ea
+      WHERE ea.active_status = 'Active'
+        AND ea.status = 'approved'
+        AND ea.cover_page_url IS NOT NULL
+      ORDER BY ea.id DESC
+    `);
+    res.json(result.recordset || []);
+  } catch (err) {
+    console.error("GET PUBLIC ASSESSMENT COVERS ERROR:", err);
     res.status(500).json([]);
   }
 };
@@ -2945,6 +2985,9 @@ module.exports = {
   createEAssessment, updateEAssessment, getEAssessments, getEAssessmentById,
   addEAssessmentQuestion, getAssessmentQuestions, updateQuestion, deleteQuestion,
   bulkAddQuestions, parseQuestionsDocx,
+
+  // public (no-auth) cover-page preview for the /take-assessment picker
+  getPublicAssessmentCovers,
 
   // cover page (per-exam PDF)
   uploadCoverPage, deleteCoverPage,

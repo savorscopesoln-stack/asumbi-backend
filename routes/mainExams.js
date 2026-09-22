@@ -108,6 +108,13 @@ router.get("/:mainExamId/subjects/:subjectId/analytics", getSubjectAnalytics);
    GET /:mainExamId/timetable above, mounted a second time here so it's
    reachable from a "Reports" tab without a second implementation. */
 router.get("/:mainExamId/reports/summary", getSummaryReport);
+// Class Performance Ranking and Overall Performance re-mount the exact
+// same Summary handler (its JSON already carries class_ranking and
+// overall_ranking — §51, one computation, never a second query) so
+// these can be viewed/downloaded as their own reports without
+// duplicating getSummaryReport's SQL.
+router.get("/:mainExamId/reports/class-ranking", getSummaryReport);
+router.get("/:mainExamId/reports/overall-performance", getSummaryReport);
 router.get("/:mainExamId/reports/timetable", getTimetable);
 router.get("/:mainExamId/reports/grade-distribution", getGradeDistributionReport);
 router.get("/:mainExamId/reports/marking-progress", getMarkingProgressReport);
@@ -125,6 +132,10 @@ router.get("/:mainExamId/reports/students/:studentId/schedule", getCandidateSche
    so a downloaded file is always consistent with the on-screen report. */
 router.get("/:mainExamId/reports/summary/excel", buildExportHandler("summary", "excel"));
 router.get("/:mainExamId/reports/summary/pdf", buildExportHandler("summary", "pdf"));
+router.get("/:mainExamId/reports/class-ranking/excel", buildExportHandler("class-ranking", "excel"));
+router.get("/:mainExamId/reports/class-ranking/pdf", buildExportHandler("class-ranking", "pdf"));
+router.get("/:mainExamId/reports/overall-performance/excel", buildExportHandler("overall-performance", "excel"));
+router.get("/:mainExamId/reports/overall-performance/pdf", buildExportHandler("overall-performance", "pdf"));
 router.get("/:mainExamId/reports/timetable/excel", buildExportHandler("timetable", "excel"));
 router.get("/:mainExamId/reports/timetable/pdf", buildExportHandler("timetable", "pdf"));
 router.get("/:mainExamId/reports/grade-distribution/excel", buildExportHandler("grade-distribution", "excel"));

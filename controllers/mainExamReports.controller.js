@@ -85,6 +85,10 @@ const getSummaryReport = async (req, res) => {
     // pass over the roll's own rows, never a second mean calculation).
     // Candidates with nothing scored yet are left off this ranked list —
     // they still appear in the Nominal Roll itself with a "—" position.
+    // `marks` is carried straight over from the Nominal Roll row (same
+    // per-subject scores, same order as `nominal_roll.subjects`) so this
+    // ranking can show what a candidate scored in every paper, not just
+    // their mean — never a second per-subject lookup.
     const overallRanking = (nominalRoll.rows || [])
       .filter((r) => r.average_percentage != null)
       .map((r) => ({
@@ -94,6 +98,7 @@ const getSummaryReport = async (req, res) => {
         name: r.name,
         class: r.class,
         average_percentage: r.average_percentage,
+        marks: r.marks,
       }))
       .sort((a, b) => a.overall_position - b.overall_position);
 
@@ -102,6 +107,34 @@ const getSummaryReport = async (req, res) => {
     // (data.performance.pass_mark), so it always agrees with the
     // exam-wide pass rate shown above it.
     const classPerformance = computeClassPerformance(nominalRoll.rows || [], data.performance.pass_mark);
+
+    // Class Performance Ranking — every scored candidate, ranked WITHIN
+    // their own class/stream (class_position, from loadNominalRoll's
+    // assignClassPositions — §51: same pass, same figure the Nominal
+    // Roll already shows for that candidate, never re-derived). Unlike
+    // Overall Performance above, position here resets per class, so a
+    // student can be e.g. "1st" in their class while sitting well down
+    // the exam-wide Overall Performance list. Grouped by class, then by
+    // position within it — the same order loadNominalRoll's own rows
+    // are already sorted in, so this is just that same list narrowed to
+    // scored candidates and carrying `class_position` instead of
+    // `overall_position`.
+    const classRanking = (nominalRoll.rows || [])
+      .filter((r) => r.average_percentage != null)
+      .map((r) => ({
+        class_position: r.class_position,
+        student_id: r.student_id,
+        admission_no: r.admission_no,
+        name: r.name,
+        class: r.class,
+        average_percentage: r.average_percentage,
+        marks: r.marks,
+      }))
+      .sort((a, b) => {
+        const classCmp = String(a.class || "").localeCompare(String(b.class || ""));
+        if (classCmp !== 0) return classCmp;
+        return a.class_position - b.class_position;
+      });
 
     res.json({
       success: true,
@@ -115,6 +148,7 @@ const getSummaryReport = async (req, res) => {
       subjects: data.subjects,
       overall_ranking: overallRanking,
       class_performance: classPerformance,
+      class_ranking: classRanking,
       nominal_roll: nominalRoll,
     });
   } catch (err) {

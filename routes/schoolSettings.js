@@ -35,20 +35,47 @@ module.exports = (poolPromise, sql) => {
       const settingsResult = await pool.request().query(
         `SELECT TOP 1 * FROM SchoolSettings WHERE id = 1`
       );
-      const officialsResult = await pool.request().query(
-        `SELECT * FROM SchoolOfficials ORDER BY sortOrder ASC, id ASC`
-      );
+      // LEFT JOIN Teachers so an official linked to a staff record (via
+      // teacherId) always shows that teacher's current name, even if it
+      // was edited after the official was linked — a hand-typed name
+      // (teacherId NULL) is left as-is.
+      const officialsResult = await pool.request().query(`
+        SELECT so.*, t.name AS teacherName, t.subject AS teacherSubject
+        FROM SchoolOfficials so
+        LEFT JOIN Teachers t ON t.id = so.teacherId
+        ORDER BY so.sortOrder ASC, so.id ASC
+      `);
+
+      const officials = (officialsResult.recordset || []).map((o) => ({
+        ...o,
+        name: o.teacherId ? (o.teacherName || o.name) : o.name,
+      }));
+
+      // Same LEFT JOIN pattern as officials above — a class teacher
+      // linked to a staff record (teacherId) always shows that
+      // teacher's current name; a hand-typed name is left as-is.
+      const classTeachersResult = await pool.request().query(`
+        SELECT ct.*, t.name AS teacherName, t.subject AS teacherSubject
+        FROM ClassTeachers ct
+        LEFT JOIN Teachers t ON t.id = ct.teacherId
+        ORDER BY ct.className ASC, ct.sortOrder ASC, ct.id ASC
+      `);
+      const classTeachers = (classTeachersResult.recordset || []).map((c) => ({
+        ...c,
+        name: c.teacherId ? (c.teacherName || c.name) : c.name,
+      }));
 
       res.json({
         settings: settingsResult.recordset[0] || null,
-        officials: officialsResult.recordset || [],
+        officials,
+        classTeachers,
       });
     } catch (err) {
       console.log("SCHOOL SETTINGS GET ERROR:", err.message);
       // Empty-shaped response, not a 500 — every screen that reads
       // this should fall back to its own generic default rather than
       // breaking a report download just because this lookup hiccups.
-      res.json({ settings: null, officials: [] });
+      res.json({ settings: null, officials: [], classTeachers: [] });
     }
   });
 
@@ -150,30 +177,48 @@ module.exports = (poolPromise, sql) => {
   });
 
   /* ================= OFFICIALS (admin) ================= */
+
+  /* Teachers picker for the "link to an existing teacher" option below —
+     lightweight list (no marks/attendance/etc.), gated by the same
+     School Settings page as everything else here. */
+  router.get("/officials/teachers", protect, requirePage("School Settings"), async (req, res) => {
+    try {
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
+      const result = await pool.request().query(
+        `SELECT id, name, subject, staffId FROM Teachers ORDER BY name ASC`
+      );
+      res.json({ teachers: result.recordset || [] });
+    } catch (err) {
+      console.log("SCHOOL OFFICIALS TEACHERS LIST ERROR:", err.message);
+      res.status(500).json({ message: "Failed to load teachers" });
+    }
+  });
+
   router.post("/officials", protect, requirePage("School Settings"), async (req, res) => {
     try {
       const pool = req.pool; // tenant-resolved by server.js DB middleware
-      const { title, name, sortOrder, isSignatory } = req.body || {};
+      const { title, name, teacherId, sortOrder, isSignatory } = req.body || {};
 
       if (!title || !String(title).trim()) {
-        return res.status(400).json({ message: "Title is required" });
+        return res.status(400).json({ message: "Rank / title is required" });
+      }
+      if (!teacherId && (!name || !String(name).trim())) {
+        return res.status(400).json({ message: "Pick a teacher or type a name" });
       }
 
-      // Only one signatory at a time — clear any existing one first
-      // when this new official is being marked as the signatory.
-      if (isSignatory) {
-        await pool.request().query(`UPDATE SchoolOfficials SET isSignatory = 0`);
-      }
-
+      // No more "only one signatory" rule — any number of officials can
+      // be flagged isSignatory and will all appear on a report; sortOrder
+      // doubles as the order they're signed/listed in.
       const result = await pool.request()
         .input("title", sql.NVarChar, title)
-        .input("name", sql.NVarChar, name || null)
+        .input("name", sql.NVarChar, teacherId ? null : name)
+        .input("teacherId", sql.Int, teacherId ? parseInt(teacherId, 10) : null)
         .input("sortOrder", sql.Int, sortOrder != null ? parseInt(sortOrder, 10) : 0)
         .input("isSignatory", sql.Bit, isSignatory ? 1 : 0)
         .query(`
-          INSERT INTO SchoolOfficials (title, name, sortOrder, isSignatory)
+          INSERT INTO SchoolOfficials (title, name, teacherId, sortOrder, isSignatory)
           OUTPUT INSERTED.*
-          VALUES (@title, @name, @sortOrder, @isSignatory)
+          VALUES (@title, @name, @teacherId, @sortOrder, @isSignatory)
         `);
 
       res.json({ success: true, official: result.recordset[0] });
@@ -186,25 +231,25 @@ module.exports = (poolPromise, sql) => {
   router.put("/officials/:id", protect, requirePage("School Settings"), async (req, res) => {
     try {
       const pool = req.pool; // tenant-resolved by server.js DB middleware
-      const { title, name, sortOrder, isSignatory } = req.body || {};
+      const { title, name, teacherId, sortOrder, isSignatory } = req.body || {};
 
       if (!title || !String(title).trim()) {
-        return res.status(400).json({ message: "Title is required" });
+        return res.status(400).json({ message: "Rank / title is required" });
       }
-
-      if (isSignatory) {
-        await pool.request().query(`UPDATE SchoolOfficials SET isSignatory = 0`);
+      if (!teacherId && (!name || !String(name).trim())) {
+        return res.status(400).json({ message: "Pick a teacher or type a name" });
       }
 
       await pool.request()
         .input("id", sql.Int, req.params.id)
         .input("title", sql.NVarChar, title)
-        .input("name", sql.NVarChar, name || null)
+        .input("name", sql.NVarChar, teacherId ? null : name)
+        .input("teacherId", sql.Int, teacherId ? parseInt(teacherId, 10) : null)
         .input("sortOrder", sql.Int, sortOrder != null ? parseInt(sortOrder, 10) : 0)
         .input("isSignatory", sql.Bit, isSignatory ? 1 : 0)
         .query(`
           UPDATE SchoolOfficials SET
-            title = @title, name = @name, sortOrder = @sortOrder,
+            title = @title, name = @name, teacherId = @teacherId, sortOrder = @sortOrder,
             isSignatory = @isSignatory, updatedAt = GETDATE()
           WHERE id = @id
         `);
@@ -226,6 +271,92 @@ module.exports = (poolPromise, sql) => {
     } catch (err) {
       console.log("SCHOOL OFFICIAL DELETE ERROR:", err.message);
       res.status(500).json({ message: "Failed to delete official" });
+    }
+  });
+
+  /* ================= CLASS TEACHERS / LECTURERS (admin) =================
+     Same shape as Officials above, but scoped to one class at a time —
+     every class picked up from Students.studentClass (see
+     GET /api/meta/classes) can be given its own "Class Teacher /
+     Lecturer" (rank/title editable, e.g. "Form Tutor", "Lecturer"),
+     optionally more than one per class (sortOrder as rank, e.g. a
+     main Class Teacher plus an Assistant). Consumed by the student's
+     own report card, which prints the assignment for the student's
+     class instead of a blank hand-signed line. */
+  router.post("/class-teachers", protect, requirePage("School Settings"), async (req, res) => {
+    try {
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
+      const { className, title, name, teacherId, sortOrder } = req.body || {};
+
+      if (!className || !String(className).trim()) {
+        return res.status(400).json({ message: "Class is required" });
+      }
+      if (!teacherId && (!name || !String(name).trim())) {
+        return res.status(400).json({ message: "Pick a teacher or type a name" });
+      }
+
+      const result = await pool.request()
+        .input("className", sql.NVarChar, className)
+        .input("title", sql.NVarChar, title && String(title).trim() ? title : "Class Teacher / Lecturer")
+        .input("name", sql.NVarChar, teacherId ? null : name)
+        .input("teacherId", sql.Int, teacherId ? parseInt(teacherId, 10) : null)
+        .input("sortOrder", sql.Int, sortOrder != null ? parseInt(sortOrder, 10) : 0)
+        .query(`
+          INSERT INTO ClassTeachers (className, title, name, teacherId, sortOrder)
+          OUTPUT INSERTED.*
+          VALUES (@className, @title, @name, @teacherId, @sortOrder)
+        `);
+
+      res.json({ success: true, classTeacher: result.recordset[0] });
+    } catch (err) {
+      console.log("CLASS TEACHER CREATE ERROR:", err.message);
+      res.status(500).json({ message: "Failed to add class teacher" });
+    }
+  });
+
+  router.put("/class-teachers/:id", protect, requirePage("School Settings"), async (req, res) => {
+    try {
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
+      const { className, title, name, teacherId, sortOrder } = req.body || {};
+
+      if (!className || !String(className).trim()) {
+        return res.status(400).json({ message: "Class is required" });
+      }
+      if (!teacherId && (!name || !String(name).trim())) {
+        return res.status(400).json({ message: "Pick a teacher or type a name" });
+      }
+
+      await pool.request()
+        .input("id", sql.Int, req.params.id)
+        .input("className", sql.NVarChar, className)
+        .input("title", sql.NVarChar, title && String(title).trim() ? title : "Class Teacher / Lecturer")
+        .input("name", sql.NVarChar, teacherId ? null : name)
+        .input("teacherId", sql.Int, teacherId ? parseInt(teacherId, 10) : null)
+        .input("sortOrder", sql.Int, sortOrder != null ? parseInt(sortOrder, 10) : 0)
+        .query(`
+          UPDATE ClassTeachers SET
+            className = @className, title = @title, name = @name,
+            teacherId = @teacherId, sortOrder = @sortOrder, updatedAt = GETDATE()
+          WHERE id = @id
+        `);
+
+      res.json({ success: true });
+    } catch (err) {
+      console.log("CLASS TEACHER UPDATE ERROR:", err.message);
+      res.status(500).json({ message: "Failed to update class teacher" });
+    }
+  });
+
+  router.delete("/class-teachers/:id", protect, requirePage("School Settings"), async (req, res) => {
+    try {
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
+      await pool.request()
+        .input("id", sql.Int, req.params.id)
+        .query(`DELETE FROM ClassTeachers WHERE id = @id`);
+      res.json({ success: true });
+    } catch (err) {
+      console.log("CLASS TEACHER DELETE ERROR:", err.message);
+      res.status(500).json({ message: "Failed to delete class teacher" });
     }
   });
 

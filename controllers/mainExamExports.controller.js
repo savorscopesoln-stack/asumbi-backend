@@ -50,6 +50,21 @@ async function loadExamHeaderInfo(pool, mainExamId) {
 
 const slug = (s) => String(s || "report").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
 
+/* Per-subject mark columns/values, shared by every report that lines a
+   candidate's papers up side by side (Nominal Roll, Overall Performance,
+   Class Performance Ranking) — one function so a column added to one of
+   these can never quietly drift out of sync with the others (§51). Keys
+   the same subj_${i} way nominalCols/nominalRows always have, against
+   the exam's own nominal_roll.subjects code list. */
+function subjectMarkColumns(nominalSubjects) {
+  return nominalSubjects.map((s, i) => ({ header: s.code || s.subject, key: `subj_${i}`, width: 12 }));
+}
+function subjectMarkValues(marks, base) {
+  const row = { ...base };
+  (marks || []).forEach((m, i) => { row[`subj_${i}`] = m.not_registered || m.score == null ? "—" : m.score; });
+  return row;
+}
+
 /* -------------------------------------------------------------------------
    One shape function per report type: given the report's own JSON, return
    { title, excelSheets: [...], pdfSections: [...] }. Kept side by side so
@@ -158,17 +173,13 @@ const SHAPES = {
       ...nominalSubjects.map((s, i) => ({ header: s.code || s.subject, key: `subj_${i}`, width: 12 })),
       { header: "Average %", key: "average_percentage", width: 10, percent: true },
     ];
-    const nominalRows = (nr.rows || []).map((r) => {
-      const row = {
-        class_position: r.class_position ?? "—",
-        admission_no: r.admission_no,
-        gender: r.gender || "—",
-        name: r.name,
-        average_percentage: r.average_percentage,
-      };
-      (r.marks || []).forEach((m, i) => { row[`subj_${i}`] = m.not_registered || m.score == null ? "—" : m.score; });
-      return row;
-    });
+    const nominalRows = (nr.rows || []).map((r) => subjectMarkValues(r.marks, {
+      class_position: r.class_position ?? "—",
+      admission_no: r.admission_no,
+      gender: r.gender || "—",
+      name: r.name,
+      average_percentage: r.average_percentage,
+    }));
 
     const keyCols = [{ header: "Code", key: "code", width: 10 }, { header: "Subject", key: "subject", width: 30 }];
     const keyRows = nominalSubjects.map((s) => ({ code: s.code || "—", subject: s.subject }));
@@ -177,14 +188,25 @@ const SHAPES = {
     // exam-wide by the mean (average_percentage), from
     // getSummaryReport's overall_ranking (§51 — same figure the Nominal
     // Roll already shows for that candidate, not a second calculation).
+    // Carries the same per-subject marks the Nominal Roll shows, via the
+    // shared subjectMarkColumns/subjectMarkValues helpers above, so this
+    // ranking doubles as a "how did they do in each paper" view, not
+    // just the mean.
     const overallCols = [
       { header: "Position", key: "overall_position", width: 10 },
       { header: "Admission No", key: "admission_no", width: 16 },
       { header: "Name", key: "name", width: 26 },
       { header: "Class", key: "class", width: 14 },
+      ...subjectMarkColumns(nominalSubjects),
       { header: "Mean (%)", key: "average_percentage", width: 12, percent: true },
     ];
-    const overallRows = data.overall_ranking || [];
+    const overallRows = (data.overall_ranking || []).map((r) => subjectMarkValues(r.marks, {
+      overall_position: r.overall_position,
+      admission_no: r.admission_no,
+      name: r.name,
+      class: r.class,
+      average_percentage: r.average_percentage,
+    }));
 
     // Class Performance — one row per class/stream, from
     // getSummaryReport's class_performance (§51 — rolled up from the same
@@ -201,6 +223,29 @@ const SHAPES = {
     ];
     const classRows = data.class_performance || [];
 
+    // Class Performance Ranking — every scored candidate, ranked WITHIN
+    // their own class (class_position, from getSummaryReport's
+    // class_ranking — §51, same figure the Nominal Roll already shows
+    // for that candidate). Distinct from Class Performance above, which
+    // is one aggregate row per class — this is one row per STUDENT,
+    // grouped by class, so a class teacher can see exactly where each
+    // of their students placed among their classmates, paper by paper.
+    const classRankingCols = [
+      { header: "Position", key: "class_position", width: 10 },
+      { header: "Admission No", key: "admission_no", width: 16 },
+      { header: "Name", key: "name", width: 26 },
+      { header: "Class", key: "class", width: 14 },
+      ...subjectMarkColumns(nominalSubjects),
+      { header: "Mean (%)", key: "average_percentage", width: 12, percent: true },
+    ];
+    const classRankingRows = (data.class_ranking || []).map((r) => subjectMarkValues(r.marks, {
+      class_position: r.class_position,
+      admission_no: r.admission_no,
+      name: r.name,
+      class: r.class,
+      average_percentage: r.average_percentage,
+    }));
+
     return {
       title: "Main Examination Summary",
       excelSheets: [
@@ -208,6 +253,7 @@ const SHAPES = {
         { name: "Performance", title: "Overall Performance", columns: overviewCols, rows: perfRows },
         { name: "Subject Summary", title: "Performance by Subject", columns: subjectCols, rows: subjectRows },
         { name: "Class Performance", title: "Class Performance", columns: classCols, rows: classRows, note: !classRows.length ? "No registered candidates found." : null },
+        { name: "Class Ranking", title: "Class Performance Ranking", columns: classRankingCols, rows: classRankingRows, note: !classRankingRows.length ? "No candidates have been scored yet." : null },
         { name: "Overall Ranking", title: "Overall Performance — Candidate Ranking", columns: overallCols, rows: overallRows, note: !overallRows.length ? "No candidates have been scored yet." : null },
         { name: "Grade Distribution", title: "Grade Distribution", columns: gradeCols, rows: gradeRows, note: gradeNote },
         { name: "Nominal Roll", title: "Nominal Roll", columns: nominalCols, rows: nominalRows, note: !nominalRows.length ? "No registered candidates found." : null },
@@ -218,6 +264,7 @@ const SHAPES = {
         { heading: "Overall Performance", columns: overviewCols, rows: perfRows },
         { heading: "Performance by Subject", columns: subjectCols, rows: subjectRows },
         { heading: "Class Performance", columns: classCols, rows: classRows },
+        { heading: "Class Performance Ranking", columns: classRankingCols, rows: classRankingRows },
         { heading: "Overall Performance — Candidate Ranking", columns: overallCols, rows: overallRows },
         { heading: "Grade Distribution", columns: gradeCols, rows: gradeRows, text: gradeNote || undefined },
         { heading: "Nominal Roll", columns: nominalCols, rows: nominalRows },
@@ -401,6 +448,63 @@ const SHAPES = {
       pdfSections: [{ columns, rows }],
     };
   },
+
+  /* Class Performance Ranking as its own downloadable report — same
+     rows/columns as the "Class Ranking" sheet inside the Summary export
+     above (§51: reuses getSummaryReport's class_ranking, never a second
+     query), just shaped as a standalone document for a class teacher who
+     only wants this one report rather than the full Summary bundle. */
+  classRanking(data) {
+    const nominalSubjects = (data.nominal_roll && data.nominal_roll.subjects) || [];
+    const columns = [
+      { header: "Position", key: "class_position", width: 10 },
+      { header: "Admission No", key: "admission_no", width: 16 },
+      { header: "Name", key: "name", width: 26 },
+      { header: "Class", key: "class", width: 14 },
+      ...subjectMarkColumns(nominalSubjects),
+      { header: "Mean (%)", key: "average_percentage", width: 12, percent: true },
+    ];
+    const rows = (data.class_ranking || []).map((r) => subjectMarkValues(r.marks, {
+      class_position: r.class_position,
+      admission_no: r.admission_no,
+      name: r.name,
+      class: r.class,
+      average_percentage: r.average_percentage,
+    }));
+    return {
+      title: "Class Performance Ranking",
+      excelSheets: [{ name: "Class Ranking", title: "Class Performance Ranking", columns, rows, note: !rows.length ? "No candidates have been scored yet." : null }],
+      pdfSections: [{ columns, rows, text: !rows.length ? "No candidates have been scored yet." : undefined }],
+    };
+  },
+
+  /* Overall Performance ranking as its own downloadable report — same
+     rows/columns (subjects included) as the "Overall Ranking" sheet
+     inside the Summary export above (§51), standalone for anyone who
+     only wants the exam-wide ranking rather than the full Summary. */
+  overallPerformance(data) {
+    const nominalSubjects = (data.nominal_roll && data.nominal_roll.subjects) || [];
+    const columns = [
+      { header: "Position", key: "overall_position", width: 10 },
+      { header: "Admission No", key: "admission_no", width: 16 },
+      { header: "Name", key: "name", width: 26 },
+      { header: "Class", key: "class", width: 14 },
+      ...subjectMarkColumns(nominalSubjects),
+      { header: "Mean (%)", key: "average_percentage", width: 12, percent: true },
+    ];
+    const rows = (data.overall_ranking || []).map((r) => subjectMarkValues(r.marks, {
+      overall_position: r.overall_position,
+      admission_no: r.admission_no,
+      name: r.name,
+      class: r.class,
+      average_percentage: r.average_percentage,
+    }));
+    return {
+      title: "Overall Performance — Candidate Ranking",
+      excelSheets: [{ name: "Overall Ranking", title: "Overall Performance — Candidate Ranking", columns, rows, note: !rows.length ? "No candidates have been scored yet." : null }],
+      pdfSections: [{ columns, rows, text: !rows.length ? "No candidates have been scored yet." : undefined }],
+    };
+  },
 };
 
 /* -------------------------------------------------------------------------
@@ -411,6 +515,8 @@ const SHAPES = {
 ------------------------------------------------------------------------- */
 const REPORTS = {
   summary: { handler: getSummaryReport, params: ["mainExamId"], shape: SHAPES.summary },
+  "class-ranking": { handler: getSummaryReport, params: ["mainExamId"], shape: SHAPES.classRanking },
+  "overall-performance": { handler: getSummaryReport, params: ["mainExamId"], shape: SHAPES.overallPerformance },
   "subject-results": { handler: getSubjectResultsReport, params: ["mainExamId", "subjectId"], shape: SHAPES.subjectResults },
   "student-result": { handler: getStudentResultReport, params: ["mainExamId", "studentId"], shape: SHAPES.studentResult },
   "class-results": { handler: getClassResultsReport, params: ["mainExamId", "classId"], shape: SHAPES.classResults },

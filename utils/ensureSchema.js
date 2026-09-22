@@ -1337,10 +1337,16 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
     /* ---------------- SchoolOfficials table ----------------
        Replaces the hand-typed "Dean of Curriculum" / "Chief Principal"
        names/titles that used to be scattered across result slips and
-       exam reports. Any number of officials, shown in sortOrder;
-       isSignatory marks the one whose name appears on the main
-       signature line of a certificate/result slip (defaults to the
-       first one seeded below). Managed from the School Settings page. */
+       exam reports. Any number of officials, shown in sortOrder (this
+       also doubles as their signing rank — 1 signs first, 2 second,
+       etc.); isSignatory marks EVERY official whose name should appear
+       on the signature line of a certificate/result slip — more than
+       one may be flagged at once, unlike the old single-signatory
+       design. An official's name can either be typed by hand (name
+       column) or linked live to an existing staff record via
+       teacherId, in which case the current Teachers.name is used
+       instead so the report stays correct if that teacher's name is
+       ever corrected. Managed from the School Settings page. */
     await pool.request().query(`
       IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='SchoolOfficials' AND xtype='U')
       BEGIN
@@ -1348,6 +1354,7 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
           id INT IDENTITY(1,1) PRIMARY KEY,
           title NVARCHAR(150) NOT NULL,
           name NVARCHAR(150) NULL,
+          teacherId INT NULL,
           sortOrder INT NOT NULL DEFAULT 0,
           isSignatory BIT NOT NULL DEFAULT 0,
           createdAt DATETIME NOT NULL DEFAULT GETDATE(),
@@ -1357,6 +1364,47 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
         INSERT INTO SchoolOfficials (title, name, sortOrder, isSignatory) VALUES
           ('Dean of Curriculum', NULL, 1, 0),
           ('Chief Principal', NULL, 2, 1)
+      END
+    `);
+
+    // Existing installs: add teacherId to link an official to a Teachers
+    // record instead of (or as well as) a hand-typed name — see above.
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='SchoolOfficials' AND xtype='U')
+      AND NOT EXISTS (
+        SELECT * FROM sys.columns
+        WHERE Name = N'teacherId' AND Object_ID = Object_ID(N'SchoolOfficials')
+      )
+      ALTER TABLE SchoolOfficials ADD teacherId INT NULL
+    `);
+
+    /* ---------------- ClassTeachers table ----------------
+       Unlike SchoolOfficials (one school-wide list of Principal/Dean/etc.
+       signatories), a Class Teacher / Lecturer is assigned per CLASS —
+       every class (studentClass, see /api/meta/classes) can have its own
+       named teacher, plus an optional co-rank (e.g. an Assistant Class
+       Teacher) via sortOrder. Consumed by StudentReport.jsx's "Class
+       Teacher / Lecturer's Remarks" box, which used to be a blank line
+       the teacher had to hand-sign with no name printed — it now looks
+       up the assignment for the student's own class and prints it, the
+       same way SchoolOfficials already does for Principal/Dean.
+       `title` is the RANK shown against the name (defaults to "Class
+       Teacher / Lecturer" but a school can relabel it "Form Tutor",
+       "Lecturer", "Class Prefect-in-Charge", etc.). `name` mirrors
+       SchoolOfficials' hand-typed-vs-linked-teacher pattern exactly. */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='ClassTeachers' AND xtype='U')
+      BEGIN
+        CREATE TABLE ClassTeachers (
+          id INT IDENTITY(1,1) PRIMARY KEY,
+          className NVARCHAR(100) NOT NULL,
+          title NVARCHAR(150) NOT NULL DEFAULT 'Class Teacher / Lecturer',
+          name NVARCHAR(150) NULL,
+          teacherId INT NULL,
+          sortOrder INT NOT NULL DEFAULT 0,
+          createdAt DATETIME NOT NULL DEFAULT GETDATE(),
+          updatedAt DATETIME NOT NULL DEFAULT GETDATE()
+        )
       END
     `);
 

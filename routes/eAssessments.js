@@ -7,6 +7,9 @@ const {
   addEAssessmentQuestion, getAssessmentQuestions, updateQuestion, deleteQuestion,
   bulkAddQuestions, parseQuestionsDocx,
 
+  // public (no-auth) cover-page preview for the /take-assessment picker
+  getPublicAssessmentCovers,
+
   // cover page (per-exam PDF)
   uploadCoverPage, deleteCoverPage,
 
@@ -175,6 +178,12 @@ router.post("/submissions/:id/request-remark", protect, authorize("student"), re
 /* =========================================================================
    CORE ASSESSMENT ROUTES
 ========================================================================= */
+// No `protect` — a student hits this before they've logged in at all
+// (see the /take-assessment picker's pre-login cover banner). Must
+// stay above the "/:id" route below so "/public/covers" isn't parsed
+// as an :id.
+router.get("/public/covers", getPublicAssessmentCovers);
+
 router.get("/", protect, getEAssessments);
 router.post("/", protect, authorize("teacher"), createEAssessment);
 router.put("/:id", protect, authorize("teacher"), updateEAssessment);

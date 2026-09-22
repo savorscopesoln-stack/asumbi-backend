@@ -70,6 +70,83 @@ const THEMES = {
     zebra: "#FBF3E3",
     rule: "#E4C98A",
   },
+  teal: {
+    name: "Teal",
+    primary: "#0F5E5A",
+    onPrimary: "#ffffff",
+    zebra: "#E9F5F4",
+    rule: "#B7DAD7",
+  },
+  crimson: {
+    name: "Crimson",
+    primary: "#8B1E2D",
+    onPrimary: "#ffffff",
+    zebra: "#FBEAEC",
+    rule: "#E3B7BD",
+  },
+  indigo: {
+    name: "Indigo",
+    primary: "#2F3C7E",
+    onPrimary: "#ffffff",
+    zebra: "#ECEEF8",
+    rule: "#C2C8E8",
+  },
+  emerald: {
+    name: "Emerald",
+    primary: "#0B6E4F",
+    onPrimary: "#ffffff",
+    zebra: "#E8F5EF",
+    rule: "#B3DCC9",
+  },
+  burntOrange: {
+    name: "Burnt Orange",
+    primary: "#9A3412",
+    onPrimary: "#ffffff",
+    zebra: "#FBEDE5",
+    rule: "#E7BFA9",
+  },
+  steel: {
+    name: "Steel Blue",
+    primary: "#33587A",
+    onPrimary: "#ffffff",
+    zebra: "#EBF1F6",
+    rule: "#C1D2E1",
+  },
+  plum: {
+    name: "Plum",
+    primary: "#5B2A5E",
+    onPrimary: "#ffffff",
+    zebra: "#F2EBF3",
+    rule: "#D6BFD8",
+  },
+  graphite: {
+    name: "Graphite",
+    primary: "#3A3F44",
+    onPrimary: "#ffffff",
+    zebra: "#EEEFF0",
+    rule: "#C9CCCF",
+  },
+  olive: {
+    name: "Olive",
+    primary: "#556B2F",
+    onPrimary: "#ffffff",
+    zebra: "#EFF3E7",
+    rule: "#CBD8B4",
+  },
+  burgundy: {
+    name: "Burgundy",
+    primary: "#4A0E1E",
+    onPrimary: "#ffffff",
+    zebra: "#F1E4E7",
+    rule: "#D3AEB6",
+  },
+  skyBlue: {
+    name: "Sky Blue",
+    primary: "#1D5A8A",
+    onPrimary: "#ffffff",
+    zebra: "#E9F2FA",
+    rule: "#B8D5EA",
+  },
 };
 
 const DEFAULT_THEME_KEY = "slate";
@@ -82,10 +159,24 @@ function resolveReportTheme(key) {
   return THEMES[key] || THEMES[DEFAULT_THEME_KEY];
 }
 
-// { key, name } list for the School Settings picker — GET
-// /api/school-settings/report-themes.
+// { key, name, primary, onPrimary, zebra, rule } list for the School
+// Settings picker — GET /api/school-settings/report-themes. Returns the
+// FULL palette (not just key/name/primary) so a frontend consumer can
+// fully theme a report with it too — e.g. StudentReport.jsx's on-screen/
+// printed report card, which used to stay a fixed maroon regardless of
+// the school's chosen reportTheme; it now resolves the same palette
+// object this list hands back and applies primary/onPrimary/zebra/rule
+// to its header band, section labels, table header and zebra rows.
+// None of this is sensitive — it's a static list of color swatches.
 function listReportThemes() {
-  return Object.entries(THEMES).map(([key, t]) => ({ key, name: t.name, primary: t.primary }));
+  return Object.entries(THEMES).map(([key, t]) => ({
+    key,
+    name: t.name,
+    primary: t.primary,
+    onPrimary: t.onPrimary,
+    zebra: t.zebra,
+    rule: t.rule,
+  }));
 }
 
 module.exports = { THEMES, DEFAULT_THEME_KEY, resolveReportTheme, listReportThemes };
