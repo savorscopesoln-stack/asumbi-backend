@@ -3,6 +3,7 @@ const fs = require("fs");
 const XLSX = require("xlsx");
 const JSZip = require("jszip");
 const PDFDocument = require("pdfkit");
+const { resolveReportTheme } = require("./reportThemes");
 
 /* =========================================================================
    REPORT EXPORT ENGINE (Phase 12-13 — §29, §31, §32, §33)
@@ -52,10 +53,15 @@ async function getInstitutionHeader(pool) {
       phone: settings.phone || "",
       email: settings.email || "",
       logoDiskPath,
+      // Raw stored key (may be null/unrecognized) — buildReportPdf
+      // resolves it to an actual palette via resolveReportTheme() so
+      // every call site agrees on the same "unknown key" fallback
+      // instead of each one re-implementing its own default.
+      reportTheme: settings.reportTheme || null,
     };
   } catch (err) {
     console.error("⚠️ Could not load institution header for report export:", err.message);
-    return { schoolName: "", address: "", phone: "", email: "", logoDiskPath: null };
+    return { schoolName: "", address: "", phone: "", email: "", logoDiskPath: null, reportTheme: null };
   }
 }
 
@@ -174,8 +180,11 @@ function sendExcelBuffer(res, buffer, filename) {
 ========================================================================= */
 
 /* Draws the §32 institutional header block: logo, institution name,
-   examination name, academic year, report title, generated date. */
-function drawPdfHeader(doc, institution, { examinationName, academicYear, reportTitle, subtitle }) {
+   examination name, academic year, report title, generated date.
+   `theme` — resolved palette from resolveReportTheme(), used for the
+   rule line under the header so the very first thing on the page
+   already signals which school's report this is. */
+function drawPdfHeader(doc, institution, { examinationName, academicYear, reportTitle, subtitle }, theme) {
   const startX = doc.page.margins.left;
   let textX = startX;
   if (institution.logoDiskPath) {
@@ -203,8 +212,10 @@ function drawPdfHeader(doc, institution, { examinationName, academicYear, report
   doc.fillColor("#000");
   doc.moveDown(1);
   // A rule under the header keeps every report visually consistent and
-  // clearly separates it from the table that follows.
-  doc.moveTo(startX, doc.y).lineTo(doc.page.width - doc.page.margins.right, doc.y).strokeColor("#ccc").stroke();
+  // clearly separates it from the table that follows — themed to the
+  // school's chosen report color rather than a fixed gray, so it (and
+  // every table header bar drawn later) reads as one consistent brand.
+  doc.moveTo(startX, doc.y).lineTo(doc.page.width - doc.page.margins.right, doc.y).strokeColor(theme.rule).stroke();
   doc.moveDown(0.8);
 }
 
@@ -219,7 +230,7 @@ function drawPdfHeader(doc, institution, { examinationName, academicYear, report
    the same factor so the table still spans the full page edge-to-edge
    (shrinking proportionally if the content is wider than one page,
    growing proportionally to fill leftover space if it's narrower). */
-function drawPdfTable(doc, { columns, rows }) {
+function drawPdfTable(doc, { columns, rows, theme }) {
   const pageLeft = doc.page.margins.left;
   const pageRight = doc.page.width - doc.page.margins.right;
   const usableWidth = pageRight - pageLeft;
@@ -247,16 +258,36 @@ function drawPdfTable(doc, { columns, rows }) {
   let y = doc.y;
 
   const drawHeaderRow = () => {
-    doc.rect(pageLeft, y, usableWidth, rowHeight).fill("#2c3e50");
-    doc.fillColor("#fff").fontSize(7.5).font("Helvetica-Bold");
+    doc.rect(pageLeft, y, usableWidth, rowHeight).fill(theme.primary);
+    doc.fillColor(theme.onPrimary).fontSize(7.5).font("Helvetica-Bold");
     let x = pageLeft;
     columns.forEach((c, i) => {
-      doc.text(c.header, x + 3, y + 4, { width: colWidths[i] - 6, align: c.align || "left" });
+      // lineBreak:false + ellipsis — every cell in this table is drawn at
+      // an absolute (x, y) the row loop below computes by hand, on the
+      // assumption every cell is exactly one line tall (rowHeight=16).
+      // Without this, pdfkit wraps any header/value wider than its
+      // column onto extra lines using its OWN auto-pagination — which
+      // silently inserts a page break mid-row when that wrapped text
+      // would run past the bottom margin, leaving the manual row loop's
+      // page-break check below out of sync with the real page count and
+      // producing stray near-blank pages in wide tables (e.g. the
+      // Nominal Roll, with one column per subject). Truncating to a
+      // single line keeps this loop the only thing that ever paginates.
+      doc.text(c.header, x + 3, y + 4, { width: colWidths[i] - 6, align: c.align || "left", lineBreak: false, ellipsis: true });
       x += colWidths[i];
     });
     doc.fillColor("#000").font("Helvetica");
     y += rowHeight;
   };
+
+  // Guard against an orphaned header row: if a heading/subtitle drawn
+  // just above (see buildReportPdf) left less than one row's worth of
+  // room at the bottom of the page, start the table on a fresh page
+  // instead of drawing a header row with no data rows visibly under it.
+  if (y + rowHeight > doc.page.height - doc.page.margins.bottom - 20) {
+    doc.addPage();
+    y = doc.page.margins.top;
+  }
 
   drawHeaderRow();
 
@@ -274,14 +305,17 @@ function drawPdfTable(doc, { columns, rows }) {
       drawHeaderRow();
     }
     if (idx % 2 === 1) {
-      doc.rect(pageLeft, y, usableWidth, rowHeight).fill("#f4f6f7");
+      doc.rect(pageLeft, y, usableWidth, rowHeight).fill(theme.zebra);
       doc.fillColor("#000");
     }
     doc.fontSize(7.5).font("Helvetica");
     let x = pageLeft;
     columns.forEach((c, i) => {
       const val = row[c.key];
-      doc.text(val == null || val === "" ? "-" : String(val), x + 3, y + 4, { width: colWidths[i] - 6, align: c.align || "left" });
+      // Same lineBreak:false / ellipsis reasoning as drawHeaderRow above —
+      // keep every value cell to the single line rowHeight already
+      // budgets for it, so pdfkit never auto-paginates mid-row.
+      doc.text(val == null || val === "" ? "-" : String(val), x + 3, y + 4, { width: colWidths[i] - 6, align: c.align || "left", lineBreak: false, ellipsis: true });
       x += colWidths[i];
     });
     y += rowHeight;
@@ -316,7 +350,7 @@ function addPageNumbers(doc) {
      { type: "break", time, duration } ] }]. Built by SHAPES.timetable
    in mainExamExports.controller.js. Long days split across pages with
    the day cell repeated on the continuation. ── */
-function drawTimetablePdf(doc, { days }) {
+function drawTimetablePdf(doc, { days }, theme) {
   const left = doc.page.margins.left;
   const usable = doc.page.width - doc.page.margins.left - doc.page.margins.right;
   const fixed = { num: 26, day: 100, time: 112, sn: 30, dur: 86, venue: 84 };
@@ -344,8 +378,8 @@ function drawTimetablePdf(doc, { days }) {
 
   const header = () => {
     const h = 18;
-    doc.rect(left, y, usable, h).fill("#2c3e50");
-    doc.fillColor("#fff").font("Helvetica-Bold").fontSize(7.5);
+    doc.rect(left, y, usable, h).fill(theme.primary);
+    doc.fillColor(theme.onPrimary).font("Helvetica-Bold").fontSize(7.5);
     [["num", "#", "center"], ["day", "DAY / DATE"], ["time", "TIME"], ["sn", "S/N", "center"], ["subject", "SUBJECT"], ["dur", "DURATION"], ["venue", "VENUE"]]
       .forEach(([k, label, align]) => doc.text(label, X[k].x + PAD, y + 5, { width: X[k].w - PAD * 2, align: align || "left" }));
     doc.fillColor("#000");
@@ -425,6 +459,10 @@ function drawTimetablePdf(doc, { days }) {
    document). Returns a Buffer. `landscape` defaults true since most of
    these are wide result tables (§32). */
 function buildReportPdf({ institution, examinationName, academicYear, reportTitle, subtitle, sections, landscape = true }) {
+  // Resolved once per document — every header bar, rule line, and zebra
+  // stripe in this PDF (across every section) draws from this same
+  // palette, so a report can never come out half-themed.
+  const theme = resolveReportTheme(institution?.reportTheme);
   return new Promise((resolve, reject) => {
     const doc = new PDFDocument({ layout: landscape ? "landscape" : "portrait", margin: 36, size: "A4", bufferPages: true });
     const chunks = [];
@@ -432,10 +470,20 @@ function buildReportPdf({ institution, examinationName, academicYear, reportTitl
     doc.on("end", () => resolve(Buffer.concat(chunks)));
     doc.on("error", reject);
 
-    drawPdfHeader(doc, institution, { examinationName, academicYear, reportTitle, subtitle });
+    drawPdfHeader(doc, institution, { examinationName, academicYear, reportTitle, subtitle }, theme);
 
     sections.forEach((section, idx) => {
       if (idx > 0) doc.moveDown(0.8);
+      // If the heading (plus a little breathing room for what follows
+      // it) can no longer fit above the bottom margin, start this
+      // section on a fresh page instead of drawing an orphaned heading
+      // at the very bottom of the current one — pdfkit's own
+      // auto-pagination would otherwise decide where the break lands,
+      // sometimes leaving a near-empty trailing page. 60pt covers the
+      // heading line plus a table's header row.
+      if (section.heading && doc.y + 60 > doc.page.height - doc.page.margins.bottom) {
+        doc.addPage();
+      }
       if (section.heading) {
         doc.fontSize(10).font("Helvetica-Bold").text(section.heading);
         doc.moveDown(0.3);
@@ -445,9 +493,9 @@ function buildReportPdf({ institution, examinationName, academicYear, reportTitl
         doc.moveDown(0.3);
       }
       if (section.timetable) {
-        drawTimetablePdf(doc, section.timetable);
+        drawTimetablePdf(doc, section.timetable, theme);
       } else if (section.columns) {
-        drawPdfTable(doc, { columns: section.columns, rows: section.rows || [] });
+        drawPdfTable(doc, { columns: section.columns, rows: section.rows || [], theme });
       }
     });
 

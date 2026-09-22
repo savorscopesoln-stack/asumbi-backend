@@ -1,6 +1,7 @@
 const sql = require("mssql");
 const crypto = require("crypto");
 const { logExamAudit } = require("../utils/examAuditLog");
+const { getPassMark } = require("./mainExamAnalytics.controller");
 
 /* =========================================================================
    MAIN EXAMINATION CRUD
@@ -415,6 +416,13 @@ const getMainExaminationDashboard = async (req, res) => {
     let candidateCount = 0;
     let completedAttempts = 0;
     let averagePerformance = null;
+    let passRate = null;
+
+    // Same GradingSystem-backed pass mark Analytics uses (getPassMark
+    // has its own fallback to 40% if that row isn't configured yet on
+    // this tenant) — fetched unconditionally so passRateNote below can
+    // always cite the real configured value, even with 0 candidates.
+    const passMark = await getPassMark(pool);
 
     if (eAssessmentIds.length) {
       // Registered candidates = distinct students whose class or year of
@@ -448,13 +456,16 @@ const getMainExaminationDashboard = async (req, res) => {
       // averages, so a subject with more candidates isn't under- or
       // over-weighted (§17 — "do not create misleading rankings").
       const idParams = eAssessmentIds.map((_, i) => `@eid${i}`).join(",");
-      const submissionsRequest = pool.request();
+      const submissionsRequest = pool.request().input("passMark", sql.Float, passMark);
       eAssessmentIds.forEach((eid, i) => submissionsRequest.input(`eid${i}`, sql.Int, eid));
       const submissionsResult = await submissionsRequest.query(`
         SELECT
           COUNT(*) AS total_submissions,
           AVG(CASE WHEN s.score IS NOT NULL AND ea.total_marks > 0
-                    THEN CAST(s.score AS FLOAT) * 100.0 / ea.total_marks END) AS avg_percentage
+                    THEN CAST(s.score AS FLOAT) * 100.0 / ea.total_marks END) AS avg_percentage,
+          SUM(CASE WHEN s.score IS NOT NULL AND ea.total_marks > 0
+                    AND (CAST(s.score AS FLOAT) * 100.0 / ea.total_marks) >= @passMark
+                    THEN 1 ELSE 0 END) AS passed_count
         FROM e_assessment_submissions s
         JOIN e_assessments ea ON ea.id = s.e_assessment_id
         WHERE s.e_assessment_id IN (${idParams})
@@ -462,16 +473,15 @@ const getMainExaminationDashboard = async (req, res) => {
       const row = submissionsResult.recordset[0] || {};
       completedAttempts = row.total_submissions || 0;
       averagePerformance = row.avg_percentage != null ? Math.round(row.avg_percentage * 10) / 10 : null;
+      // Same "pooled across all submissions, not averaged per subject"
+      // rule as averagePerformance above (§17) — a subject with more
+      // candidates isn't under- or over-weighted in the pass rate either.
+      passRate = completedAttempts > 0 ? Math.round((Number(row.passed_count || 0) / completedAttempts) * 1000) / 10 : null;
     }
 
-    // §50 "No Fake Analytics": there is no pass-mark/grading-scale
-    // configuration anywhere in the existing e-assessment schema to
-    // compute a real pass rate from, so this is reported as
-    // unavailable rather than invented from an assumed threshold (e.g.
-    // "50%"). If/when a configurable grading scale is added (§16), this
-    // is the one place to wire it in.
-    const passRate = null;
-    const passRateNote = "Unavailable — no pass mark is configured for these assessments.";
+    const passRateNote = completedAttempts > 0
+      ? `Candidates scoring at or above the configured pass mark (${passMark}%).`
+      : "Unavailable — no candidates have been scored yet.";
 
     res.json({
       success: true,

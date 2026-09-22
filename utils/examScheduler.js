@@ -30,22 +30,64 @@ const { notifyUsers } = require("./notify");
 ========================================================================= */
 const TICK_MS = 60 * 1000;
 
+/* -------------------------------------------------------------------------
+   TIMEZONE — this is what was actually causing "subjects don't go active
+   at the set time".
+
+   The dashboard's Start/End Time fields are explicitly labelled "(EAT)"
+   (see MainExaminationDashboard.jsx) and every stored start_time/end_time
+   is the East Africa Time wall-clock digits the admin typed, saved as a
+   "labelled UTC" instant on purpose (see toDateTime() in
+   examSubjectSession.controller.js and HANDOFF_NOTES_EXAMCODE_AND_
+   TIMEZONE_FIX.md) — the point being: whatever number the admin typed is
+   the number that comes back, everywhere in the app, regardless of what
+   timezone the server or the viewer's browser happens to be in.
+
+   This file was the one place that broke that rule: it compared those
+   "labelled EAT" columns straight against SQL Server's own GETDATE(),
+   which carries no such label — it's just whatever real-world instant
+   the SQL Server *process's own clock* says right now, in whatever
+   timezone that machine happens to be set to. Azure SQL Database's
+   GETDATE() in particular is always UTC, no matter where the resource is
+   hosted. So a subject with start_time "09:00" (meaning 9am EAT) never
+   satisfied `start_time <= GETDATE()` until the server's clock itself
+   reached "09:00" — which, on a UTC server, is 12:00 EAT: three hours
+   late. On a different server clock it'd be off by some other amount.
+   Either way, the DB server's own timezone was silently deciding when
+   exams opened, not the time the admin actually typed.
+
+   Fix: never ask the database "what time is it" for this comparison.
+   Compute "right now, relabelled as EAT wall-clock digits" here in Node
+   from Date.now() (a real, timezone-agnostic instant) and pass it in as
+   a parameter, in the exact same "labelled UTC" shape start_time/end_time
+   are already stored in — so the WHERE clause is always comparing two
+   values on the same clock, independent of whatever timezone the
+   database server process itself happens to be running in.
+------------------------------------------------------------------------- */
+const EAT_OFFSET_MINUTES = 3 * 60; // East Africa Time is UTC+3, no DST
+function nowAsSchoolWallClock() {
+  return new Date(Date.now() + EAT_OFFSET_MINUTES * 60 * 1000);
+}
+
 async function activateDueSessions(pool, tenantKey, io) {
+  const now = nowAsSchoolWallClock();
   // Pulls in the linked assessment's approval status/audience in the same
   // query — §8's security rule means this decision has to be made here,
   // server-side, at activation time, not trusted from whatever attach/
   // publish already checked earlier (an assessment can't currently be
   // un-approved after publish, but this stays correct even if that ever
   // changes).
-  const due = await pool.request().query(`
+  const due = await pool.request()
+    .input("now", sql.DateTime, now)
+    .query(`
     SELECT ess.id, ess.main_examination_id, ess.subject,
            ea.id AS e_assessment_id, ea.status AS assessment_status,
            ea.title AS assessment_title, ea.class_id, ea.year_of_study
     FROM exam_subject_sessions ess
     LEFT JOIN e_assessments ea ON ea.id = ess.e_assessment_id
     WHERE ess.status = 'scheduled'
-      AND ess.start_time IS NOT NULL AND ess.start_time <= GETDATE()
-      AND (ess.end_time IS NULL OR ess.end_time > GETDATE())
+      AND ess.start_time IS NOT NULL AND ess.start_time <= @now
+      AND (ess.end_time IS NULL OR ess.end_time > @now)
   `);
 
   for (const row of due.recordset || []) {
@@ -64,9 +106,10 @@ async function activateDueSessions(pool, tenantKey, io) {
       // that actually flips the row's status performs the follow-up work.
       const updated = await pool.request()
         .input("id", sql.Int, row.id)
+        .input("now", sql.DateTime, now)
         .query(`
           UPDATE exam_subject_sessions
-          SET status = 'active', activated_at = GETDATE(), updatedAt = GETDATE()
+          SET status = 'active', activated_at = @now, updatedAt = @now
           OUTPUT INSERTED.id
           WHERE id = @id AND status = 'scheduled'
         `);
@@ -127,12 +170,15 @@ async function activateDueSessions(pool, tenantKey, io) {
 }
 
 async function endDueSessions(pool, tenantKey, io) {
-  const result = await pool.request().query(`
+  const now = nowAsSchoolWallClock();
+  const result = await pool.request()
+    .input("now", sql.DateTime, now)
+    .query(`
     UPDATE exam_subject_sessions
-    SET status = 'ended', ended_at = GETDATE(), updatedAt = GETDATE()
+    SET status = 'ended', ended_at = @now, updatedAt = @now
     OUTPUT INSERTED.id, INSERTED.main_examination_id, INSERTED.subject, INSERTED.e_assessment_id
     WHERE status = 'active'
-      AND end_time IS NOT NULL AND end_time <= GETDATE()
+      AND end_time IS NOT NULL AND end_time <= @now
   `);
 
   for (const row of result.recordset || []) {

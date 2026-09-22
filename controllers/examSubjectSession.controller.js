@@ -443,8 +443,16 @@ const deleteSubjectSession = async (req, res) => {
     const current = existing.recordset[0];
     if (!current) return res.status(404).json({ success: false, message: "Subject session not found" });
 
-    if (["active", "ended", "marking", "completed"].includes(current.status)) {
-      return res.status(409).json({ success: false, message: `Cannot remove a subject once it is ${current.status}.` });
+    // Only a session that's actually LIVE right now is protected — removing
+    // it mid-sitting would pull the rug out from under a student who could
+    // be actively taking it. Once a subject is done (ended/marking/
+    // completed) there's no live attempt left to disrupt, and the
+    // underlying e_assessment/questions/submissions/marks all live on the
+    // referenced e_assessments row, not on this scheduling row (§36) — so
+    // deleting this row never touches results, it just drops the subject's
+    // slot out of this examination's timetable.
+    if (current.status === "active") {
+      return res.status(409).json({ success: false, message: "Cannot remove a subject while it is active — end it first." });
     }
 
     await pool.request().input("id", sql.Int, id).query(`DELETE FROM exam_subject_sessions WHERE id = @id`);
@@ -563,6 +571,70 @@ const publishTimetable = async (req, res) => {
   }
 };
 
+/* =========================================================================
+   UNPUBLISH (revert to draft)
+   The mirror image of publishTimetable — lets an admin walk a published
+   timetable back to 'draft' to fix a mistake, as long as nothing has
+   actually happened yet: if any subject has gone active/ended/marking/
+   completed, the exam is effectively underway/finished and reverting
+   would contradict real history (and the auto-activation scheduler,
+   which only ever moves a session forward), so that's refused instead.
+========================================================================= */
+const unpublishTimetable = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const mainExamId = toInt(req.params.mainExamId);
+    if (!mainExamId) return res.status(400).json({ success: false, message: "Invalid main examination id" });
+
+    const mainExam = await loadMainExam(pool, mainExamId);
+    if (!mainExam) return res.status(404).json({ success: false, message: "Main examination not found" });
+
+    if (mainExam.status !== "published") {
+      return res.status(409).json({ success: false, message: `Cannot revert to draft — this examination is ${mainExam.status}.` });
+    }
+
+    const subjectsResult = await pool.request()
+      .input("mainExaminationId", sql.Int, mainExamId)
+      .query(`SELECT status, subject FROM exam_subject_sessions WHERE main_examination_id = @mainExaminationId`);
+
+    const started = (subjectsResult.recordset || []).find((s) =>
+      ["active", "ended", "marking", "completed"].includes(s.status)
+    );
+    if (started) {
+      return res.status(409).json({
+        success: false,
+        message: `Cannot revert to draft — "${started.subject}" has already ${started.status === "active" ? "started" : started.status}.`,
+      });
+    }
+
+    // Only rows the publish step itself flipped (draft -> scheduled) get
+    // reversed; anything else is left exactly as it is.
+    await pool.request()
+      .input("mainExaminationId", sql.Int, mainExamId)
+      .query(`
+        UPDATE exam_subject_sessions SET status = 'draft', updatedAt = GETDATE()
+        WHERE main_examination_id = @mainExaminationId AND status = 'scheduled'
+      `);
+
+    await pool.request()
+      .input("id", sql.Int, mainExamId)
+      .query(`UPDATE main_examinations SET status = 'draft', updatedAt = GETDATE() WHERE id = @id`);
+
+    await logExamAudit(pool, {
+      mainExaminationId: mainExamId,
+      action: "timetable_reverted_to_draft",
+      actorId: req.user?.id,
+      actorRole: req.user?.role,
+      details: {},
+    });
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("UNPUBLISH TIMETABLE ERROR:", err);
+    res.status(500).json({ success: false, message: "Server error reverting examination to draft" });
+  }
+};
+
 module.exports = {
   addSubjectSession,
   getSubjectSessions,
@@ -572,4 +644,5 @@ module.exports = {
   deleteSubjectSession,
   getTimetable,
   publishTimetable,
+  unpublishTimetable,
 };

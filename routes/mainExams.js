@@ -22,6 +22,7 @@ const {
   deleteSubjectSession,
   getTimetable,
   publishTimetable,
+  unpublishTimetable,
 } = require("../controllers/examSubjectSession.controller");
 
 const {
@@ -83,6 +84,7 @@ router.delete("/:mainExamId/subjects/:id", deleteSubjectSession);
 /* ---------------- Timetable (§5-§6) ---------------- */
 router.get("/:mainExamId/timetable", getTimetable);
 router.put("/:mainExamId/publish", publishTimetable);
+router.put("/:mainExamId/unpublish", unpublishTimetable);
 
 /* ---------------- Analytics (§15-§26 — Phase 9) ----------------
    Main-exam-level and subject-level aggregation, plus the student

@@ -173,12 +173,42 @@ const SHAPES = {
     const keyCols = [{ header: "Code", key: "code", width: 10 }, { header: "Subject", key: "subject", width: 30 }];
     const keyRows = nominalSubjects.map((s) => ({ code: s.code || "—", subject: s.subject }));
 
+    // Overall Performance ranking — every scored candidate, ranked
+    // exam-wide by the mean (average_percentage), from
+    // getSummaryReport's overall_ranking (§51 — same figure the Nominal
+    // Roll already shows for that candidate, not a second calculation).
+    const overallCols = [
+      { header: "Position", key: "overall_position", width: 10 },
+      { header: "Admission No", key: "admission_no", width: 16 },
+      { header: "Name", key: "name", width: 26 },
+      { header: "Class", key: "class", width: 14 },
+      { header: "Mean (%)", key: "average_percentage", width: 12, percent: true },
+    ];
+    const overallRows = data.overall_ranking || [];
+
+    // Class Performance — one row per class/stream, from
+    // getSummaryReport's class_performance (§51 — rolled up from the same
+    // per-candidate average_percentage as the Overall Performance ranking
+    // and the Nominal Roll above).
+    const classCols = [
+      { header: "Class", key: "class", width: 16 },
+      { header: "Registered", key: "registered", width: 12 },
+      { header: "Scored", key: "scored", width: 10 },
+      { header: "Mean (%)", key: "mean", width: 12, percent: true },
+      { header: "Highest (%)", key: "highest", width: 12, percent: true },
+      { header: "Lowest (%)", key: "lowest", width: 12, percent: true },
+      { header: "Pass Rate (%)", key: "pass_rate", width: 12, percent: true },
+    ];
+    const classRows = data.class_performance || [];
+
     return {
       title: "Main Examination Summary",
       excelSheets: [
         { name: "Candidate Stats", title: "Candidate Statistics", columns: overviewCols, rows: overviewRows },
         { name: "Performance", title: "Overall Performance", columns: overviewCols, rows: perfRows },
         { name: "Subject Summary", title: "Performance by Subject", columns: subjectCols, rows: subjectRows },
+        { name: "Class Performance", title: "Class Performance", columns: classCols, rows: classRows, note: !classRows.length ? "No registered candidates found." : null },
+        { name: "Overall Ranking", title: "Overall Performance — Candidate Ranking", columns: overallCols, rows: overallRows, note: !overallRows.length ? "No candidates have been scored yet." : null },
         { name: "Grade Distribution", title: "Grade Distribution", columns: gradeCols, rows: gradeRows, note: gradeNote },
         { name: "Nominal Roll", title: "Nominal Roll", columns: nominalCols, rows: nominalRows, note: !nominalRows.length ? "No registered candidates found." : null },
         { name: "Nominal Roll Key", title: "Nominal Roll — Subject Code Key", columns: keyCols, rows: keyRows, note: !keyRows.length ? "No subjects with an attached assessment yet." : null },
@@ -187,6 +217,8 @@ const SHAPES = {
         { heading: "Candidate Statistics", columns: overviewCols, rows: overviewRows },
         { heading: "Overall Performance", columns: overviewCols, rows: perfRows },
         { heading: "Performance by Subject", columns: subjectCols, rows: subjectRows },
+        { heading: "Class Performance", columns: classCols, rows: classRows },
+        { heading: "Overall Performance — Candidate Ranking", columns: overallCols, rows: overallRows },
         { heading: "Grade Distribution", columns: gradeCols, rows: gradeRows, text: gradeNote || undefined },
         { heading: "Nominal Roll", columns: nominalCols, rows: nominalRows },
         { heading: "Nominal Roll — Subject Code Key", columns: keyCols, rows: keyRows },

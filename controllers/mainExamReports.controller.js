@@ -4,6 +4,7 @@ const {
   getSubjectAnalytics,
   getStudentExaminationProfile,
   loadNominalRoll,
+  computeClassPerformance,
 } = require("./mainExamAnalytics.controller");
 
 /* =========================================================================
@@ -77,6 +78,31 @@ const getSummaryReport = async (req, res) => {
     // see loadNominalRoll's comment) since it's specific to this report.
     const nominalRoll = await loadNominalRoll(pool, mainExamId);
 
+    // Overall Performance ranking — every scored candidate, ranked
+    // exam-wide (not just within their own class/stream) by the exact
+    // same average_percentage the Nominal Roll already computed and
+    // displays, via loadNominalRoll's assignOverallPositions (§51: one
+    // pass over the roll's own rows, never a second mean calculation).
+    // Candidates with nothing scored yet are left off this ranked list —
+    // they still appear in the Nominal Roll itself with a "—" position.
+    const overallRanking = (nominalRoll.rows || [])
+      .filter((r) => r.average_percentage != null)
+      .map((r) => ({
+        overall_position: r.overall_position,
+        student_id: r.student_id,
+        admission_no: r.admission_no,
+        name: r.name,
+        class: r.class,
+        average_percentage: r.average_percentage,
+      }))
+      .sort((a, b) => a.overall_position - b.overall_position);
+
+    // Class Performance — one row per class/stream, rolled up from the
+    // same Nominal Roll rows (§51) using the exam's configured pass mark
+    // (data.performance.pass_mark), so it always agrees with the
+    // exam-wide pass rate shown above it.
+    const classPerformance = computeClassPerformance(nominalRoll.rows || [], data.performance.pass_mark);
+
     res.json({
       success: true,
       report: "main_examination_summary",
@@ -87,6 +113,8 @@ const getSummaryReport = async (req, res) => {
       grade_distribution: data.grade_distribution,
       grade_distribution_note: data.grade_distribution_note,
       subjects: data.subjects,
+      overall_ranking: overallRanking,
+      class_performance: classPerformance,
       nominal_roll: nominalRoll,
     });
   } catch (err) {
