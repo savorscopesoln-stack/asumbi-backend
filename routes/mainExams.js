@@ -14,6 +14,8 @@ const {
   generateExamCode,
 } = require("../controllers/mainExam.controller");
 
+const { downloadTranscripts } = require("../controllers/transcript.controller");
+
 const {
   addSubjectSession,
   getSubjectSessions,
@@ -62,6 +64,13 @@ router.use(protect, requirePage("E-Assessments"));
 
 router.get("/", getMainExaminations);
 router.post("/", createMainExamination);
+
+/* ---------------- Transcripts (cross-exam — not scoped to one exam id) ----------------
+   "Download Transcripts" on the Main Examinations list. A literal
+   2-segment path, registered before the /:id routes below so it can
+   never be shadowed by a single-segment :id param. */
+router.get("/transcripts/download", downloadTranscripts);
+
 router.get("/:id", getMainExaminationById);
 router.put("/:id", updateMainExamination);
 router.put("/:id/archive", archiveMainExamination);
