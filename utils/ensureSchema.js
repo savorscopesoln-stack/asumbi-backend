@@ -1334,6 +1334,25 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       ALTER TABLE SchoolSettings ADD reportTheme NVARCHAR(30) NULL
     `);
 
+    /* ---------------- SchoolSettings.stampUrl ----------------
+       The official college/school stamp image, embedded at the bottom
+       of a downloaded transcript (utils/transcriptPdf.js) next to the
+       signing officials pulled from SchoolOfficials below. Same
+       upload pipeline and URL shape as logoUrl (served path like
+       "/uploads/website/<file>") — see POST /api/school-settings/stamp
+       in routes/schoolSettings.js. NULL = no stamp uploaded yet, in
+       which case the transcript falls back to a plain "Official Stamp"
+       placeholder box, the same convention StudentReport.jsx already
+       uses on screen. */
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='SchoolSettings' AND xtype='U')
+      AND NOT EXISTS (
+        SELECT * FROM sys.columns
+        WHERE Name = N'stampUrl' AND Object_ID = Object_ID(N'SchoolSettings')
+      )
+      ALTER TABLE SchoolSettings ADD stampUrl NVARCHAR(500) NULL
+    `);
+
     /* ---------------- SchoolOfficials table ----------------
        Replaces the hand-typed "Dean of Curriculum" / "Chief Principal"
        names/titles that used to be scattered across result slips and

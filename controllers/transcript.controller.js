@@ -1,5 +1,5 @@
 const sql = require("mssql");
-const { getInstitutionHeader, sendPdfBuffer } = require("../utils/reportExport");
+const { getInstitutionHeader, getSigningOfficials, sendPdfBuffer } = require("../utils/reportExport");
 const { buildTranscriptPdf } = require("../utils/transcriptPdf");
 const { loadGradingSystem, getGradeForScore, getOverallResultForScore } = require("../utils/grading");
 
@@ -42,7 +42,7 @@ const downloadTranscripts = async (req, res) => {
 
     /* ---------------- 1. Students in scope ---------------- */
     const studentsReq = pool.request();
-    let studentsQuery = `SELECT id, name, admissionNo, studentClass FROM Students`;
+    let studentsQuery = `SELECT id, name, admissionNo, studentClass, gender, assessmentNumber, yearOfStudy FROM Students`;
     if (scope === "class") {
       studentsReq.input("className", sql.NVarChar, className);
       studentsQuery += ` WHERE studentClass = @className`;
@@ -113,6 +113,7 @@ const downloadTranscripts = async (req, res) => {
         });
       }
       examsMap.get(row.mainExaminationId).subjects.push({
+        subjectCode: row.subjectCode || null,
         subjectName: row.subjectName || row.subjectCode || "Subject",
         percentage: row.percentage,
       });
@@ -129,14 +130,35 @@ const downloadTranscripts = async (req, res) => {
       const exams = [...examsMap.values()].map((exam) => {
         const scores = exam.subjects.map((s) => Number(s.percentage)).filter((n) => !Number.isNaN(n));
         const average = scores.length ? round1(scores.reduce((a, b) => a + b, 0) / scores.length) : null;
+
+        // Per-subject grade band: `label` (e.g. "Credit") is shown in
+        // BOTH the "Grade" and "Points" table columns — the app has one
+        // grading scale, not the separate letter-grade/points scales a
+        // college transcript like the sample sometimes uses. The
+        // band's own numeric `grade` code (e.g. "4") still exists
+        // underneath and is what the exam's aggregate points total
+        // below is summed from, so that figure means something even
+        // though the two visible columns match.
+        const subjects = exam.subjects.map((s) => {
+          const band = s.percentage != null ? getGradeForScore(s.percentage, gradingSystem) : null;
+          return {
+            ...s,
+            grade: band ? band.label : "—",
+            points: band ? band.label : "—",
+            gradePoints: band ? Number(band.grade) : null,
+            result: s.percentage != null ? getOverallResultForScore(s.percentage, gradingSystem) : "—",
+          };
+        });
+
+        const gradePointsList = subjects.map((s) => s.gradePoints).filter((n) => n != null && !Number.isNaN(n));
+        const aggregatePoints = gradePointsList.length ? gradePointsList.reduce((a, b) => a + b, 0) : null;
+
         return {
           ...exam,
-          subjects: exam.subjects.map((s) => ({
-            ...s,
-            grade: s.percentage != null ? getGradeForScore(s.percentage, gradingSystem).label : "—",
-          })),
+          subjects,
           average,
           overallResult: average != null ? getOverallResultForScore(average, gradingSystem) : "—",
+          aggregatePoints,
         };
       });
 
@@ -162,8 +184,10 @@ const downloadTranscripts = async (req, res) => {
 
     /* ---------------- 6. Render + send ---------------- */
     const institution = await getInstitutionHeader(pool);
+    const officials = await getSigningOfficials(pool);
     const buffer = await buildTranscriptPdf({
       institution,
+      officials,
       title: singleExam ? singleExam.name : "Full Academic Transcript (All Exams)",
       subtitle: scope === "class" ? `Class: ${className}` : "All Students",
       students: studentPages,

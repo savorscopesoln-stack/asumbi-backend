@@ -47,12 +47,23 @@ async function getInstitutionHeader(pool) {
       const candidate = path.join(__dirname, "..", settings.logoUrl.replace(/^\/+/, ""));
       if (fs.existsSync(candidate)) logoDiskPath = candidate;
     }
+    // Same resolve-to-disk-path pattern as the logo, for the official
+    // stamp a transcript embeds next to its signing officials (see
+    // utils/transcriptPdf.js) — NULL/missing file just means "no stamp
+    // uploaded yet", not an error.
+    let stampDiskPath = null;
+    if (settings.stampUrl) {
+      const candidate = path.join(__dirname, "..", settings.stampUrl.replace(/^\/+/, ""));
+      if (fs.existsSync(candidate)) stampDiskPath = candidate;
+    }
     return {
       schoolName: settings.schoolName || "",
       address: settings.address || "",
       phone: settings.phone || "",
       email: settings.email || "",
+      website: settings.website || "",
       logoDiskPath,
+      stampDiskPath,
       // Raw stored key (may be null/unrecognized) — buildReportPdf
       // resolves it to an actual palette via resolveReportTheme() so
       // every call site agrees on the same "unknown key" fallback
@@ -61,7 +72,34 @@ async function getInstitutionHeader(pool) {
     };
   } catch (err) {
     console.error("⚠️ Could not load institution header for report export:", err.message);
-    return { schoolName: "", address: "", phone: "", email: "", logoDiskPath: null, reportTheme: null };
+    return { schoolName: "", address: "", phone: "", email: "", website: "", logoDiskPath: null, stampDiskPath: null, reportTheme: null };
+  }
+}
+
+/* -------------------------------------------------------------------------
+   SIGNING OFFICIALS (for the transcript's signature block)
+   Reads the existing SchoolOfficials table (ensureSchema.js) — the same
+   Principal/Dean list the School Settings page manages and reports.jsx's
+   on-screen "Approval & Authentication" panel already reads over HTTP.
+   Only the ones flagged isSignatory are returned, in sortOrder, since
+   those are the only ones meant to appear on a signed document.
+------------------------------------------------------------------------- */
+async function getSigningOfficials(pool) {
+  try {
+    const result = await pool.request().query(`
+      SELECT so.title, so.name, so.teacherId, t.name AS teacherName
+      FROM SchoolOfficials so
+      LEFT JOIN Teachers t ON t.id = so.teacherId
+      WHERE so.isSignatory = 1
+      ORDER BY so.sortOrder ASC, so.id ASC
+    `);
+    return (result.recordset || []).map((o) => ({
+      title: o.title,
+      name: o.teacherId ? (o.teacherName || o.name) : o.name,
+    }));
+  } catch (err) {
+    console.error("⚠️ Could not load signing officials for report export:", err.message);
+    return [];
   }
 }
 
@@ -512,6 +550,7 @@ function sendPdfBuffer(res, buffer, filename) {
 
 module.exports = {
   getInstitutionHeader,
+  getSigningOfficials,
   buildReportWorkbook,
   sendExcelBuffer,
   buildReportPdf,

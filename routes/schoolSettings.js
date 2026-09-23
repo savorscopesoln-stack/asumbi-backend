@@ -94,7 +94,7 @@ module.exports = (poolPromise, sql) => {
       const pool = req.pool; // tenant-resolved by server.js DB middleware
       const {
         schoolName, shortName, motto, centreCode,
-        address, phone, email, website, numberOfClasses, logoUrl,
+        address, phone, email, website, numberOfClasses, logoUrl, stampUrl,
         reportTheme,
       } = req.body || {};
 
@@ -121,6 +121,7 @@ module.exports = (poolPromise, sql) => {
         .input("website", sql.NVarChar, website || null)
         .input("numberOfClasses", sql.Int, numberOfClasses ? parseInt(numberOfClasses, 10) : null)
         .input("logoUrl", sql.NVarChar, logoUrl || null)
+        .input("stampUrl", sql.NVarChar, stampUrl || null)
         .input("reportTheme", sql.NVarChar, cleanReportTheme)
         .input("updatedBy", sql.Int, req.user?.id || null)
         .query(`
@@ -135,6 +136,7 @@ module.exports = (poolPromise, sql) => {
             website = @website,
             numberOfClasses = @numberOfClasses,
             logoUrl = @logoUrl,
+            stampUrl = @stampUrl,
             reportTheme = @reportTheme,
             updatedAt = GETDATE(),
             updatedBy = @updatedBy
@@ -172,6 +174,30 @@ module.exports = (poolPromise, sql) => {
       res.json({ url });
     } catch (err) {
       console.log("SCHOOL LOGO UPLOAD ERROR:", err.message);
+      res.status(400).json({ message: err.message || "Upload failed" });
+    }
+  });
+
+  /* ================= STAMP UPLOAD (admin) =================
+     Same pipeline/two-step-then-save pattern as the logo above —
+     used at the bottom of a downloaded transcript (utils/transcriptPdf.js)
+     next to the signing officials below. */
+  router.post("/stamp", protect, requirePage("School Settings"), async (req, res) => {
+    try {
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
+      await runWebsiteImageUpload(req, res);
+      if (!req.file) return res.status(400).json({ message: "No image file received" });
+
+      const url = websiteImageUrlFor(req.file.filename);
+
+      // Best-effort cleanup of the previous stamp file.
+      const prev = await pool.request().query(`SELECT stampUrl FROM SchoolSettings WHERE id = 1`);
+      const prevUrl = prev.recordset[0]?.stampUrl;
+      if (prevUrl && prevUrl !== url) deleteWebsiteImageByUrl(prevUrl);
+
+      res.json({ url });
+    } catch (err) {
+      console.log("SCHOOL STAMP UPLOAD ERROR:", err.message);
       res.status(400).json({ message: err.message || "Upload failed" });
     }
   });
