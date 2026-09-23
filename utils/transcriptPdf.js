@@ -38,11 +38,14 @@ const ROW_H = 16;
 
 function drawInstitutionHeader(doc, institution, { title, subtitle }, theme) {
   const startX = doc.page.margins.left;
+  const LOGO_SIZE = 42;
   let textX = startX;
+  let logoDrawn = false;
   if (institution.logoDiskPath) {
     try {
-      doc.image(institution.logoDiskPath, startX, doc.y, { width: 42, height: 42 });
+      doc.image(institution.logoDiskPath, startX, doc.y, { width: LOGO_SIZE, height: LOGO_SIZE });
       textX = startX + 52;
+      logoDrawn = true;
     } catch (err) {
       console.error("⚠️ Could not embed logo in transcript PDF:", err.message);
     }
@@ -52,7 +55,7 @@ function drawInstitutionHeader(doc, institution, { title, subtitle }, theme) {
   doc.fontSize(13).font("Helvetica-Bold").fillColor("#000")
     .text(institution.schoolName || "Institution", textX, topY, { width: textWidth, align: "center" });
   if (institution.address) {
-    doc.fontSize(8).font("Helvetica").fillColor("#555").text(institution.address, { width: textWidth, align: "center" });
+    doc.fontSize(8).font("Helvetica").fillColor("#555").text(institution.address, textX, doc.y, { width: textWidth, align: "center" });
   }
   // Telephone / Email / Website contact line — same three facts the
   // sample college transcript prints under its address, pulled from
@@ -64,13 +67,21 @@ function drawInstitutionHeader(doc, institution, { title, subtitle }, theme) {
   ].filter(Boolean);
   if (contactParts.length) {
     doc.fontSize(8).font("Helvetica").fillColor("#555")
-      .text(contactParts.join("   |   "), { width: textWidth, align: "center" });
+      .text(contactParts.join("   |   "), textX, doc.y, { width: textWidth, align: "center" });
   }
   doc.fillColor("#000");
+  // The name/address/contact block can be shorter than the logo (e.g.
+  // when address/contact details are missing), which previously let
+  // doc.y creep back up above the logo's bottom edge — the next
+  // (full-width, centered) title lines would then render on top of
+  // the logo image instead of below it. Clamp the cursor to clear the
+  // logo's bottom edge before anything else is drawn.
+  if (logoDrawn) doc.y = Math.max(doc.y, topY + LOGO_SIZE);
+  doc.x = startX;
   doc.moveDown(0.4);
-  doc.fontSize(11).font("Helvetica-Bold").text("STUDENT ACADEMIC TRANSCRIPT", { align: "center" });
-  doc.fontSize(9).font("Helvetica-Bold").fillColor(theme.primary).text(title, { align: "center" });
-  if (subtitle) doc.fontSize(8).font("Helvetica").fillColor("#555").text(subtitle, { align: "center" });
+  doc.fontSize(11).font("Helvetica-Bold").text("STUDENT ACADEMIC TRANSCRIPT", startX, doc.y, { width: doc.page.width - startX - doc.page.margins.right, align: "center" });
+  doc.fontSize(9).font("Helvetica-Bold").fillColor(theme.primary).text(title, startX, doc.y, { width: doc.page.width - startX - doc.page.margins.right, align: "center" });
+  if (subtitle) doc.fontSize(8).font("Helvetica").fillColor("#555").text(subtitle, startX, doc.y, { width: doc.page.width - startX - doc.page.margins.right, align: "center" });
   doc.fillColor("#000");
   doc.moveDown(0.6);
   doc.moveTo(startX, doc.y).lineTo(doc.page.width - doc.page.margins.right, doc.y).strokeColor(theme.rule).stroke();
@@ -96,13 +107,27 @@ function drawStudentInfo(doc, student) {
   const startX = doc.page.margins.left;
   const colWidth = (doc.page.width - doc.page.margins.left - doc.page.margins.right) / 3;
   const rowH = 30;
+  // Row/col positions are anchored to `startY`, captured once below —
+  // NOT to doc.y at call time. PDFKit still advances doc.y after every
+  // .text() call even when it's given an explicit x/y, so if each
+  // field read the *current* doc.y it would drift a little further
+  // down with every single field drawn (label, then value, then the
+  // next field...). By the time the second row's fields were placed,
+  // that compounding drift pushed them well past their intended slot
+  // and into whatever was drawn next (the exam table header row) —
+  // exactly the overlapping text this fixes.
+  const startY = doc.y;
   const field = (label, value, col, row) => {
     const x = startX + col * colWidth;
-    const y = doc.y + row * rowH;
+    const y = startY + row * rowH;
     doc.fontSize(7.5).font("Helvetica-Bold").fillColor("#777").text(label.toUpperCase(), x, y);
-    doc.fontSize(10).font("Helvetica-Bold").fillColor("#000").text(value ?? "—", x, y + 11, { width: colWidth - 6, ellipsis: true });
+    // `height` must be paired with `ellipsis` — pdfkit only truncates
+    // with "…" when it knows the box is bounded to one line; without
+    // it, a long value (e.g. a long student name) silently wraps onto
+    // a second line instead of truncating, and that second line then
+    // overlaps the next row of fields below it.
+    doc.fontSize(10).font("Helvetica-Bold").fillColor("#000").text(value ?? "—", x, y + 11, { width: colWidth - 6, height: 13, ellipsis: true });
   };
-  const startY = doc.y;
   field("Student Name", student.name, 0, 0);
   field("Gender", student.gender, 1, 0);
   field("Index No.", student.assessmentNumber, 2, 0);
@@ -110,6 +135,14 @@ function drawStudentInfo(doc, student) {
   field("Class", student.studentClass, 1, 1);
   field("Year of Study", student.yearOfStudy, 2, 1);
   doc.y = startY + rowH * 2;
+  // Every field above is drawn at an explicit x (one of the three
+  // columns), which leaves doc.x parked wherever the last field
+  // happened to be (the third/rightmost column) once the loop ends.
+  // Anything drawn next without its own explicit x — like the exam
+  // heading in drawExamTable — would otherwise inherit that stray x
+  // and render on top of this block's last column instead of at the
+  // page's left margin.
+  doc.x = startX;
   doc.moveDown(0.3);
 }
 
@@ -147,8 +180,10 @@ function drawExamTable(doc, exam, theme) {
   }
 
   const examLabel = [exam.examName, exam.term, exam.academic_year].filter(Boolean).join(" — ");
-  doc.fontSize(9.5).font("Helvetica-Bold").fillColor(theme.primary).text(examLabel);
+  doc.fontSize(9.5).font("Helvetica-Bold").fillColor(theme.primary)
+    .text(examLabel, pageLeft, doc.y, { width: usableWidth });
   doc.fillColor("#000");
+  doc.x = pageLeft;
   doc.moveDown(0.2);
 
   let y = doc.y;
