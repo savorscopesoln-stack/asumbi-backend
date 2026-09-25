@@ -51,6 +51,24 @@ module.exports = (poolPromise, sql) => {
         name: o.teacherId ? (o.teacherName || o.name) : o.name,
       }));
 
+      // reportSubjects is persisted as a JSON string (see PUT below) —
+      // parse it back into an array here so every consumer (this GET is
+      // the only read path) always gets a plain array, never a raw
+      // string. Malformed/blank/legacy rows fall back to [] ("no
+      // restriction, show every subject"), the same as before this
+      // column existed.
+      const settingsRow = settingsResult.recordset[0] || null;
+      if (settingsRow) {
+        try {
+          settingsRow.reportSubjects = settingsRow.reportSubjects
+            ? JSON.parse(settingsRow.reportSubjects)
+            : [];
+          if (!Array.isArray(settingsRow.reportSubjects)) settingsRow.reportSubjects = [];
+        } catch {
+          settingsRow.reportSubjects = [];
+        }
+      }
+
       // Same LEFT JOIN pattern as officials above — a class teacher
       // linked to a staff record (teacherId) always shows that
       // teacher's current name; a hand-typed name is left as-is.
@@ -66,7 +84,7 @@ module.exports = (poolPromise, sql) => {
       }));
 
       res.json({
-        settings: settingsResult.recordset[0] || null,
+        settings: settingsRow,
         officials,
         classTeachers,
       });
@@ -95,7 +113,7 @@ module.exports = (poolPromise, sql) => {
       const {
         schoolName, shortName, motto, centreCode,
         address, phone, email, website, numberOfClasses, logoUrl, stampUrl,
-        reportTheme,
+        reportTheme, reportSubjects,
       } = req.body || {};
 
       if (!schoolName || !String(schoolName).trim()) {
@@ -110,6 +128,13 @@ module.exports = (poolPromise, sql) => {
       const knownKeys = listReportThemes().map((t) => t.key);
       const cleanReportTheme = reportTheme && knownKeys.includes(reportTheme) ? reportTheme : null;
 
+      // Persisted as a JSON string (see the GET handler above, which
+      // parses it back into an array) — an empty/missing array is
+      // stored as "[]" rather than NULL so a school that explicitly
+      // clears their selection ("show every subject") is stored the
+      // same way as one that never touched this setting.
+      const cleanReportSubjects = JSON.stringify(Array.isArray(reportSubjects) ? reportSubjects : []);
+
       await pool.request()
         .input("schoolName", sql.NVarChar, schoolName)
         .input("shortName", sql.NVarChar, shortName || "")
@@ -123,6 +148,7 @@ module.exports = (poolPromise, sql) => {
         .input("logoUrl", sql.NVarChar, logoUrl || null)
         .input("stampUrl", sql.NVarChar, stampUrl || null)
         .input("reportTheme", sql.NVarChar, cleanReportTheme)
+        .input("reportSubjects", sql.NVarChar(sql.MAX), cleanReportSubjects)
         .input("updatedBy", sql.Int, req.user?.id || null)
         .query(`
           UPDATE SchoolSettings SET
@@ -138,13 +164,23 @@ module.exports = (poolPromise, sql) => {
             logoUrl = @logoUrl,
             stampUrl = @stampUrl,
             reportTheme = @reportTheme,
+            reportSubjects = @reportSubjects,
             updatedAt = GETDATE(),
             updatedBy = @updatedBy
           WHERE id = 1
         `);
 
       const result = await pool.request().query(`SELECT TOP 1 * FROM SchoolSettings WHERE id = 1`);
-      res.json({ success: true, settings: result.recordset[0] });
+      const savedSettings = result.recordset[0] || null;
+      if (savedSettings) {
+        try {
+          savedSettings.reportSubjects = savedSettings.reportSubjects ? JSON.parse(savedSettings.reportSubjects) : [];
+          if (!Array.isArray(savedSettings.reportSubjects)) savedSettings.reportSubjects = [];
+        } catch {
+          savedSettings.reportSubjects = [];
+        }
+      }
+      res.json({ success: true, settings: savedSettings });
     } catch (err) {
       console.log("SCHOOL SETTINGS UPDATE ERROR:", err.message);
       res.status(500).json({ message: "Failed to update school settings" });
@@ -202,6 +238,38 @@ module.exports = (poolPromise, sql) => {
     }
   });
 
+  /* ================= OFFICIAL/CLASS-TEACHER SIGNATURE UPLOAD (admin) =================
+     Personalised signature image for a single official or class
+     teacher — same two-step upload-then-save pattern as logo/stamp
+     above (upload returns a URL, the frontend then includes it in the
+     officials/class-teachers create or update call below). Not scoped
+     to an existing row's id because a brand-new official/class teacher
+     doesn't have one yet when the image is picked — same reasoning as
+     why the school stamp isn't scoped to a row. No "previous file"
+     cleanup here (unlike logo/stamp) since the caller doesn't tell us
+     which row, if any, is being replaced. */
+  router.post("/officials/signature", protect, requirePage("School Settings"), async (req, res) => {
+    try {
+      await runWebsiteImageUpload(req, res);
+      if (!req.file) return res.status(400).json({ message: "No image file received" });
+      res.json({ url: websiteImageUrlFor(req.file.filename) });
+    } catch (err) {
+      console.log("OFFICIAL SIGNATURE UPLOAD ERROR:", err.message);
+      res.status(400).json({ message: err.message || "Upload failed" });
+    }
+  });
+
+  router.post("/class-teachers/signature", protect, requirePage("School Settings"), async (req, res) => {
+    try {
+      await runWebsiteImageUpload(req, res);
+      if (!req.file) return res.status(400).json({ message: "No image file received" });
+      res.json({ url: websiteImageUrlFor(req.file.filename) });
+    } catch (err) {
+      console.log("CLASS TEACHER SIGNATURE UPLOAD ERROR:", err.message);
+      res.status(400).json({ message: err.message || "Upload failed" });
+    }
+  });
+
   /* ================= OFFICIALS (admin) ================= */
 
   /* Teachers picker for the "link to an existing teacher" option below —
@@ -223,7 +291,7 @@ module.exports = (poolPromise, sql) => {
   router.post("/officials", protect, requirePage("School Settings"), async (req, res) => {
     try {
       const pool = req.pool; // tenant-resolved by server.js DB middleware
-      const { title, name, teacherId, sortOrder, isSignatory } = req.body || {};
+      const { title, name, teacherId, sortOrder, isSignatory, signatureUrl } = req.body || {};
 
       if (!title || !String(title).trim()) {
         return res.status(400).json({ message: "Rank / title is required" });
@@ -241,10 +309,11 @@ module.exports = (poolPromise, sql) => {
         .input("teacherId", sql.Int, teacherId ? parseInt(teacherId, 10) : null)
         .input("sortOrder", sql.Int, sortOrder != null ? parseInt(sortOrder, 10) : 0)
         .input("isSignatory", sql.Bit, isSignatory ? 1 : 0)
+        .input("signatureUrl", sql.NVarChar, signatureUrl || null)
         .query(`
-          INSERT INTO SchoolOfficials (title, name, teacherId, sortOrder, isSignatory)
+          INSERT INTO SchoolOfficials (title, name, teacherId, sortOrder, isSignatory, signatureUrl)
           OUTPUT INSERTED.*
-          VALUES (@title, @name, @teacherId, @sortOrder, @isSignatory)
+          VALUES (@title, @name, @teacherId, @sortOrder, @isSignatory, @signatureUrl)
         `);
 
       res.json({ success: true, official: result.recordset[0] });
@@ -257,7 +326,7 @@ module.exports = (poolPromise, sql) => {
   router.put("/officials/:id", protect, requirePage("School Settings"), async (req, res) => {
     try {
       const pool = req.pool; // tenant-resolved by server.js DB middleware
-      const { title, name, teacherId, sortOrder, isSignatory } = req.body || {};
+      const { title, name, teacherId, sortOrder, isSignatory, signatureUrl } = req.body || {};
 
       if (!title || !String(title).trim()) {
         return res.status(400).json({ message: "Rank / title is required" });
@@ -273,10 +342,11 @@ module.exports = (poolPromise, sql) => {
         .input("teacherId", sql.Int, teacherId ? parseInt(teacherId, 10) : null)
         .input("sortOrder", sql.Int, sortOrder != null ? parseInt(sortOrder, 10) : 0)
         .input("isSignatory", sql.Bit, isSignatory ? 1 : 0)
+        .input("signatureUrl", sql.NVarChar, signatureUrl || null)
         .query(`
           UPDATE SchoolOfficials SET
             title = @title, name = @name, teacherId = @teacherId, sortOrder = @sortOrder,
-            isSignatory = @isSignatory, updatedAt = GETDATE()
+            isSignatory = @isSignatory, signatureUrl = @signatureUrl, updatedAt = GETDATE()
           WHERE id = @id
         `);
 
@@ -312,7 +382,7 @@ module.exports = (poolPromise, sql) => {
   router.post("/class-teachers", protect, requirePage("School Settings"), async (req, res) => {
     try {
       const pool = req.pool; // tenant-resolved by server.js DB middleware
-      const { className, title, name, teacherId, sortOrder } = req.body || {};
+      const { className, title, name, teacherId, sortOrder, signatureUrl } = req.body || {};
 
       if (!className || !String(className).trim()) {
         return res.status(400).json({ message: "Class is required" });
@@ -327,10 +397,11 @@ module.exports = (poolPromise, sql) => {
         .input("name", sql.NVarChar, teacherId ? null : name)
         .input("teacherId", sql.Int, teacherId ? parseInt(teacherId, 10) : null)
         .input("sortOrder", sql.Int, sortOrder != null ? parseInt(sortOrder, 10) : 0)
+        .input("signatureUrl", sql.NVarChar, signatureUrl || null)
         .query(`
-          INSERT INTO ClassTeachers (className, title, name, teacherId, sortOrder)
+          INSERT INTO ClassTeachers (className, title, name, teacherId, sortOrder, signatureUrl)
           OUTPUT INSERTED.*
-          VALUES (@className, @title, @name, @teacherId, @sortOrder)
+          VALUES (@className, @title, @name, @teacherId, @sortOrder, @signatureUrl)
         `);
 
       res.json({ success: true, classTeacher: result.recordset[0] });
@@ -343,7 +414,7 @@ module.exports = (poolPromise, sql) => {
   router.put("/class-teachers/:id", protect, requirePage("School Settings"), async (req, res) => {
     try {
       const pool = req.pool; // tenant-resolved by server.js DB middleware
-      const { className, title, name, teacherId, sortOrder } = req.body || {};
+      const { className, title, name, teacherId, sortOrder, signatureUrl } = req.body || {};
 
       if (!className || !String(className).trim()) {
         return res.status(400).json({ message: "Class is required" });
@@ -359,10 +430,11 @@ module.exports = (poolPromise, sql) => {
         .input("name", sql.NVarChar, teacherId ? null : name)
         .input("teacherId", sql.Int, teacherId ? parseInt(teacherId, 10) : null)
         .input("sortOrder", sql.Int, sortOrder != null ? parseInt(sortOrder, 10) : 0)
+        .input("signatureUrl", sql.NVarChar, signatureUrl || null)
         .query(`
           UPDATE ClassTeachers SET
             className = @className, title = @title, name = @name,
-            teacherId = @teacherId, sortOrder = @sortOrder, updatedAt = GETDATE()
+            teacherId = @teacherId, sortOrder = @sortOrder, signatureUrl = @signatureUrl, updatedAt = GETDATE()
           WHERE id = @id
         `);
 

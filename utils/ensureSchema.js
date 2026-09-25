@@ -1353,6 +1353,24 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       ALTER TABLE SchoolSettings ADD stampUrl NVARCHAR(500) NULL
     `);
 
+    /* ---------------- SchoolSettings.reportSubjects ----------------
+       Which subjects are allowed to appear on a student's report card
+       (StudentReport.jsx) — set from the "Subjects shown on report
+       cards" picker on the School Settings page. Stored as a JSON array
+       of subject ids (e.g. "[3,7,12]") since this is a variable-length
+       multi-select, not a single value — routes/schoolSettings.js
+       JSON.stringifies on save and JSON.parses back to an array on
+       read. NULL/'[]' = no restriction, i.e. show every subject, which
+       is the same behaviour a school had before this column existed. */
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='SchoolSettings' AND xtype='U')
+      AND NOT EXISTS (
+        SELECT * FROM sys.columns
+        WHERE Name = N'reportSubjects' AND Object_ID = Object_ID(N'SchoolSettings')
+      )
+      ALTER TABLE SchoolSettings ADD reportSubjects NVARCHAR(MAX) NULL
+    `);
+
     /* ---------------- SchoolOfficials table ----------------
        Replaces the hand-typed "Dean of Curriculum" / "Chief Principal"
        names/titles that used to be scattered across result slips and
@@ -1397,6 +1415,23 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       ALTER TABLE SchoolOfficials ADD teacherId INT NULL
     `);
 
+    /* ---------------- SchoolOfficials.signatureUrl ----------------
+       This official's own personalised signature image (a scanned or
+       photographed signature, uploaded from the School Settings page —
+       see POST /api/school-settings/officials/signature), embedded on
+       the student report card's "Approved By" signature line in place
+       of the blank hand-signed line. Same upload pipeline/URL shape as
+       logoUrl/stampUrl. NULL = no signature uploaded yet, in which case
+       the report falls back to the blank line it always used. */
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='SchoolOfficials' AND xtype='U')
+      AND NOT EXISTS (
+        SELECT * FROM sys.columns
+        WHERE Name = N'signatureUrl' AND Object_ID = Object_ID(N'SchoolOfficials')
+      )
+      ALTER TABLE SchoolOfficials ADD signatureUrl NVARCHAR(500) NULL
+    `);
+
     /* ---------------- ClassTeachers table ----------------
        Unlike SchoolOfficials (one school-wide list of Principal/Dean/etc.
        signatories), a Class Teacher / Lecturer is assigned per CLASS —
@@ -1425,6 +1460,21 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
           updatedAt DATETIME NOT NULL DEFAULT GETDATE()
         )
       END
+    `);
+
+    /* ---------------- ClassTeachers.signatureUrl ----------------
+       Same personalised-signature-image feature as
+       SchoolOfficials.signatureUrl above, but for a Class Teacher /
+       Lecturer — embedded on the report card's "Class Teacher /
+       Lecturer's Remarks" sign-off line. See POST
+       /api/school-settings/class-teachers/signature. */
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='ClassTeachers' AND xtype='U')
+      AND NOT EXISTS (
+        SELECT * FROM sys.columns
+        WHERE Name = N'signatureUrl' AND Object_ID = Object_ID(N'ClassTeachers')
+      )
+      ALTER TABLE ClassTeachers ADD signatureUrl NVARCHAR(500) NULL
     `);
 
     /* ---------------- GradingSystem table ----------------
