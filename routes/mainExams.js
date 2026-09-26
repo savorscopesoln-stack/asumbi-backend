@@ -50,6 +50,7 @@ const {
 const { buildExportHandler } = require("../controllers/mainExamExports.controller");
 
 const { protect, requirePage } = require("../middleware/authMiddleware");
+const { requireFundableExamination } = require("../middleware/examWalletGuard");
 
 /* =========================================================================
    MAIN EXAMINATIONS
@@ -63,7 +64,14 @@ const { protect, requirePage } = require("../middleware/authMiddleware");
 router.use(protect, requirePage("E-Assessments"));
 
 router.get("/", getMainExaminations);
-router.post("/", createMainExamination);
+// Phase 5 (wallet integration): requireFundableExamination is a
+// pre-flight convenience that turns "no eligible students" / "no
+// credits" / "insufficient credits for this cohort" into a clean 400
+// before the controller does any work — see that middleware's own
+// header for why it is NOT the actual security boundary.
+// createMainExamination re-validates and performs the real, atomic
+// reservation itself via fundNewExamination either way.
+router.post("/", requireFundableExamination, createMainExamination);
 
 /* ---------------- Transcripts (cross-exam — not scoped to one exam id) ----------------
    "Download Transcripts" on the Main Examinations list. A literal

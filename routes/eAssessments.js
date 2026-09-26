@@ -39,6 +39,7 @@ const {
   // submissions / marking
   getAllSubmissions, getAssessmentSubmissions, getSubmissionForMarking, getAllSubmissionsForMarking,
   saveMarking, saveMarkingBulk, assignSubmission, bulkAssignSubmissions, getNextSubmissionForMarking,
+  getMarkingSession, saveMarkingSession, clearMarkingSession,
 
   // remarks
   requestRemark, getRemarkRequests, reviewRemarkRequest,
@@ -171,6 +172,13 @@ router.get("/marking/submission/:id", protect, authorize("teacher"), getSubmissi
 router.get("/marking/:id", protect, authorize("teacher"), getSubmissionForMarking);
 router.post("/save-marking", protect, authorize("teacher"), saveMarking);
 router.post("/save-marking/bulk", protect, authorize("teacher"), saveMarkingBulk);
+
+// Marking-session cache — draft autosave so marking survives a refresh,
+// a closed tab, or continuing on a different device (see the controller
+// for details). Never touches e_assessment_answers.
+router.get("/marking-session/:id", protect, authorize("teacher"), getMarkingSession);
+router.put("/marking-session/:id", protect, authorize("teacher"), saveMarkingSession);
+router.delete("/marking-session/:id", protect, authorize("teacher"), clearMarkingSession);
 
 /* student requests a remark on their own submission */
 router.post("/submissions/:id/request-remark", protect, authorize("student"), requestRemark);

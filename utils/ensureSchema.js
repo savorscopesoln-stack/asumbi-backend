@@ -45,6 +45,34 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       ALTER TABLE e_assessments ADD exam_password NVARCHAR(50) NULL
     `);
 
+    /* ---------------- e_assessment_answers.highlights / .highlighted_html ----
+       Persists the actual highlight-to-mark selections a teacher makes on
+       the essay-marking screen (Marking.jsx / AllQuestionsMarking.jsx):
+       `highlights` is a JSON array of { id, text, mark, ... } (drives the
+       "Marked points" list + score total), `highlighted_html` is the
+       marked-up essay HTML itself (the <mark class="hl-mark"> spans) so
+       reopening an already-marked answer shows the highlights in place
+       rather than plain text. Previously only the *computed total*
+       (marks_awarded) was saved, so once a submission was finalized the
+       highlighted spans were lost for good. Both nullable: an answer
+       marked via the plain "Override score" box never gets a value here. */
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='e_assessment_answers' AND xtype='U')
+      AND NOT EXISTS (
+        SELECT * FROM sys.columns
+        WHERE Name = N'highlights' AND Object_ID = Object_ID(N'e_assessment_answers')
+      )
+      ALTER TABLE e_assessment_answers ADD highlights NVARCHAR(MAX) NULL
+    `);
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='e_assessment_answers' AND xtype='U')
+      AND NOT EXISTS (
+        SELECT * FROM sys.columns
+        WHERE Name = N'highlighted_html' AND Object_ID = Object_ID(N'e_assessment_answers')
+      )
+      ALTER TABLE e_assessment_answers ADD highlighted_html NVARCHAR(MAX) NULL
+    `);
+
     /* ---------------- e_assessment_question_setters ----------------
        Admin picks, at create/edit time, exactly which teacher(s) are
        allowed to add/edit/delete questions on an assessment — separate
@@ -1178,6 +1206,31 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       )
     `);
 
+    /* ---------------- Marking session cache ----------------
+       Lets a teacher's in-progress essay marking — scores, remarks,
+       highlights, flags, which questions are dismissed, and where they
+       were in the queue — survive a refresh, a closed tab, or logging in
+       on a different device. The frontend (AllQuestionsMarking.jsx) pushes
+       a JSON snapshot here roughly every 60s and on unload, and pulls it
+       back the next time the marking screen is opened. One row per
+       (assessment, teacher) — a fresh push overwrites the last one, so
+       whichever device pushed most recently wins. This table is never
+       touched by the real "Save marks" commit path (saveMarking /
+       e_assessment_answers), so autosave can't accidentally finalize a
+       score the teacher hasn't actually awarded yet. */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='e_assessment_marking_sessions' AND xtype='U')
+      CREATE TABLE e_assessment_marking_sessions (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        e_assessment_id INT NOT NULL,
+        teacher_id INT NOT NULL,
+        state NVARCHAR(MAX) NOT NULL,
+        updatedAt DATETIME NOT NULL DEFAULT GETDATE(),
+        createdAt DATETIME NOT NULL DEFAULT GETDATE(),
+        CONSTRAINT UQ_marking_session UNIQUE (e_assessment_id, teacher_id)
+      )
+    `);
+
     /* ---------------- Local Sync (offline exam server) ----------------
        Lets a lightweight local exam server register as a "sync device",
        pull an assessment package while it has internet, and push
@@ -1432,6 +1485,24 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       ALTER TABLE SchoolOfficials ADD signatureUrl NVARCHAR(500) NULL
     `);
 
+    /* ---------------- SchoolOfficials.stampUrl ----------------
+       This official's own personalised stamp image (their individual
+       rubber/ink stamp, uploaded from the School Settings page — see
+       POST /api/school-settings/officials/stamp), shown next to their
+       signature on the student report card's "Approved By" block
+       instead of the one shared, school-wide SchoolSettings.stampUrl.
+       Same upload pipeline/URL shape as signatureUrl above. NULL = no
+       stamp uploaded yet, in which case the report shows the dashed
+       placeholder box it always used for a missing stamp. */
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='SchoolOfficials' AND xtype='U')
+      AND NOT EXISTS (
+        SELECT * FROM sys.columns
+        WHERE Name = N'stampUrl' AND Object_ID = Object_ID(N'SchoolOfficials')
+      )
+      ALTER TABLE SchoolOfficials ADD stampUrl NVARCHAR(500) NULL
+    `);
+
     /* ---------------- ClassTeachers table ----------------
        Unlike SchoolOfficials (one school-wide list of Principal/Dean/etc.
        signatories), a Class Teacher / Lecturer is assigned per CLASS —
@@ -1475,6 +1546,21 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
         WHERE Name = N'signatureUrl' AND Object_ID = Object_ID(N'ClassTeachers')
       )
       ALTER TABLE ClassTeachers ADD signatureUrl NVARCHAR(500) NULL
+    `);
+
+    /* ---------------- ClassTeachers.stampUrl ----------------
+       Same personalised-stamp-image feature as SchoolOfficials.stampUrl
+       above, but for a Class Teacher / Lecturer — shown next to their
+       signature on the report card's "Class Teacher / Lecturer's
+       Remarks" sign-off block. See POST
+       /api/school-settings/class-teachers/stamp. */
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='ClassTeachers' AND xtype='U')
+      AND NOT EXISTS (
+        SELECT * FROM sys.columns
+        WHERE Name = N'stampUrl' AND Object_ID = Object_ID(N'ClassTeachers')
+      )
+      ALTER TABLE ClassTeachers ADD stampUrl NVARCHAR(500) NULL
     `);
 
     /* ---------------- GradingSystem table ----------------
@@ -1778,7 +1864,430 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       ON Assessments(sourceSystem, sourceRefId)
     `);
 
-    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, PortalPageSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, leave_outs code-verification columns, meal_daily_codes, leave_auto_approve, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl, Students.profileCompleted, student_profile_change_requests, website_content, contact_messages, newsletter_subscribers, e_assessments.cover_page_url, e_assessments.cover_page_width/height, e_assessment_question_images, e_assessment_violation_photos, e_assessment_sync_devices, e_assessment_sync_devices.tenant_key, e_assessment_sync_device_assessments, e_assessment_sync_logs, e_assessment_submissions.sync_batch_id, SchoolSettings, SchoolOfficials, GradingSystem, main_examinations, exam_subject_sessions, exam_audit_log, Assessments.examScope/sourceSystem/sourceRefId, Marks indexes, main_examinations.is_report_exam)");
+    /* =========================================================================
+       WALLET / CREDIT LEDGER — Doravo institution-wallet examination
+       credit & billing system, Phase 2 of the wallet spec.
+
+       Design constraints carried over from the Phase 1 audit:
+       - Additive only; nothing here touches e_assessments, Assessments,
+         Marks, or any existing exam/marking/reporting table.
+       - Institutions request credits by EMAIL/WhatsApp only — there is
+         deliberately no "credit request" table here; requests never
+         become data, only a verified deposit does.
+       - Finance is a per-tenant role (role='finance' on the existing
+         Users table — see the MFA columns added below), not a new
+         central identity store, matching the Phase 1 Option A decision:
+         this codebase has no control database / cross-tenant identity
+         system to hook into today, so Finance accounts live in each
+         tenant DB exactly like every other role already does.
+       - Money is always DECIMAL(18,2) with a currency column; credit
+         QUANTITIES (what actually gates exam creation) are plain INT —
+         the wallet counts credits, not currency, once issued.
+       - Every balance mutation is written through
+         services/walletLedger.service.js (Phase 3+), never directly by
+         a controller, so wallet_ledger stays the single source of
+         truth an available/reserved balance can always be recomputed
+         from. The columns here support that: an idempotency_key so a
+         retried request can never double-apply, and a running
+         available_after/reserved_after snapshot per row so balance
+         history/audits never need to replay the whole ledger.
+    ========================================================================= */
+
+    /* ---------------- institution_wallets ----------------
+       One row per tenant DB (id fixed at 1, same singleton convention
+       as SchoolSettings above — there is exactly one wallet per
+       institution/tenant). available_credits is what exam creation
+       checks against; reserved_credits is credits already committed to
+       a funded-but-not-yet-fully-consumed examination (see
+       student_exam_entitlements below) — reserved credits are NOT
+       available for a new examination, but are also never returned to
+       "available" just because the wallet later hits zero (§ "Zero
+       available credits must NEVER interrupt previously funded
+       examinations"). CHECK constraints make a negative balance a hard
+       DB-level impossibility, not just an application-level one. */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='institution_wallets' AND xtype='U')
+      BEGIN
+        CREATE TABLE institution_wallets (
+          id INT PRIMARY KEY,
+          available_credits INT NOT NULL DEFAULT 0,
+          reserved_credits INT NOT NULL DEFAULT 0,
+          total_purchased INT NOT NULL DEFAULT 0,
+          total_allocated INT NOT NULL DEFAULT 0,
+          updatedAt DATETIME NOT NULL DEFAULT GETDATE(),
+          CONSTRAINT CK_institution_wallets_available_nonneg CHECK (available_credits >= 0),
+          CONSTRAINT CK_institution_wallets_reserved_nonneg CHECK (reserved_credits >= 0)
+        )
+        INSERT INTO institution_wallets (id, available_credits, reserved_credits, total_purchased, total_allocated)
+        VALUES (1, 0, 0, 0, 0)
+      END
+    `);
+
+    /* ---------------- wallet_ledger ----------------
+       Immutable, append-only. Never UPDATEd or DELETEd by application
+       code (reversals are new compensating rows, per spec — see
+       entry_type='reverse'). One row per balance-affecting event:
+       'issue' (Finance deposits credits), 'reserve' (exam creation
+       commits credits to a student+exam), 'consume' (a reserved credit
+       is realized — e.g. the exam actually runs/completes; kept
+       distinct from 'reserve' so reserved-vs-consumed reporting is
+       possible later without re-deriving it from exam state),
+       'release' (an unused reservation is freed — student removed
+       before the exam ran, exam cancelled pre-funding-lock, etc.),
+       'reverse' (Finance reverses unused issued credits — a
+       compensating entry, never a deletion of the original 'issue').
+       credit_delta is signed (+ for issue/release, - for
+       reserve/consume/reverse) so SUM(credit_delta) always reconciles
+       to the wallet's current available_credits by construction.
+       idempotency_key guards the exact failure mode called out in the
+       spec ("Finance deposit interrupted between control and tenant
+       databases" / "duplicate payment verification and callback/retry
+       handling") — retrying the same logical operation with the same
+       key is a no-op, enforced by the unique filtered index below. */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='wallet_ledger' AND xtype='U')
+      CREATE TABLE wallet_ledger (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        entry_type NVARCHAR(30) NOT NULL,
+        credit_delta INT NOT NULL,
+        available_after INT NOT NULL,
+        reserved_after INT NOT NULL,
+        main_examination_id INT NULL,
+        student_id INT NULL,
+        credit_issuance_id INT NULL,
+        actor_id INT NULL,
+        actor_role NVARCHAR(30) NULL,
+        reason NVARCHAR(500) NULL,
+        idempotency_key NVARCHAR(100) NULL,
+        createdAt DATETIME NOT NULL DEFAULT GETDATE()
+      )
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (
+        SELECT * FROM sys.indexes
+        WHERE name = N'UQ_wallet_ledger_idempotency_key' AND object_id = Object_ID(N'wallet_ledger')
+      )
+      CREATE UNIQUE NONCLUSTERED INDEX UQ_wallet_ledger_idempotency_key
+      ON wallet_ledger(idempotency_key) WHERE idempotency_key IS NOT NULL
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (
+        SELECT * FROM sys.indexes
+        WHERE name = N'IX_wallet_ledger_main_examination_id' AND object_id = Object_ID(N'wallet_ledger')
+      )
+      CREATE NONCLUSTERED INDEX IX_wallet_ledger_main_examination_id
+      ON wallet_ledger(main_examination_id)
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (
+        SELECT * FROM sys.indexes
+        WHERE name = N'IX_wallet_ledger_student_id' AND object_id = Object_ID(N'wallet_ledger')
+      )
+      CREATE NONCLUSTERED INDEX IX_wallet_ledger_student_id
+      ON wallet_ledger(student_id)
+    `);
+
+    /* ---------------- institution_payments ----------------
+       A Doravo Finance officer's manually-verified record of money
+       received (outside this system — bank/mobile-money reconciled by
+       hand, per spec). payment_reference is finance-entered (bank
+       transaction ref, M-Pesa code, etc.) and must be unique, which is
+       the DB-level backstop for "duplicate payment verification"
+       (§56 test 5/6) — a second attempt to verify the same real-world
+       payment fails at the unique index, not just in application
+       logic. verified_by/verified_at are set the moment this row is
+       created (there is deliberately no separate
+       "pending verification" state here — unlike credit_issuances
+       below, a payment row only ever gets created once already
+       verified, since verification is the manual step finance did
+       before touching this system at all). */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='institution_payments' AND xtype='U')
+      CREATE TABLE institution_payments (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        payment_reference NVARCHAR(80) NOT NULL,
+        amount DECIMAL(18,2) NOT NULL,
+        currency NVARCHAR(3) NOT NULL DEFAULT 'KES',
+        method NVARCHAR(50) NULL,
+        notes NVARCHAR(500) NULL,
+        verified_by INT NULL,
+        verified_at DATETIME NOT NULL DEFAULT GETDATE(),
+        createdAt DATETIME NOT NULL DEFAULT GETDATE(),
+        CONSTRAINT CK_institution_payments_amount_positive CHECK (amount > 0)
+      )
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (
+        SELECT * FROM sys.indexes
+        WHERE name = N'UQ_institution_payments_reference' AND object_id = Object_ID(N'institution_payments')
+      )
+      CREATE UNIQUE NONCLUSTERED INDEX UQ_institution_payments_reference
+      ON institution_payments(payment_reference)
+    `);
+
+    /* ---------------- credit_issuances ----------------
+       One row per Finance "deposit credits" action. issuance_reference
+       is a globally-unique, crypto-random reference (same generation
+       pattern as main_examinations.exam_code — see
+       controllers/mainExam.controller.js's randomExamCode/EXAM_CODE_
+       ALPHABET, reused rather than reinvented in
+       services/walletLedger.service.js) shown to the institution as
+       their deposit receipt. unit_price/currency are an immutable
+       snapshot of Doravo's wholesale credit price AT THE TIME of this
+       issuance (spec: "Store currency and immutable transaction-time
+       price snapshots") — never recomputed later even if Doravo's
+       pricing changes. state models the issuance as a small state
+       machine per the spec's "central-to-tenant credit issuance ...
+       idempotent delivery with reconciliation" requirement, since a
+       control-side "record this issuance happened" step and the
+       tenant-side "actually credit the wallet" step can't be one
+       distributed SQL transaction across two independent databases:
+         pending    -> issuance row exists, not yet applied to the wallet
+         delivered  -> wallet_ledger 'issue' row written, wallet balance
+                       updated (this is the only state exam creation/
+                       wallet balance ever reflects)
+         failed     -> delivery attempt errored; safe to retry, since
+                       retrying re-uses the same issuance_reference as
+                       the wallet_ledger idempotency_key
+         reconciled -> finance has confirmed post-hoc that a 'failed' or
+                       long-'pending' row's true state matches the wallet
+       reversed_quantity tracks partial/full reversals of THIS
+       issuance's unused credits without ever deleting or rewriting the
+       original issuance row (spec: "Never delete financial ledger
+       entries; use compensating transactions for reversals"). */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='credit_issuances' AND xtype='U')
+      CREATE TABLE credit_issuances (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        issuance_reference NVARCHAR(40) NOT NULL,
+        institution_payment_id INT NULL,
+        credit_quantity INT NOT NULL,
+        unit_price DECIMAL(18,2) NULL,
+        currency NVARCHAR(3) NOT NULL DEFAULT 'KES',
+        state NVARCHAR(20) NOT NULL DEFAULT 'pending',
+        reversed_quantity INT NOT NULL DEFAULT 0,
+        issued_by INT NULL,
+        issued_at DATETIME NOT NULL DEFAULT GETDATE(),
+        delivered_at DATETIME NULL,
+        notes NVARCHAR(500) NULL,
+        createdAt DATETIME NOT NULL DEFAULT GETDATE(),
+        CONSTRAINT CK_credit_issuances_quantity_positive CHECK (credit_quantity > 0),
+        CONSTRAINT CK_credit_issuances_reversed_valid CHECK (reversed_quantity >= 0 AND reversed_quantity <= credit_quantity),
+        CONSTRAINT CK_credit_issuances_state CHECK (state IN ('pending','delivered','failed','reconciled')),
+        CONSTRAINT FK_credit_issuances_payment FOREIGN KEY (institution_payment_id)
+          REFERENCES institution_payments(id)
+      )
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (
+        SELECT * FROM sys.indexes
+        WHERE name = N'UQ_credit_issuances_reference' AND object_id = Object_ID(N'credit_issuances')
+      )
+      CREATE UNIQUE NONCLUSTERED INDEX UQ_credit_issuances_reference
+      ON credit_issuances(issuance_reference)
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (
+        SELECT * FROM sys.indexes
+        WHERE name = N'IX_credit_issuances_payment_id' AND object_id = Object_ID(N'credit_issuances')
+      )
+      CREATE NONCLUSTERED INDEX IX_credit_issuances_payment_id
+      ON credit_issuances(institution_payment_id)
+    `);
+
+    /* ---------------- student_exam_entitlements ----------------
+       THE core new concept the Phase 1 audit flagged as missing: a
+       stored record of exactly which student is funded for exactly
+       which Main Examination — the join between "a wallet credit" and
+       "a real candidate." Nothing in the existing Main Examination
+       schema tracked this before (audience was computed implicitly by
+       class/year match at read time — see
+       controllers/mainExamStudent.controller.js's loadMySessions,
+       which Phase 5 will reconcile against this table, not replace).
+       One credit funds one student for one COMPLETE main examination
+       (every subject paper) — so this is deliberately scoped to
+       (student_id, main_examination_id), never to an individual
+       exam_subject_sessions row; a subject paper is never billed
+       separately (spec: "Individual subject papers inside a funded
+       main examination must never consume additional credits").
+       status: 'reserved' (credit committed, exam not yet fully
+       consumed/completed), 'consumed' (the funded examination ran/
+       completed — see main_examinations lifecycle, Phase 5),
+       'released' (freed without ever being consumed — student removed
+       before the exam, or the whole examination was cancelled pre-
+       funding-lock; the credit returns to available_credits, see
+       walletLedger.service.js). The filtered unique index enforces
+       "duplicate active student-exam entitlements" can never exist at
+       the DB level: a student can only have ONE non-released row per
+       main_examination_id at a time, but a NEW entitlement can be
+       created after a prior one was released (e.g. re-admitted after
+       being removed), since the filter excludes released rows. */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='student_exam_entitlements' AND xtype='U')
+      CREATE TABLE student_exam_entitlements (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        student_id INT NOT NULL,
+        main_examination_id INT NOT NULL,
+        status NVARCHAR(20) NOT NULL DEFAULT 'reserved',
+        allocated_by INT NULL,
+        allocated_at DATETIME NOT NULL DEFAULT GETDATE(),
+        consumed_at DATETIME NULL,
+        released_at DATETIME NULL,
+        release_reason NVARCHAR(300) NULL,
+        createdAt DATETIME NOT NULL DEFAULT GETDATE(),
+        updatedAt DATETIME NOT NULL DEFAULT GETDATE(),
+        CONSTRAINT CK_student_exam_entitlements_status CHECK (status IN ('reserved','consumed','released')),
+        CONSTRAINT FK_student_exam_entitlements_main_exam FOREIGN KEY (main_examination_id)
+          REFERENCES main_examinations(id)
+      )
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (
+        SELECT * FROM sys.indexes
+        WHERE name = N'UQ_student_exam_entitlements_active' AND object_id = Object_ID(N'student_exam_entitlements')
+      )
+      CREATE UNIQUE NONCLUSTERED INDEX UQ_student_exam_entitlements_active
+      ON student_exam_entitlements(student_id, main_examination_id)
+      WHERE status <> 'released'
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (
+        SELECT * FROM sys.indexes
+        WHERE name = N'IX_student_exam_entitlements_main_exam' AND object_id = Object_ID(N'student_exam_entitlements')
+      )
+      CREATE NONCLUSTERED INDEX IX_student_exam_entitlements_main_exam
+      ON student_exam_entitlements(main_examination_id, status)
+    `);
+
+    /* ---------------- institution_exam_billing_settings ----------------
+       The admin-defined STUDENT FEE (spec: "separate accounting
+       concept" from Doravo's wholesale credit price above — this
+       table never touches institution_wallets/wallet_ledger).
+       main_examination_id NULL = the institution's standing default
+       fee; a specific exam's row (if present) overrides it. Exactly
+       one default row (main_examination_id IS NULL) and at most one
+       override per exam, both enforced by filtered unique indexes. */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='institution_exam_billing_settings' AND xtype='U')
+      CREATE TABLE institution_exam_billing_settings (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        main_examination_id INT NULL,
+        student_fee_amount DECIMAL(18,2) NULL,
+        currency NVARCHAR(3) NOT NULL DEFAULT 'KES',
+        updated_by INT NULL,
+        updatedAt DATETIME NOT NULL DEFAULT GETDATE(),
+        CONSTRAINT FK_institution_exam_billing_main_exam FOREIGN KEY (main_examination_id)
+          REFERENCES main_examinations(id)
+      )
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (
+        SELECT * FROM sys.indexes
+        WHERE name = N'UQ_institution_billing_default' AND object_id = Object_ID(N'institution_exam_billing_settings')
+      )
+      CREATE UNIQUE NONCLUSTERED INDEX UQ_institution_billing_default
+      ON institution_exam_billing_settings(main_examination_id)
+      WHERE main_examination_id IS NULL
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (
+        SELECT * FROM sys.indexes
+        WHERE name = N'UQ_institution_billing_per_exam' AND object_id = Object_ID(N'institution_exam_billing_settings')
+      )
+      CREATE UNIQUE NONCLUSTERED INDEX UQ_institution_billing_per_exam
+      ON institution_exam_billing_settings(main_examination_id)
+      WHERE main_examination_id IS NOT NULL
+    `);
+
+    /* ---------------- student_exam_payments ----------------
+       Tracks whether a student actually paid the institution's own
+       exam fee (institution_exam_billing_settings above) — separate
+       again from wallet credits, which the institution paid Doravo
+       for, not the student. Not previously implemented anywhere in
+       fees.js/routes/fees.js (that module is general school fees, has
+       no exam-specific or wallet-related table). One row per
+       (student_id, main_examination_id); status defaults to 'unpaid'
+       so a row can be created at allocation time and updated as the
+       institution collects the fee, or 'waived' if the institution
+       chooses not to charge a specific student. */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='student_exam_payments' AND xtype='U')
+      CREATE TABLE student_exam_payments (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        student_id INT NOT NULL,
+        main_examination_id INT NOT NULL,
+        amount DECIMAL(18,2) NULL,
+        currency NVARCHAR(3) NOT NULL DEFAULT 'KES',
+        status NVARCHAR(20) NOT NULL DEFAULT 'unpaid',
+        payment_reference NVARCHAR(80) NULL,
+        recorded_by INT NULL,
+        recordedAt DATETIME NULL,
+        createdAt DATETIME NOT NULL DEFAULT GETDATE(),
+        updatedAt DATETIME NOT NULL DEFAULT GETDATE(),
+        CONSTRAINT CK_student_exam_payments_status CHECK (status IN ('unpaid','paid','waived')),
+        CONSTRAINT FK_student_exam_payments_main_exam FOREIGN KEY (main_examination_id)
+          REFERENCES main_examinations(id)
+      )
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (
+        SELECT * FROM sys.indexes
+        WHERE name = N'UQ_student_exam_payments_student_exam' AND object_id = Object_ID(N'student_exam_payments')
+      )
+      CREATE UNIQUE NONCLUSTERED INDEX UQ_student_exam_payments_student_exam
+      ON student_exam_payments(student_id, main_examination_id)
+    `);
+
+    /* ---------------- finance_audit_log ----------------
+       Same convention as exam_audit_log (utils/examAuditLog.js) —
+       factual event trail, never throws on write failure, small JSON
+       details blob so new event types never need a schema change.
+       Kept as its own table rather than reusing exam_audit_log since
+       finance actions (payment verification, issuance, reversal) are
+       a distinct audit domain from exam-lifecycle actions, and the
+       spec calls for finance audit records explicitly. */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='finance_audit_log' AND xtype='U')
+      CREATE TABLE finance_audit_log (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        action NVARCHAR(100) NOT NULL,
+        institution_payment_id INT NULL,
+        credit_issuance_id INT NULL,
+        wallet_ledger_id INT NULL,
+        actor_id INT NULL,
+        actor_role NVARCHAR(30) NULL,
+        details NVARCHAR(MAX) NULL,
+        createdAt DATETIME NOT NULL DEFAULT GETDATE()
+      )
+    `);
+
+    /* ---------------- Users: finance role support ----------------
+       Finance accounts are Users rows with role='finance' (Phase 1
+       Option A — no new central identity store exists to hook into
+       yet). mfaSecret/mfaEnabled follow the same nullable-ALTER
+       pattern as every other optional Users column added above
+       (mustChangePassword, permissions, name) — NULL/0 for every
+       existing account, so nothing changes for admin/teacher/student
+       logins. Enforced by middleware/authMiddleware.js's financeOnly
+       (Phase 3), never by the frontend. */
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='Users' AND xtype='U')
+      AND NOT EXISTS (
+        SELECT * FROM sys.columns
+        WHERE Name = N'mfaSecret' AND Object_ID = Object_ID(N'Users')
+      )
+      ALTER TABLE Users ADD mfaSecret NVARCHAR(100) NULL
+    `);
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='Users' AND xtype='U')
+      AND NOT EXISTS (
+        SELECT * FROM sys.columns
+        WHERE Name = N'mfaEnabled' AND Object_ID = Object_ID(N'Users')
+      )
+      ALTER TABLE Users ADD mfaEnabled BIT NOT NULL DEFAULT 0
+    `);
+
+    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, PortalPageSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, leave_outs code-verification columns, meal_daily_codes, leave_auto_approve, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl, Students.profileCompleted, student_profile_change_requests, website_content, contact_messages, newsletter_subscribers, e_assessments.cover_page_url, e_assessments.cover_page_width/height, e_assessment_question_images, e_assessment_violation_photos, e_assessment_sync_devices, e_assessment_sync_devices.tenant_key, e_assessment_sync_device_assessments, e_assessment_sync_logs, e_assessment_submissions.sync_batch_id, SchoolSettings, SchoolOfficials, SchoolOfficials.stampUrl, ClassTeachers.stampUrl, GradingSystem, main_examinations, exam_subject_sessions, exam_audit_log, Assessments.examScope/sourceSystem/sourceRefId, Marks indexes, main_examinations.is_report_exam, institution_wallets, wallet_ledger, institution_payments, credit_issuances, student_exam_entitlements, institution_exam_billing_settings, student_exam_payments, finance_audit_log, Users.mfaSecret/mfaEnabled)");
   } catch (err) {
     console.error("⚠️  Schema ensure failed:", err.message);
   }

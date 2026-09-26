@@ -270,6 +270,35 @@ module.exports = (poolPromise, sql) => {
     }
   });
 
+  /* ================= OFFICIAL/CLASS-TEACHER STAMP UPLOAD (admin) =================
+     Personalised stamp image for a single official or class teacher —
+     each individual gets their own stamp rather than every signatory
+     sharing SchoolSettings' single school-wide stampUrl. Same
+     two-step upload-then-save pattern as the signature endpoints
+     above: this returns a URL, the frontend then includes it in the
+     officials/class-teachers create or update call below. */
+  router.post("/officials/stamp", protect, requirePage("School Settings"), async (req, res) => {
+    try {
+      await runWebsiteImageUpload(req, res);
+      if (!req.file) return res.status(400).json({ message: "No image file received" });
+      res.json({ url: websiteImageUrlFor(req.file.filename) });
+    } catch (err) {
+      console.log("OFFICIAL STAMP UPLOAD ERROR:", err.message);
+      res.status(400).json({ message: err.message || "Upload failed" });
+    }
+  });
+
+  router.post("/class-teachers/stamp", protect, requirePage("School Settings"), async (req, res) => {
+    try {
+      await runWebsiteImageUpload(req, res);
+      if (!req.file) return res.status(400).json({ message: "No image file received" });
+      res.json({ url: websiteImageUrlFor(req.file.filename) });
+    } catch (err) {
+      console.log("CLASS TEACHER STAMP UPLOAD ERROR:", err.message);
+      res.status(400).json({ message: err.message || "Upload failed" });
+    }
+  });
+
   /* ================= OFFICIALS (admin) ================= */
 
   /* Teachers picker for the "link to an existing teacher" option below —
@@ -291,7 +320,7 @@ module.exports = (poolPromise, sql) => {
   router.post("/officials", protect, requirePage("School Settings"), async (req, res) => {
     try {
       const pool = req.pool; // tenant-resolved by server.js DB middleware
-      const { title, name, teacherId, sortOrder, isSignatory, signatureUrl } = req.body || {};
+      const { title, name, teacherId, sortOrder, isSignatory, signatureUrl, stampUrl } = req.body || {};
 
       if (!title || !String(title).trim()) {
         return res.status(400).json({ message: "Rank / title is required" });
@@ -310,10 +339,11 @@ module.exports = (poolPromise, sql) => {
         .input("sortOrder", sql.Int, sortOrder != null ? parseInt(sortOrder, 10) : 0)
         .input("isSignatory", sql.Bit, isSignatory ? 1 : 0)
         .input("signatureUrl", sql.NVarChar, signatureUrl || null)
+        .input("stampUrl", sql.NVarChar, stampUrl || null)
         .query(`
-          INSERT INTO SchoolOfficials (title, name, teacherId, sortOrder, isSignatory, signatureUrl)
+          INSERT INTO SchoolOfficials (title, name, teacherId, sortOrder, isSignatory, signatureUrl, stampUrl)
           OUTPUT INSERTED.*
-          VALUES (@title, @name, @teacherId, @sortOrder, @isSignatory, @signatureUrl)
+          VALUES (@title, @name, @teacherId, @sortOrder, @isSignatory, @signatureUrl, @stampUrl)
         `);
 
       res.json({ success: true, official: result.recordset[0] });
@@ -326,7 +356,7 @@ module.exports = (poolPromise, sql) => {
   router.put("/officials/:id", protect, requirePage("School Settings"), async (req, res) => {
     try {
       const pool = req.pool; // tenant-resolved by server.js DB middleware
-      const { title, name, teacherId, sortOrder, isSignatory, signatureUrl } = req.body || {};
+      const { title, name, teacherId, sortOrder, isSignatory, signatureUrl, stampUrl } = req.body || {};
 
       if (!title || !String(title).trim()) {
         return res.status(400).json({ message: "Rank / title is required" });
@@ -343,10 +373,11 @@ module.exports = (poolPromise, sql) => {
         .input("sortOrder", sql.Int, sortOrder != null ? parseInt(sortOrder, 10) : 0)
         .input("isSignatory", sql.Bit, isSignatory ? 1 : 0)
         .input("signatureUrl", sql.NVarChar, signatureUrl || null)
+        .input("stampUrl", sql.NVarChar, stampUrl || null)
         .query(`
           UPDATE SchoolOfficials SET
             title = @title, name = @name, teacherId = @teacherId, sortOrder = @sortOrder,
-            isSignatory = @isSignatory, signatureUrl = @signatureUrl, updatedAt = GETDATE()
+            isSignatory = @isSignatory, signatureUrl = @signatureUrl, stampUrl = @stampUrl, updatedAt = GETDATE()
           WHERE id = @id
         `);
 
@@ -382,7 +413,7 @@ module.exports = (poolPromise, sql) => {
   router.post("/class-teachers", protect, requirePage("School Settings"), async (req, res) => {
     try {
       const pool = req.pool; // tenant-resolved by server.js DB middleware
-      const { className, title, name, teacherId, sortOrder, signatureUrl } = req.body || {};
+      const { className, title, name, teacherId, sortOrder, signatureUrl, stampUrl } = req.body || {};
 
       if (!className || !String(className).trim()) {
         return res.status(400).json({ message: "Class is required" });
@@ -398,10 +429,11 @@ module.exports = (poolPromise, sql) => {
         .input("teacherId", sql.Int, teacherId ? parseInt(teacherId, 10) : null)
         .input("sortOrder", sql.Int, sortOrder != null ? parseInt(sortOrder, 10) : 0)
         .input("signatureUrl", sql.NVarChar, signatureUrl || null)
+        .input("stampUrl", sql.NVarChar, stampUrl || null)
         .query(`
-          INSERT INTO ClassTeachers (className, title, name, teacherId, sortOrder, signatureUrl)
+          INSERT INTO ClassTeachers (className, title, name, teacherId, sortOrder, signatureUrl, stampUrl)
           OUTPUT INSERTED.*
-          VALUES (@className, @title, @name, @teacherId, @sortOrder, @signatureUrl)
+          VALUES (@className, @title, @name, @teacherId, @sortOrder, @signatureUrl, @stampUrl)
         `);
 
       res.json({ success: true, classTeacher: result.recordset[0] });
@@ -414,7 +446,7 @@ module.exports = (poolPromise, sql) => {
   router.put("/class-teachers/:id", protect, requirePage("School Settings"), async (req, res) => {
     try {
       const pool = req.pool; // tenant-resolved by server.js DB middleware
-      const { className, title, name, teacherId, sortOrder, signatureUrl } = req.body || {};
+      const { className, title, name, teacherId, sortOrder, signatureUrl, stampUrl } = req.body || {};
 
       if (!className || !String(className).trim()) {
         return res.status(400).json({ message: "Class is required" });
@@ -431,10 +463,12 @@ module.exports = (poolPromise, sql) => {
         .input("teacherId", sql.Int, teacherId ? parseInt(teacherId, 10) : null)
         .input("sortOrder", sql.Int, sortOrder != null ? parseInt(sortOrder, 10) : 0)
         .input("signatureUrl", sql.NVarChar, signatureUrl || null)
+        .input("stampUrl", sql.NVarChar, stampUrl || null)
         .query(`
           UPDATE ClassTeachers SET
             className = @className, title = @title, name = @name,
-            teacherId = @teacherId, sortOrder = @sortOrder, signatureUrl = @signatureUrl, updatedAt = GETDATE()
+            teacherId = @teacherId, sortOrder = @sortOrder, signatureUrl = @signatureUrl,
+            stampUrl = @stampUrl, updatedAt = GETDATE()
           WHERE id = @id
         `);
 

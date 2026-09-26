@@ -33,6 +33,7 @@ const PAGE_KEYS = [
   "Profile Change Requests",
   "Website",
   "School Settings",
+  "Wallet",
 ];
 
 /* Keep only valid, de-duplicated page keys from whatever was submitted. */

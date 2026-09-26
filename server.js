@@ -52,6 +52,8 @@ const kitchenRoutes = require("./routes/kitchen");
 const attendanceRoutes = require("./routes/attendance");
 const eAssessmentRoutes = require("./routes/eAssessments");
 const mainExamsRoutes = require("./routes/mainExams");
+const financeRoutes = require("./routes/finance");
+const walletRoutes = require("./routes/wallet");
 const mainExamsStudentRoutes = require("./routes/mainExamsStudent");
 const localSyncRoutes = require("./routes/localSync");
 const metaRoutes = require("./routes/meta.routes");
@@ -266,6 +268,8 @@ app.use("/api/kitchen", protect, kitchenRoutes);
 app.use("/api/attendance", protect, attendanceRoutes);
 app.use("/api/e-assessments", eAssessmentRoutes); // already protects internally
 app.use("/api/main-exams", mainExamsRoutes); // already protects internally (protect + requirePage("E-Assessments"))
+app.use("/api/finance", financeRoutes); // already protects internally (protect + financeOnly — strict, no admin bypass, see middleware/financeAuth.js)
+app.use("/api/wallet", walletRoutes); // already protects internally (protect + requirePage("Wallet"))
 // Deliberately a distinct base path, not "/api/main-exams/student" — the
 // admin router above has a catch-all "/:id" route that would otherwise
 // swallow "/student" as if it were a numeric main-exam id before ever

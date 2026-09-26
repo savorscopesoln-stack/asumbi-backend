@@ -2286,7 +2286,7 @@ const getSubmissionForMarking = async (req, res) => {
       .query(`SELECT * FROM e_assessment_submissions WHERE id = @id`);
 
     const answers = await pool.request().input("id", sql.Int, submissionId).query(`
-      SELECT a.id, a.question_id, a.selected_answer, a.essay_answer, a.is_correct, a.marks_awarded,
+      SELECT a.id, a.question_id, a.selected_answer, a.essay_answer, a.is_correct, a.marks_awarded, a.highlights, a.highlighted_html,
              q.question_text, q.correct_answer, q.marks AS max_marks, q.question_type
       FROM e_assessment_answers a
       INNER JOIN e_assessment_questions q ON q.id = a.question_id
@@ -2327,7 +2327,7 @@ const getAllSubmissionsForMarking = async (req, res) => {
     const finalData = [];
     for (const submission of submissions) {
       const answersResult = await pool.request().input("submissionId", sql.Int, submission.id).query(`
-        SELECT a.id, a.submission_id, a.question_id, a.essay_answer, a.marks_awarded,
+        SELECT a.id, a.submission_id, a.question_id, a.essay_answer, a.marks_awarded, a.highlights, a.highlighted_html,
        q.question_text, q.question_type, q.marks AS max_marks, q.marking_guide
 FROM e_assessment_answers a
 INNER JOIN e_assessment_questions q ON a.question_id = q.id
@@ -2345,7 +2345,7 @@ WHERE a.submission_id = @submissionId
 const saveMarking = async (req, res) => {
   try {
     const pool = req.pool;
-    const { scores, remarks } = req.body;
+    const { scores, remarks, highlights, essayHTML } = req.body;
     if (!scores || typeof scores !== "object" || !Object.keys(scores).length) {
       return res.status(400).json({ success: false, message: "No scores provided" });
     }
@@ -2355,11 +2355,33 @@ const saveMarking = async (req, res) => {
 
     for (const answerId of answerIds) {
       const mark = Number(scores[answerId]) || 0;
+      // The client always sends its full current highlight state per
+      // answer (empty array included), so this is authoritative — write
+      // it as-is. Strip the `prior: true` placeholder ("Previously
+      // marked") the frontend synthesizes for already-graded answers; it
+      // isn't real highlight data and shouldn't be persisted as if it were.
+      const hlList = (highlights?.[answerId] || []).filter((h) => !h.prior);
+      const hlJson = hlList.length ? JSON.stringify(hlList) : null;
+      // The marked-up essay HTML (the <mark class="hl-mark"> spans) — only
+      // meaningful alongside actual highlight data, so it's dropped
+      // whenever hlList is empty (an override-only mark, or highlights
+      // that were all removed again before saving).
+      const markedHtml = hlList.length ? (essayHTML?.[answerId] || null) : null;
+
       await pool.request()
         .input("answerId", sql.Int, answerId)
         .input("mark", sql.Int, mark)
         .input("remarks", sql.NVarChar(sql.MAX), remarks?.[answerId] || "")
-        .query(`UPDATE e_assessment_answers SET marks_awarded = @mark, remarks = @remarks WHERE id = @answerId`);
+        .input("highlights", sql.NVarChar(sql.MAX), hlJson)
+        .input("highlightedHtml", sql.NVarChar(sql.MAX), markedHtml)
+        .query(`
+          UPDATE e_assessment_answers
+          SET marks_awarded = @mark,
+              remarks = @remarks,
+              highlights = @highlights,
+              highlighted_html = @highlightedHtml
+          WHERE id = @answerId
+        `);
     }
 
     const idList = answerIds.join(",");
@@ -2437,6 +2459,118 @@ const saveMarking = async (req, res) => {
 };
 
 const saveMarkingBulk = saveMarking; // same shape/body contract — kept as distinct route name for the frontend
+
+/* ═════════════════════════════════════════════════════════════════════
+   MARKING SESSION CACHE — autosave / resume-anywhere for the marking UI
+   (see the table comment in ensureSchema.js for the full rationale).
+   Scoped to (assessment, teacher) so it works the same whether the
+   teacher is back on the same device or has logged in on another one.
+═════════════════════════════════════════════════════════════════════ */
+const getMarkingSession = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const e_assessmentId = toInt(req.params.id);
+    const teacherId = toInt(req.user?.id);
+    if (!e_assessmentId) return res.status(400).json({ message: "Invalid assessment id" });
+
+    const result = await pool.request()
+      .input("e_assessmentId", sql.Int, e_assessmentId)
+      .input("teacherId", sql.Int, teacherId)
+      .query(`
+        SELECT state, updatedAt FROM e_assessment_marking_sessions
+        WHERE e_assessment_id = @e_assessmentId AND teacher_id = @teacherId
+      `);
+
+    if (!result.recordset.length) return res.json({ state: null, updatedAt: null });
+
+    const row = result.recordset[0];
+    let state = null;
+    try { state = JSON.parse(row.state); } catch { state = null; }
+    res.json({ state, updatedAt: row.updatedAt });
+  } catch (err) {
+    console.error("GET MARKING SESSION ERROR:", err);
+    res.status(500).json({ message: err.message });
+  }
+};
+
+const saveMarkingSession = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const e_assessmentId = toInt(req.params.id);
+    const teacherId = toInt(req.user?.id);
+    if (!e_assessmentId) return res.status(400).json({ message: "Invalid assessment id" });
+
+    const { state } = req.body;
+    if (!state || typeof state !== "object") {
+      return res.status(400).json({ message: "No session state provided" });
+    }
+
+    // Guard against a runaway payload (shouldn't happen — this is just
+    // scores/remarks/highlights/flags for one batch — but NVARCHAR(MAX)
+    // is effectively unbounded, so cap it defensively).
+    const serialized = JSON.stringify(state).slice(0, 8_000_000);
+
+    const existing = await pool.request()
+      .input("e_assessmentId", sql.Int, e_assessmentId)
+      .input("teacherId", sql.Int, teacherId)
+      .query(`
+        SELECT id FROM e_assessment_marking_sessions
+        WHERE e_assessment_id = @e_assessmentId AND teacher_id = @teacherId
+      `);
+
+    if (existing.recordset.length) {
+      await pool.request()
+        .input("e_assessmentId", sql.Int, e_assessmentId)
+        .input("teacherId", sql.Int, teacherId)
+        .input("state", sql.NVarChar(sql.MAX), serialized)
+        .query(`
+          UPDATE e_assessment_marking_sessions
+          SET state = @state, updatedAt = GETDATE()
+          WHERE e_assessment_id = @e_assessmentId AND teacher_id = @teacherId
+        `);
+    } else {
+      await pool.request()
+        .input("e_assessmentId", sql.Int, e_assessmentId)
+        .input("teacherId", sql.Int, teacherId)
+        .input("state", sql.NVarChar(sql.MAX), serialized)
+        .query(`
+          INSERT INTO e_assessment_marking_sessions (e_assessment_id, teacher_id, state)
+          VALUES (@e_assessmentId, @teacherId, @state)
+        `);
+    }
+
+    res.json({ success: true, updatedAt: new Date().toISOString() });
+  } catch (err) {
+    console.error("SAVE MARKING SESSION ERROR:", err);
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// Called once the batch is fully saved & finished — the cached draft has
+// served its purpose (everything it held is now committed to
+// e_assessment_answers), so drop it rather than let a stale draft get
+// pulled back on the next visit.
+const clearMarkingSession = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const e_assessmentId = toInt(req.params.id);
+    const teacherId = toInt(req.user?.id);
+    if (!e_assessmentId) return res.status(400).json({ message: "Invalid assessment id" });
+
+    await pool.request()
+      .input("e_assessmentId", sql.Int, e_assessmentId)
+      .input("teacherId", sql.Int, teacherId)
+      .query(`
+        DELETE FROM e_assessment_marking_sessions
+        WHERE e_assessment_id = @e_assessmentId AND teacher_id = @teacherId
+      `);
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("CLEAR MARKING SESSION ERROR:", err);
+    res.status(500).json({ message: err.message });
+  }
+};
 
 const assignSubmission = async (req, res) => {
   try {
@@ -3018,6 +3152,7 @@ module.exports = {
   // submissions / marking
   getAllSubmissions, getAssessmentSubmissions, getSubmissionForMarking, getAllSubmissionsForMarking,
   saveMarking, saveMarkingBulk, assignSubmission, bulkAssignSubmissions, getNextSubmissionForMarking,
+  getMarkingSession, saveMarkingSession, clearMarkingSession,
 
   // remarks
   requestRemark, getRemarkRequests, reviewRemarkRequest,

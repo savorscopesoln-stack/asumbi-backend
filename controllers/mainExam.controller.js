@@ -2,6 +2,13 @@ const sql = require("mssql");
 const crypto = require("crypto");
 const { logExamAudit } = require("../utils/examAuditLog");
 const { getPassMark } = require("./mainExamAnalytics.controller");
+const {
+  WalletError,
+  fundNewExamination,
+  cancelExaminationFunding,
+  completeExaminationFunding,
+  getExaminationFundingState,
+} = require("../services/examFunding.service");
 
 /* =========================================================================
    MAIN EXAMINATION CRUD
@@ -20,7 +27,13 @@ const toInt = (v) => {
 
 // Kept small and explicit rather than free-text, so the dashboard/status
 // badges (§46/§47) always have a known, finite set of values to render.
-const VALID_STATUSES = ["draft", "published", "ongoing", "completed", "archived"];
+// 'cancelled' added in Phase 5 (wallet integration) — distinct from
+// 'archived': archiving is the normal soft-delete for an exam that ran
+// (or is running) to completion, while cancelling means the exam is
+// being called off before it ran and its reserved wallet credits are
+// released back to available_credits (see updateMainExamination and
+// archiveMainExamination below for exactly when each happens).
+const VALID_STATUSES = ["draft", "published", "ongoing", "completed", "archived", "cancelled"];
 
 const toDateOnly = (v) => {
   if (!v) return null;
@@ -44,6 +57,7 @@ const createMainExamination = async (req, res) => {
       description,
       start_date,
       end_date,
+      studentIds, // optional Phase 5 addition — explicit subset of the eligible cohort to fund now; defaults to the whole eligible cohort when omitted (see examFunding.service.js's fundNewExamination)
     } = req.body;
 
     if (!name || !String(name).trim()) {
@@ -56,10 +70,12 @@ const createMainExamination = async (req, res) => {
       return res.status(400).json({ success: false, message: "End date cannot be before start date" });
     }
 
+    const cohortYearVal = toInt(cohort_year);
+
     const result = await pool.request()
       .input("name", sql.NVarChar, String(name).trim())
       .input("academic_year", sql.NVarChar, academic_year || null)
-      .input("cohort_year", sql.Int, toInt(cohort_year))
+      .input("cohort_year", sql.Int, cohortYearVal)
       .input("programme", sql.NVarChar, programme || null)
       .input("department", sql.NVarChar, department || null)
       .input("term", sql.NVarChar, term || null)
@@ -77,15 +93,44 @@ const createMainExamination = async (req, res) => {
 
     const id = result.recordset[0].id;
 
+    /* ================= PHASE 5: FUND THE COHORT =================
+       "Sufficient students and credits: allow creation and atomically
+       reserve one credit for every selected eligible student" (spec).
+       requireFundableExamination (routes/mainExams.js) already ran the
+       same check pre-flight, but that read is not the security
+       boundary — fundNewExamination re-validates and does the actual,
+       row-locked reservation. If it fails for ANY reason (wallet
+       balance changed since the pre-flight read, race with another
+       admin, duplicate entitlement, etc.), the just-inserted draft row
+       is deleted — a compensating action so a creation request that
+       didn't get funded never leaves behind an examination that
+       LOOKS like it exists but was never actually paid for. */
+    let funding;
+    try {
+      funding = await fundNewExamination(pool, {
+        mainExaminationId: id,
+        cohortYear: cohortYearVal,
+        studentIds: Array.isArray(studentIds) ? studentIds : null,
+        actorId: req.user?.id,
+        actorRole: req.user?.role,
+      });
+    } catch (fundErr) {
+      await pool.request().input("id", sql.Int, id).query(`DELETE FROM main_examinations WHERE id = @id`);
+      if (fundErr instanceof WalletError) {
+        return res.status(400).json({ success: false, code: fundErr.code, message: fundErr.message });
+      }
+      throw fundErr;
+    }
+
     await logExamAudit(pool, {
       mainExaminationId: id,
       action: "main_examination_created",
       actorId: req.user?.id,
       actorRole: req.user?.role,
-      details: { name },
+      details: { name, studentsFunded: funding.reserved },
     });
 
-    res.status(201).json({ success: true, id });
+    res.status(201).json({ success: true, id, funding: { studentsFunded: funding.reserved, availableCredits: funding.availableCredits } });
   } catch (err) {
     console.error("CREATE MAIN EXAMINATION ERROR:", err);
     res.status(500).json({ success: false, message: "Server error creating examination" });
@@ -185,10 +230,11 @@ const updateMainExamination = async (req, res) => {
 
     const existing = await pool.request()
       .input("id", sql.Int, id)
-      .query(`SELECT id FROM main_examinations WHERE id = @id`);
+      .query(`SELECT id, status AS current_status FROM main_examinations WHERE id = @id`);
     if (!existing.recordset[0]) {
       return res.status(404).json({ success: false, message: "Main examination not found" });
     }
+    const currentStatus = existing.recordset[0].current_status;
 
     const {
       name,
@@ -208,6 +254,13 @@ const updateMainExamination = async (req, res) => {
     }
     if (status !== undefined && !VALID_STATUSES.includes(status)) {
       return res.status(400).json({ success: false, message: `Status must be one of: ${VALID_STATUSES.join(", ")}` });
+    }
+    // Phase 5 transition guards: a completed exam's credits are already
+    // consumed (spent) — cancelling it would incorrectly imply those
+    // credits should be released, so that transition is refused
+    // outright rather than silently doing nothing useful.
+    if (status === "cancelled" && currentStatus === "completed") {
+      return res.status(400).json({ success: false, message: "A completed examination cannot be cancelled" });
     }
 
     const startDateVal = start_date !== undefined ? toDateOnly(start_date) : undefined;
@@ -253,7 +306,30 @@ const updateMainExamination = async (req, res) => {
       details: req.body,
     });
 
-    res.json({ success: true });
+    /* ================= PHASE 5: FUNDING SIDE EFFECTS =================
+       Only fires when THIS request is the one moving status into
+       'completed' or 'cancelled' (status !== currentStatus check
+       avoids re-consuming/re-releasing on every unrelated field edit
+       to an exam that was already in that state — both underlying
+       service calls are additionally idempotent per student on their
+       own, so this is a belt-and-braces skip, not the only guard). */
+    let fundingResult = null;
+    if (status === "completed" && currentStatus !== "completed") {
+      fundingResult = await completeExaminationFunding(pool, {
+        mainExaminationId: id,
+        actorId: req.user?.id,
+        actorRole: req.user?.role,
+      });
+    } else if (status === "cancelled" && currentStatus !== "cancelled") {
+      fundingResult = await cancelExaminationFunding(pool, {
+        mainExaminationId: id,
+        reason: req.body?.cancellation_reason || "Examination cancelled by administrator",
+        actorId: req.user?.id,
+        actorRole: req.user?.role,
+      });
+    }
+
+    res.json({ success: true, funding: fundingResult });
   } catch (err) {
     console.error("UPDATE MAIN EXAMINATION ERROR:", err);
     res.status(500).json({ success: false, message: "Server error updating examination" });
@@ -271,6 +347,14 @@ const archiveMainExamination = async (req, res) => {
     const id = toInt(req.params.id);
     if (!id) return res.status(400).json({ success: false, message: "Invalid id" });
 
+    const before = await pool.request()
+      .input("id", sql.Int, id)
+      .query(`SELECT id, status FROM main_examinations WHERE id = @id`);
+    if (!before.recordset[0]) {
+      return res.status(404).json({ success: false, message: "Main examination not found" });
+    }
+    const statusBeforeArchive = before.recordset[0].status;
+
     const result = await pool.request()
       .input("id", sql.Int, id)
       .query(`
@@ -283,14 +367,36 @@ const archiveMainExamination = async (req, res) => {
       return res.status(404).json({ success: false, message: "Main examination not found" });
     }
 
+    /* ================= PHASE 5: IMPLICIT CANCELLATION ON ARCHIVE =================
+       Archiving is the normal soft-delete for an exam that ran (or is
+       running) — those entitlements are already 'consumed' and stay
+       untouched. But archiving a 'draft' or 'published' exam (one that
+       never got as far as 'ongoing') is, in wallet terms, the same
+       thing as cancelling it: nobody sat it, so any credits reserved
+       for its cohort should return to available_credits rather than
+       sit reserved against an archived exam forever. 'ongoing' and
+       'completed' exams are deliberately excluded from this — those
+       credits were legitimately spent (or are mid-spend) on an exam
+       that actually happened. */
+    let fundingResult = null;
+    if (statusBeforeArchive === "draft" || statusBeforeArchive === "published") {
+      fundingResult = await cancelExaminationFunding(pool, {
+        mainExaminationId: id,
+        reason: "Examination archived before it ran",
+        actorId: req.user?.id,
+        actorRole: req.user?.role,
+      });
+    }
+
     await logExamAudit(pool, {
       mainExaminationId: id,
       action: "main_examination_archived",
       actorId: req.user?.id,
       actorRole: req.user?.role,
+      details: fundingResult ? { creditsReleased: fundingResult.released } : undefined,
     });
 
-    res.json({ success: true });
+    res.json({ success: true, funding: fundingResult });
   } catch (err) {
     console.error("ARCHIVE MAIN EXAMINATION ERROR:", err);
     res.status(500).json({ success: false, message: "Server error archiving examination" });
@@ -379,6 +485,21 @@ const deleteMainExamination = async (req, res) => {
       return res.status(409).json({
         success: false,
         message: "This examination has scheduled subjects and can't be deleted. Archive it instead.",
+      });
+    }
+
+    // Phase 5: student_exam_entitlements.main_examination_id has an FK
+    // back to this table, so a funded exam's DELETE would fail on that
+    // constraint anyway — this check exists to give a clear, actionable
+    // 409 instead of a raw SQL foreign-key error. Deliberately refuses
+    // rather than auto-releasing: releasing wallet credits is a
+    // deliberate cancellation action (PUT status='cancelled', above),
+    // not a side effect an admin should get for free by hitting delete.
+    const fundingState = await getExaminationFundingState(pool, id);
+    if (fundingState.isFunded) {
+      return res.status(409).json({
+        success: false,
+        message: "This examination has wallet credits reserved or consumed against it and can't be deleted. Cancel it first to release unused credits, or archive it instead.",
       });
     }
 
