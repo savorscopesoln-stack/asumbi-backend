@@ -38,24 +38,26 @@ const { resolveReportTheme } = require("./reportThemes");
    "/uploads/website/<file>" (see middleware/websitePhotoUpload.js); this
    resolves it to the actual file on disk so pdfkit can embed it.
 ------------------------------------------------------------------------- */
+// Resolves a served path (e.g. "/uploads/website/<file>") to an actual
+// file on disk so pdfkit can embed it — shared by the institution's
+// logo/stamp and by each signing official's own signature/stamp below.
+// Returns null for anything missing/unset, which callers treat as
+// "nothing uploaded yet", not an error.
+function urlToDiskPath(url) {
+  if (!url) return null;
+  const candidate = path.join(__dirname, "..", url.replace(/^\/+/, ""));
+  return fs.existsSync(candidate) ? candidate : null;
+}
+
 async function getInstitutionHeader(pool) {
   try {
     const result = await pool.request().query(`SELECT TOP 1 * FROM SchoolSettings WHERE id = 1`);
     const settings = result.recordset[0] || {};
-    let logoDiskPath = null;
-    if (settings.logoUrl) {
-      const candidate = path.join(__dirname, "..", settings.logoUrl.replace(/^\/+/, ""));
-      if (fs.existsSync(candidate)) logoDiskPath = candidate;
-    }
-    // Same resolve-to-disk-path pattern as the logo, for the official
-    // stamp a transcript embeds next to its signing officials (see
-    // utils/transcriptPdf.js) — NULL/missing file just means "no stamp
-    // uploaded yet", not an error.
-    let stampDiskPath = null;
-    if (settings.stampUrl) {
-      const candidate = path.join(__dirname, "..", settings.stampUrl.replace(/^\/+/, ""));
-      if (fs.existsSync(candidate)) stampDiskPath = candidate;
-    }
+    const logoDiskPath = urlToDiskPath(settings.logoUrl);
+    // Same resolve-to-disk-path pattern as the logo, for the school-wide
+    // stamp a transcript falls back to when a signing official hasn't
+    // uploaded their own (see utils/transcriptPdf.js).
+    const stampDiskPath = urlToDiskPath(settings.stampUrl);
     return {
       schoolName: settings.schoolName || "",
       address: settings.address || "",
@@ -87,7 +89,7 @@ async function getInstitutionHeader(pool) {
 async function getSigningOfficials(pool) {
   try {
     const result = await pool.request().query(`
-      SELECT so.title, so.name, so.teacherId, t.name AS teacherName
+      SELECT so.title, so.name, so.teacherId, so.signatureUrl, so.stampUrl, t.name AS teacherName
       FROM SchoolOfficials so
       LEFT JOIN Teachers t ON t.id = so.teacherId
       WHERE so.isSignatory = 1
@@ -96,6 +98,12 @@ async function getSigningOfficials(pool) {
     return (result.recordset || []).map((o) => ({
       title: o.title,
       name: o.teacherId ? (o.teacherName || o.name) : o.name,
+      // Each official's OWN uploaded signature/stamp (School Settings
+      // → Officials), resolved to disk so transcriptPdf.js can embed
+      // it next to that official's name instead of always falling
+      // back to the single school-wide stamp.
+      signatureDiskPath: urlToDiskPath(o.signatureUrl),
+      stampDiskPath: urlToDiskPath(o.stampUrl),
     }));
   } catch (err) {
     console.error("⚠️ Could not load signing officials for report export:", err.message);

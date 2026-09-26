@@ -321,13 +321,16 @@ function drawSignatureBlock(doc, officials, institution, theme) {
   doc.fontSize(9).font("Helvetica").fillColor("#000")
     .text(new Date().toLocaleDateString(), sigX, topY + 12, { width: sigWidth, align: "right" });
 
-  // Official stamp — an embedded image if the school has uploaded one
-  // (SchoolSettings.stampUrl), otherwise the same plain dashed-circle
-  // placeholder convention the on-screen transcript/report views
-  // already use rather than leaving the space blank.
-  if (institution.stampDiskPath) {
+  // Official stamp — prefer the primary signer's OWN uploaded stamp
+  // (SchoolOfficials.stampUrl, set in School Settings), falling back to
+  // the single school-wide stamp (SchoolSettings.stampUrl) for officials
+  // who haven't uploaded a personal one, and finally to the same plain
+  // dashed-circle placeholder convention the on-screen transcript/report
+  // views already use rather than leaving the space blank.
+  const stampDiskPath = officials[0]?.stampDiskPath || institution.stampDiskPath;
+  if (stampDiskPath) {
     try {
-      doc.image(institution.stampDiskPath, stampX, topY, { width: stampSize, height: stampSize });
+      doc.image(stampDiskPath, stampX, topY, { width: stampSize, height: stampSize });
     } catch (err) {
       console.error("⚠️ Could not embed stamp in transcript PDF:", err.message);
     }
