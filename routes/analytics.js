@@ -32,7 +32,7 @@ router.get("/teacher", async (req, res) => {
         AVG(m.percentage) AS average
       FROM Marks m
       JOIN Assessments a ON a.id = m.assessmentId
-      GROUP BY a.name
+      GROUP BY a.name, a.id
       ORDER BY a.id
     `);
 

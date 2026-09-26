@@ -124,7 +124,7 @@ const listExamsWithAllocations = async (req, res) => {
       FROM main_examinations me
       LEFT JOIN student_exam_entitlements see ON see.main_examination_id = me.id
       WHERE me.status <> 'archived'
-      GROUP BY me.id, me.name, me.status, me.cohort_year, me.academic_year
+      GROUP BY me.id, me.name, me.status, me.cohort_year, me.academic_year, me.createdAt
       ORDER BY me.createdAt DESC
     `);
     res.json({ success: true, examinations: result.recordset });
