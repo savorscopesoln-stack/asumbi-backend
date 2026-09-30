@@ -62,13 +62,45 @@ async function getWalletSnapshot(pool) {
   return result.recordset[0] || null;
 }
 
-/** Lock and read the wallet row inside an already-open transaction. Always the first statement of any mutating transaction below. */
+/** Lock and read the wallet row inside an already-open transaction. Always the first statement of any mutating transaction below.
+ *
+ *  The wallet is a singleton (id = 1). If that row is missing (table created
+ *  without its seed row, row deleted by hand, tenant DB restored from a partial
+ *  backup, etc.) we must NOT return undefined — every caller dereferences the
+ *  result. Instead:
+ *    - brand-new wallet (no ledger history at all): safely create the zero-balance
+ *      row under a range lock, then lock+read it as normal;
+ *    - wallet has ledger history: the row was lost AFTER credits moved, so silently
+ *      re-seeding at 0 would hide a real discrepancy — throw WALLET_MISSING instead.
+ */
 async function lockWallet(transaction) {
-  const result = await new sql.Request(transaction).query(`
+  const selectSql = `
     SELECT id, available_credits, reserved_credits, total_purchased, total_allocated
     FROM institution_wallets WITH (UPDLOCK, HOLDLOCK)
     WHERE id = 1
+  `;
+  let result = await new sql.Request(transaction).query(selectSql);
+  if (result.recordset[0]) return result.recordset[0];
+
+  const history = await new sql.Request(transaction).query(`SELECT TOP 1 id FROM wallet_ledger`);
+  if (history.recordset[0]) {
+    throw new WalletError(
+      "Institution wallet row is missing but the ledger has history — refusing to re-create it at zero. Reconcile institution_wallets against wallet_ledger first.",
+      "WALLET_MISSING"
+    );
+  }
+
+  // HOLDLOCK on the absent key holds a range lock until commit, so concurrent
+  // first-time callers serialize here instead of both inserting.
+  await new sql.Request(transaction).query(`
+    IF NOT EXISTS (SELECT 1 FROM institution_wallets WITH (UPDLOCK, HOLDLOCK) WHERE id = 1)
+      INSERT INTO institution_wallets (id, available_credits, reserved_credits, total_purchased, total_allocated)
+      VALUES (1, 0, 0, 0, 0)
   `);
+  result = await new sql.Request(transaction).query(selectSql);
+  if (!result.recordset[0]) {
+    throw new WalletError("Institution wallet could not be initialised", "WALLET_MISSING");
+  }
   return result.recordset[0];
 }
 

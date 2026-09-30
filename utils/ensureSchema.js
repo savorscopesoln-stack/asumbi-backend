@@ -1922,6 +1922,14 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
         VALUES (1, 0, 0, 0, 0)
       END
     `);
+    // Seed the singleton row even when the table already existed. The seed above
+    // only runs on table creation, so a table that exists without id=1 would
+    // otherwise never get its wallet (=> lockWallet returned undefined).
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT 1 FROM institution_wallets WHERE id = 1)
+        INSERT INTO institution_wallets (id, available_credits, reserved_credits, total_purchased, total_allocated)
+        VALUES (1, 0, 0, 0, 0)
+    `);
 
     /* ---------------- wallet_ledger ----------------
        Immutable, append-only. Never UPDATEd or DELETEd by application
