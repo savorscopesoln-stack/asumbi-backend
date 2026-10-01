@@ -18,6 +18,7 @@ require("./reportExport.test.js");
 require("./regression.test.js");
 require("./walletLedger.test.js");
 require("./walletController.test.js");
+require("./financeInvoicing.test.js");
 
 (async () => {
   const ok = await summarize();

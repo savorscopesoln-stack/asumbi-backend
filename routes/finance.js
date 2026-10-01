@@ -15,6 +15,15 @@ const {
   enrollMfa,
   confirmMfa,
 } = require("../controllers/finance.controller");
+const {
+  createInvoice,
+  listInvoices,
+  downloadInvoicePdf,
+  voidInvoice,
+  listReceipts,
+  downloadReceiptPdf,
+  downloadPaymentReceipt,
+} = require("../controllers/financeInvoice.controller");
 
 /* =========================================================================
    Every route below is protect + financeOnly — financeOnly is a
@@ -41,6 +50,14 @@ router.get("/institutions/:tenantKey/payments", listPayments);
 router.get("/institutions/:tenantKey/issuances", listIssuances);
 router.get("/institutions/:tenantKey/audit-log", listAuditLog);
 
+router.get("/institutions/:tenantKey/invoices", listInvoices);
+router.get("/institutions/:tenantKey/invoices/:invoiceId/pdf", downloadInvoicePdf);
+router.get("/institutions/:tenantKey/receipts", listReceipts);
+router.get("/institutions/:tenantKey/receipts/:receiptId/pdf", downloadReceiptPdf);
+router.get("/institutions/:tenantKey/payments/:paymentId/receipt", downloadPaymentReceipt);
+
+router.post("/institutions/:tenantKey/invoices", createInvoice);
+router.post("/institutions/:tenantKey/invoices/:invoiceId/void", voidInvoice);
 router.post("/institutions/:tenantKey/payments/verify", verifyPayment);
 router.post("/institutions/:tenantKey/credits/issue", issueCredits);
 router.post("/institutions/:tenantKey/credits/reverse", reverseCredits);

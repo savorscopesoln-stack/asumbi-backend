@@ -7,7 +7,7 @@ const {
   reverseIssuance,
   WalletError,
 } = require("../services/walletLedger.service");
-const { generateUniqueReference } = require("../utils/creditReference");
+const { recordPayment } = require("../services/invoicing.service");
 const { logFinanceAudit } = require("../utils/financeAuditLog");
 const { generateSecret, verifyToken, otpauthUri } = require("../utils/totp");
 
@@ -178,54 +178,59 @@ const listAuditLog = async (req, res) => {
    just records that fact. The unique index on payment_reference
    (ensureSchema.js) is the hard backstop against re-verifying the
    same real-world payment twice (spec test 5/6); a caller-supplied
-   duplicate reference is rejected here with a clear message rather
-   than a raw SQL error. */
+   duplicate reference is rejected with a clear message rather
+   than a raw SQL error.
+
+   Confirming a payment ALSO generates its receipt, atomically (see
+   services/invoicing.service.js recordPayment): the payment row, the
+   receipt row and — when `invoiceId` is supplied — the invoice's
+   issued -> paid transition all commit together or not at all. With an
+   invoice, `amount`/`currency` may be omitted and default to the
+   invoice's total/currency. The response carries `receipt.pdfPath` so
+   the frontend can download the receipt straight away. */
 const verifyPayment = async (req, res) => {
   try {
     const { tenantKey } = req.params;
     assertValidTenant(tenantKey);
-    const { amount, currency = "KES", method = null, paymentReference = null, notes = null } = req.body || {};
+    const { amount, currency, method = null, paymentReference = null, notes = null, invoiceId = null } = req.body || {};
 
-    const numericAmount = Number(amount);
-    if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
-      return res.status(400).json({ success: false, message: "A positive payment amount is required" });
+    let parsedInvoiceId = null;
+    if (invoiceId !== null && invoiceId !== undefined && invoiceId !== "") {
+      parsedInvoiceId = Number(invoiceId);
+      if (!Number.isInteger(parsedInvoiceId) || parsedInvoiceId <= 0) {
+        return res.status(400).json({ success: false, message: "Invalid invoice id" });
+      }
+    }
+    if (!parsedInvoiceId) {
+      const numericAmount = Number(amount);
+      if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
+        return res.status(400).json({ success: false, message: "A positive payment amount is required" });
+      }
     }
 
     const pool = await getPool(tenantKey);
-    const reference = paymentReference?.trim() || await generateUniqueReference(pool, "institution_payments", "payment_reference", "PAY");
-
-    let paymentId;
-    try {
-      const result = await pool.request()
-        .input("paymentReference", sql.NVarChar(80), reference)
-        .input("amount", sql.Decimal(18, 2), numericAmount)
-        .input("currency", sql.NVarChar(3), currency)
-        .input("method", sql.NVarChar(50), method)
-        .input("notes", sql.NVarChar(500), notes)
-        .input("verifiedBy", sql.Int, req.user?.id || null)
-        .query(`
-          INSERT INTO institution_payments (payment_reference, amount, currency, method, notes, verified_by)
-          OUTPUT INSERTED.id
-          VALUES (@paymentReference, @amount, @currency, @method, @notes, @verifiedBy)
-        `);
-      paymentId = result.recordset[0].id;
-    } catch (err) {
-      if (err.number === 2601 || err.number === 2627) {
-        return res.status(409).json({ success: false, message: `Payment reference "${reference}" has already been verified` });
-      }
-      throw err;
-    }
-
-    await logFinanceAudit(pool, {
-      action: "payment_verified",
-      institutionPaymentId: paymentId,
-      actorId: req.user?.id,
+    const profile = await loadInstitutionProfile(pool);
+    const { payment, receipt, invoice } = await recordPayment(pool, {
+      amount: amount === undefined || amount === "" ? null : amount,
+      currency: currency || null,
+      method, paymentReference, notes,
+      invoiceId: parsedInvoiceId,
+      institutionName: profile?.schoolName || tenantKey,
+      verifiedBy: req.user?.id || null,
       actorRole: req.user?.role,
-      details: { tenantKey, payment_reference: reference, amount: numericAmount, currency },
+      tenantKey,
     });
 
-    res.json({ success: true, payment: { id: paymentId, payment_reference: reference, amount: numericAmount, currency } });
+    res.json({
+      success: true,
+      payment,
+      invoice,
+      receipt: { ...receipt, pdfPath: `/finance/institutions/${tenantKey}/receipts/${receipt.id}/pdf` },
+    });
   } catch (err) {
+    if (err && err.name === "InvoiceError") {
+      return res.status(err.statusCode || 400).json({ success: false, code: err.code, message: err.message });
+    }
     console.error("FINANCE VERIFY PAYMENT ERROR:", err);
     res.status(err.statusCode || 500).json({ success: false, message: err.message || "Server error verifying payment" });
   }
@@ -390,4 +395,7 @@ module.exports = {
   reverseCredits,
   enrollMfa,
   confirmMfa,
+  // shared with financeInvoice.controller.js
+  assertValidTenant,
+  loadInstitutionProfile,
 };
