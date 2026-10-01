@@ -2269,6 +2269,103 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       )
     `);
 
+    /* ---------------- finance_invoices ----------------
+       Invoices Doravo Finance raises against an institution for a
+       purchase of examination credits. One invoice = one credit
+       quantity at one unit price. Lifecycle: issued -> paid, or
+       issued -> void. A PAID invoice is never voided or edited (a
+       refund is a credit reversal + a fresh document, never a rewrite
+       of history), and an invoice is never deleted.
+       bill_to_* is a SNAPSHOT of the institution's details at issue
+       time so the PDF re-renders identically later even if the
+       school's profile changes. invoice_number is assigned from the
+       identity id inside the creating transaction (INV-YYYY-NNNNN). */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='finance_invoices' AND xtype='U')
+      CREATE TABLE finance_invoices (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        invoice_number NVARCHAR(40) NULL,
+        credit_quantity INT NOT NULL,
+        unit_price DECIMAL(18,2) NOT NULL,
+        currency NVARCHAR(3) NOT NULL DEFAULT 'KES',
+        subtotal DECIMAL(18,2) NOT NULL,
+        tax_rate DECIMAL(5,2) NOT NULL DEFAULT 0,
+        tax_amount DECIMAL(18,2) NOT NULL DEFAULT 0,
+        total_amount DECIMAL(18,2) NOT NULL,
+        status NVARCHAR(20) NOT NULL DEFAULT 'issued',
+        issue_date DATETIME NOT NULL DEFAULT GETDATE(),
+        due_date DATE NULL,
+        notes NVARCHAR(500) NULL,
+        bill_to_name NVARCHAR(200) NULL,
+        bill_to_email NVARCHAR(200) NULL,
+        bill_to_phone NVARCHAR(50) NULL,
+        institution_payment_id INT NULL,
+        paid_at DATETIME NULL,
+        voided_at DATETIME NULL,
+        void_reason NVARCHAR(500) NULL,
+        issued_by INT NULL,
+        createdAt DATETIME NOT NULL DEFAULT GETDATE(),
+        CONSTRAINT CK_finance_invoices_quantity CHECK (credit_quantity > 0),
+        CONSTRAINT CK_finance_invoices_amounts CHECK (unit_price > 0 AND total_amount > 0),
+        CONSTRAINT CK_finance_invoices_status CHECK (status IN ('issued','paid','void')),
+        CONSTRAINT FK_finance_invoices_payment FOREIGN KEY (institution_payment_id)
+          REFERENCES institution_payments(id)
+      )
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (
+        SELECT * FROM sys.indexes
+        WHERE name = N'UQ_finance_invoices_number' AND object_id = Object_ID(N'finance_invoices')
+      )
+      CREATE UNIQUE NONCLUSTERED INDEX UQ_finance_invoices_number
+      ON finance_invoices(invoice_number) WHERE invoice_number IS NOT NULL
+    `);
+
+    /* ---------------- finance_receipts ----------------
+       One receipt per confirmed payment (unique index on
+       institution_payment_id makes generation idempotent — a retry or
+       a double-click can never mint a second receipt for the same
+       payment). Amount/currency/reference/method are snapshotted from
+       the payment; invoice_id is set when the payment settled an
+       invoice. Never edited or deleted. */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='finance_receipts' AND xtype='U')
+      CREATE TABLE finance_receipts (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        receipt_number NVARCHAR(40) NULL,
+        institution_payment_id INT NOT NULL,
+        invoice_id INT NULL,
+        amount DECIMAL(18,2) NOT NULL,
+        currency NVARCHAR(3) NOT NULL DEFAULT 'KES',
+        payment_reference NVARCHAR(80) NOT NULL,
+        payment_method NVARCHAR(50) NULL,
+        received_from NVARCHAR(200) NULL,
+        issued_by INT NULL,
+        issued_at DATETIME NOT NULL DEFAULT GETDATE(),
+        createdAt DATETIME NOT NULL DEFAULT GETDATE(),
+        CONSTRAINT FK_finance_receipts_payment FOREIGN KEY (institution_payment_id)
+          REFERENCES institution_payments(id),
+        CONSTRAINT FK_finance_receipts_invoice FOREIGN KEY (invoice_id)
+          REFERENCES finance_invoices(id)
+      )
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (
+        SELECT * FROM sys.indexes
+        WHERE name = N'UQ_finance_receipts_payment' AND object_id = Object_ID(N'finance_receipts')
+      )
+      CREATE UNIQUE NONCLUSTERED INDEX UQ_finance_receipts_payment
+      ON finance_receipts(institution_payment_id)
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (
+        SELECT * FROM sys.indexes
+        WHERE name = N'UQ_finance_receipts_number' AND object_id = Object_ID(N'finance_receipts')
+      )
+      CREATE UNIQUE NONCLUSTERED INDEX UQ_finance_receipts_number
+      ON finance_receipts(receipt_number) WHERE receipt_number IS NOT NULL
+    `);
+
     /* ---------------- Users: finance role support ----------------
        Finance accounts are Users rows with role='finance' (Phase 1
        Option A — no new central identity store exists to hook into
@@ -2295,7 +2392,7 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       ALTER TABLE Users ADD mfaEnabled BIT NOT NULL DEFAULT 0
     `);
 
-    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, PortalPageSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, leave_outs code-verification columns, meal_daily_codes, leave_auto_approve, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl, Students.profileCompleted, student_profile_change_requests, website_content, contact_messages, newsletter_subscribers, e_assessments.cover_page_url, e_assessments.cover_page_width/height, e_assessment_question_images, e_assessment_violation_photos, e_assessment_sync_devices, e_assessment_sync_devices.tenant_key, e_assessment_sync_device_assessments, e_assessment_sync_logs, e_assessment_submissions.sync_batch_id, SchoolSettings, SchoolOfficials, SchoolOfficials.stampUrl, ClassTeachers.stampUrl, GradingSystem, main_examinations, exam_subject_sessions, exam_audit_log, Assessments.examScope/sourceSystem/sourceRefId, Marks indexes, main_examinations.is_report_exam, institution_wallets, wallet_ledger, institution_payments, credit_issuances, student_exam_entitlements, institution_exam_billing_settings, student_exam_payments, finance_audit_log, Users.mfaSecret/mfaEnabled)");
+    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, PortalPageSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, leave_outs code-verification columns, meal_daily_codes, leave_auto_approve, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl, Students.profileCompleted, student_profile_change_requests, website_content, contact_messages, newsletter_subscribers, e_assessments.cover_page_url, e_assessments.cover_page_width/height, e_assessment_question_images, e_assessment_violation_photos, e_assessment_sync_devices, e_assessment_sync_devices.tenant_key, e_assessment_sync_device_assessments, e_assessment_sync_logs, e_assessment_submissions.sync_batch_id, SchoolSettings, SchoolOfficials, SchoolOfficials.stampUrl, ClassTeachers.stampUrl, GradingSystem, main_examinations, exam_subject_sessions, exam_audit_log, Assessments.examScope/sourceSystem/sourceRefId, Marks indexes, main_examinations.is_report_exam, institution_wallets, wallet_ledger, institution_payments, credit_issuances, student_exam_entitlements, institution_exam_billing_settings, student_exam_payments, finance_audit_log, finance_invoices, finance_receipts, Users.mfaSecret/mfaEnabled)");
   } catch (err) {
     console.error("⚠️  Schema ensure failed:", err.message);
   }
