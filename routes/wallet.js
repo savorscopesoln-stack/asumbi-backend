@@ -12,6 +12,12 @@ const {
   removeStudentAllocation,
   getCreditRequestInfo,
 } = require("../controllers/wallet.controller");
+const {
+  listMyInvoices,
+  listMyReceipts,
+  downloadMyInvoicePdf,
+  downloadMyReceiptPdf,
+} = require("../controllers/walletDocuments.controller");
 
 /* Same pattern as every other admin sub-page in this app: protect +
    requirePage("<Page Key>") — "admin" always passes, sub_admin /
@@ -44,5 +50,12 @@ router.post("/exams/:mainExamId/allocate", allocateCredits);
 // distinct from cancelling/archiving the whole examination.
 router.delete("/exams/:mainExamId/students/:studentId", removeStudentAllocation);
 router.get("/credit-request", getCreditRequestInfo);
+
+// Read-only: invoices Doravo Finance raised for this institution and the
+// receipts issued on confirmed payments (same PDFs Finance downloads).
+router.get("/invoices", listMyInvoices);
+router.get("/invoices/:invoiceId/pdf", downloadMyInvoicePdf);
+router.get("/receipts", listMyReceipts);
+router.get("/receipts/:receiptId/pdf", downloadMyReceiptPdf);
 
 module.exports = router;

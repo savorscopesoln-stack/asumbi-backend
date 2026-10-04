@@ -369,6 +369,34 @@ test("downloadInvoicePdf: 400 for a bad id, 404 when missing, PDF attachment hea
   assert.strictEqual(res.body.slice(0, 5).toString(), "%PDF-");
 });
 
+test("tenant wallet documents: serve the caller's own pool only; 400/404/PDF headers", async () => {
+  const walletDocs = require("../controllers/walletDocuments.controller");
+  const { pool } = makeMockPool([["FROM finance_invoices WHERE id", (inputs) => (inputs.id === 7 ? [{ ...sampleInvoice, id: 7 }] : [])]]);
+
+  let res = makeRes();
+  await walletDocs.downloadMyInvoicePdf(makeReq({ pool, params: { invoiceId: "abc" } }), res);
+  assert.strictEqual(res.statusCode, 400);
+
+  res = makeRes();
+  await walletDocs.downloadMyInvoicePdf(makeReq({ pool, params: { invoiceId: "99" } }), res);
+  assert.strictEqual(res.statusCode, 404);
+
+  const headers = {};
+  res = makeRes();
+  res.setHeader = (k, v) => { headers[k] = v; };
+  await walletDocs.downloadMyInvoicePdf(makeReq({ pool, params: { invoiceId: "7" } }), res);
+  assert.strictEqual(res.statusCode, 200);
+  assert.strictEqual(headers["Content-Disposition"], 'attachment; filename="INV-2026-00007.pdf"');
+  assert.strictEqual(res.body.slice(0, 5).toString(), "%PDF-");
+});
+
+test("issuer profile: defaults to Doravo and never prints the legacy company name", () => {
+  const { getIssuerProfile } = require("../utils/financeDocuments");
+  assert.strictEqual(getIssuerProfile({}).name, "Doravo");
+  assert.strictEqual(getIssuerProfile({ INVOICE_ISSUER_NAME: "Savorscope Solutions" }).name, "Doravo");
+  assert.strictEqual(getIssuerProfile({ INVOICE_ISSUER_NAME: "Doravo Ltd" }).name, "Doravo Ltd");
+});
+
 test("finance routes: an unknown institution is a 404 for every invoice/receipt endpoint", async () => {
   const { pool } = makeMockPool([]);
   activePool = pool;
