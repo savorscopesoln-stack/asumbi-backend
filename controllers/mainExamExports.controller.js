@@ -286,7 +286,7 @@ const SHAPES = {
     const rows = data.rows || [];
     const scored = rows.filter((r) => r.percentage != null);
     const totals = scored.length
-      ? { name: "Average", percentage: Math.round((scored.reduce((a, r) => a + r.percentage, 0) / scored.length) * 10) / 10 }
+      ? { name: "Average", percentage: Math.round(((scored.reduce((a, r) => a + r.percentage, 0) / scored.length) + Number.EPSILON) * 100) / 100 }
       : null;
     return {
       title: `Subject Results — ${data.subject?.subject || ""}`,

@@ -44,8 +44,9 @@ const MIN_DIFFICULTY_SAMPLE = 5;
 const MIN_DISCRIMINATION_SAMPLE = 10;
 const DISCRIMINATION_GROUP_FRACTION = 0.27; // standard top/bottom 27% split
 
-const round1 = (n) => (n == null ? null : Math.round(n * 10) / 10);
-const pct = (num, denom) => (denom > 0 ? round1((num / denom) * 100) : null);
+const round2 = (n) => (n == null ? null : Math.round((Number(n) + Number.EPSILON) * 100) / 100);
+const round1 = (n) => (n == null ? null : Math.round(n * 10) / 10); // minutes only
+const pct = (num, denom) => (denom > 0 ? round2((num / denom) * 100) : null);
 
 // Same default the standalone Grading System settings page falls back to
 // (see getGradingSystem in eAssessment.controller.js) — kept in sync so a
@@ -205,11 +206,11 @@ async function computeMainExaminationSummary(pool, id) {
   // (falls back to 40% if that's never been configured on this
   // tenant) — never a second, independently-set number.
   const performance = {
-    mean: round1(perfRow.mean),
-    median: round1(perfRow.median),
-    highest: round1(perfRow.highest),
-    lowest: round1(perfRow.lowest),
-    std_dev: round1(perfRow.std_dev),
+    mean: round2(perfRow.mean),
+    median: round2(perfRow.median),
+    highest: round2(perfRow.highest),
+    lowest: round2(perfRow.lowest),
+    std_dev: round2(perfRow.std_dev),
     sample_size: perfRow.n || 0,
     pass_mark: passMark,
     pass_rate: perfRow.n ? pct(perfRow.passed, perfRow.n) : null,
@@ -269,9 +270,9 @@ async function computeMainExaminationSummary(pool, id) {
         registered: perSessionMap[s.session_id] || 0,
         attempted: attemptedMap[s.e_assessment_id] || 0,
         completed: perf.completed || 0,
-        mean: round1(perf.mean),
-        highest: round1(perf.highest),
-        lowest: round1(perf.lowest),
+        mean: round2(perf.mean),
+        highest: round2(perf.highest),
+        lowest: round2(perf.lowest),
         pass_rate: perf.completed ? pct(perf.passed, perf.completed) : null,
       };
     });
@@ -388,9 +389,9 @@ function computeClassPerformance(rows, passMark) {
       class: className,
       registered: group.length,
       scored: scored.length,
-      mean: round1(mean),
-      highest: scored.length ? round1(Math.max(...scored.map((r) => r.average_percentage))) : null,
-      lowest: scored.length ? round1(Math.min(...scored.map((r) => r.average_percentage))) : null,
+      mean: round2(mean),
+      highest: scored.length ? round2(Math.max(...scored.map((r) => r.average_percentage))) : null,
+      lowest: scored.length ? round2(Math.min(...scored.map((r) => r.average_percentage))) : null,
       pass_rate: scored.length ? pct(scored.filter((r) => r.average_percentage >= passMark).length, scored.length) : null,
     });
   });
@@ -484,7 +485,7 @@ async function loadNominalRoll(pool, mainExaminationId) {
         not_registered: false,
         score,
         total_marks: subj.total_marks,
-        percentage: score != null && subj.total_marks > 0 ? round1((score / subj.total_marks) * 100) : null,
+        percentage: score != null && subj.total_marks > 0 ? round2((score / subj.total_marks) * 100) : null,
       };
     });
     return {
@@ -497,7 +498,7 @@ async function loadNominalRoll(pool, mainExaminationId) {
       marks,
       total_obtained: anyScored ? totalObtained : null,
       total_possible: anyScored ? totalPossible : null,
-      average_percentage: anyScored && totalPossible > 0 ? round1((totalObtained / totalPossible) * 100) : null,
+      average_percentage: anyScored && totalPossible > 0 ? round2((totalObtained / totalPossible) * 100) : null,
     };
   });
 
@@ -626,9 +627,9 @@ const getSubjectAnalytics = async (req, res) => {
     `);
     const perfRow = perfResult.recordset[0] || {};
     const performance = {
-      mean: round1(perfRow.mean), median: round1(perfRow.median),
-      highest: round1(perfRow.highest), lowest: round1(perfRow.lowest),
-      std_dev: round1(perfRow.std_dev), sample_size: perfRow.n || 0,
+      mean: round2(perfRow.mean), median: round2(perfRow.median),
+      highest: round2(perfRow.highest), lowest: round2(perfRow.lowest),
+      std_dev: round2(perfRow.std_dev), sample_size: perfRow.n || 0,
       pass_mark: passMark,
       pass_rate: perfRow.n ? pct(perfRow.passed, perfRow.n) : null,
       pass_rate_note: perfRow.n ? `Candidates scoring at or above the configured pass mark (${passMark}%).` : "Unavailable — no candidates have been scored yet.",
@@ -697,7 +698,7 @@ const getSubjectAnalytics = async (req, res) => {
           correct_pct: correctPct,
           incorrect_pct: incorrectPct,
           unanswered_pct: pct(unanswered, totalSubmissions),
-          avg_marks_awarded: round1(st.avg_marks_awarded),
+          avg_marks_awarded: round2(st.avg_marks_awarded),
           difficulty: isEssay
             ? (st.avg_marks_awarded != null && totalSubmissions >= MIN_DIFFICULTY_SAMPLE
                 ? difficultyLabel(pct(st.avg_marks_awarded, q.marks || 1), totalSubmissions)
@@ -755,7 +756,7 @@ const getSubjectAnalytics = async (req, res) => {
         GROUP BY a.question_id
       `);
       discrimination = discResult.recordset.map((r) => {
-        const index = round1((r.top_correct - r.bottom_correct) / groupSize);
+        const index = round2((r.top_correct - r.bottom_correct) / groupSize);
         return { question_id: r.question_id, discrimination_index: index, label: discriminationLabel(index) };
       });
     }
@@ -900,7 +901,7 @@ const getMainExamStudentAnalytics = async (req, res) => {
       subjects_registered: r.subjects_registered,
       subjects_completed: r.subjects_completed,
       subjects_incomplete: Math.max(0, r.subjects_registered - r.subjects_completed),
-      overall_average: round1(r.overall_average),
+      overall_average: round2(r.overall_average),
     }));
 
     res.json({ success: true, students });
@@ -946,7 +947,7 @@ const getStudentExaminationProfile = async (req, res) => {
       `);
 
     const subjects = rowsResult.recordset.map((r) => {
-      const percentage = r.score != null && r.total_marks > 0 ? round1((r.score / r.total_marks) * 100) : null;
+      const percentage = r.score != null && r.total_marks > 0 ? round2((r.score / r.total_marks) * 100) : null;
       let status;
       if (r.score != null) status = "completed";
       else if (r.session_status === "ended" || r.session_status === "completed") status = "absent";
@@ -963,7 +964,7 @@ const getStudentExaminationProfile = async (req, res) => {
     });
 
     const scored = subjects.filter((s) => s.percentage != null);
-    const overallAverage = scored.length ? round1(scored.reduce((a, s) => a + s.percentage, 0) / scored.length) : null;
+    const overallAverage = scored.length ? round2(scored.reduce((a, s) => a + s.percentage, 0) / scored.length) : null;
 
     res.json({
       success: true,

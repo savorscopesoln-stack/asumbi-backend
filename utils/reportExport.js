@@ -174,7 +174,7 @@ function addReportSheet(workbook, { name, title, subtitle, columns, rows, totals
   // Percentage columns get a real Excel number format (not just a "%"
   // string) so totals/sorting/filtering behave like actual percentages
   // (§31 "appropriate number formats"). Values are expected as plain
-  // numbers (e.g. 68.4), stored as 68.4/100 with format "0.0%". Applied
+  // numbers (e.g. 68.4), stored as 68.4/100 with format "0.00%". Applied
   // to both the data rows and the totals row (if any) — a totals row
   // left unconverted would show "70.25" right below cells reading
   // "68.4%", which is worse than not formatting anything at all.
@@ -186,8 +186,21 @@ function addReportSheet(workbook, { name, title, subtitle, columns, rows, totals
       const cellRef = XLSX.utils.encode_cell({ r: excelRow, c: colIdx });
       const cell = ws[cellRef];
       if (cell && typeof cell.v === "number") {
-        cell.v = cell.v / 100;
-        cell.z = "0.0%";
+        cell.v = Math.round((cell.v + Number.EPSILON) * 100) / 100 / 100;
+        cell.z = "0.00%";
+      }
+    });
+  });
+  // Every other non-whole number (marks, means, averages…) is rounded to
+  // 2 decimal places too, so scores read consistently across all reports.
+  columns.forEach((c, colIdx) => {
+    if (c.percent) return;
+    allDataRows.forEach((row, rowIdx) => {
+      const cellRef = XLSX.utils.encode_cell({ r: headerRowIndex + 1 + rowIdx, c: colIdx });
+      const cell = ws[cellRef];
+      if (cell && typeof cell.v === "number" && !Number.isInteger(cell.v)) {
+        cell.v = Math.round((cell.v + Number.EPSILON) * 100) / 100;
+        cell.z = "0.00";
       }
     });
   });
@@ -361,7 +374,12 @@ function drawPdfTable(doc, { columns, rows, theme }) {
       // Same lineBreak:false / ellipsis reasoning as drawHeaderRow above —
       // keep every value cell to the single line rowHeight already
       // budgets for it, so pdfkit never auto-paginates mid-row.
-      doc.text(val == null || val === "" ? "-" : String(val), x + 3, y + 4, { width: colWidths[i] - 6, align: c.align || "left", lineBreak: false, ellipsis: true });
+      const shown = val == null || val === ""
+        ? "-"
+        : (typeof val === "number" && (c.percent || !Number.isInteger(val)))
+          ? val.toFixed(2)
+          : String(val);
+      doc.text(shown, x + 3, y + 4, { width: colWidths[i] - 6, align: c.align || "left", lineBreak: false, ellipsis: true });
       x += colWidths[i];
     });
     y += rowHeight;

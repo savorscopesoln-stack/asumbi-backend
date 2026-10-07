@@ -4,7 +4,7 @@ const { buildTranscriptPdf } = require("../utils/transcriptPdf");
 const { loadGradingSystem, getGradeForScore, getOverallResultForScore } = require("../utils/grading");
 
 const toInt = (v) => { const n = parseInt(v, 10); return Number.isNaN(n) ? null : n; };
-const round1 = (n) => (n == null ? null : Math.round(n * 10) / 10);
+const round2 = (n) => (n == null ? null : Math.round((Number(n) + Number.EPSILON) * 100) / 100);
 
 /* =========================================================================
    TRANSCRIPT DOWNLOAD
@@ -129,7 +129,7 @@ const downloadTranscripts = async (req, res) => {
 
       const exams = [...examsMap.values()].map((exam) => {
         const scores = exam.subjects.map((s) => Number(s.percentage)).filter((n) => !Number.isNaN(n));
-        const average = scores.length ? round1(scores.reduce((a, b) => a + b, 0) / scores.length) : null;
+        const average = scores.length ? round2(scores.reduce((a, b) => a + b, 0) / scores.length) : null;
 
         // Per-subject grade band: `label` (e.g. "Credit") is shown in
         // BOTH the "Grade" and "Points" table columns — the app has one
@@ -163,7 +163,7 @@ const downloadTranscripts = async (req, res) => {
       });
 
       const allScores = exams.flatMap((e) => e.subjects.map((s) => Number(s.percentage)).filter((n) => !Number.isNaN(n)));
-      const cumulativeAverage = allScores.length ? round1(allScores.reduce((a, b) => a + b, 0) / allScores.length) : null;
+      const cumulativeAverage = allScores.length ? round2(allScores.reduce((a, b) => a + b, 0) / allScores.length) : null;
 
       studentPages.push({
         student,

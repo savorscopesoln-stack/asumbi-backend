@@ -39,7 +39,7 @@ const toInt = (v) => {
   const n = parseInt(v, 10);
   return Number.isNaN(n) ? null : n;
 };
-const round1 = (n) => (n == null ? null : Math.round(n * 10) / 10);
+const round2 = (n) => (n == null ? null : Math.round((Number(n) + Number.EPSILON) * 100) / 100);
 
 /* -------------------------------------------------------------------------
    Calls one of the Phase 9 Express handlers in-process and captures the
@@ -205,7 +205,7 @@ const getSubjectResultsReport = async (req, res) => {
       admission_no: r.admissionNo,
       marks: r.score,
       total_marks: session.total_marks,
-      percentage: r.score != null && session.total_marks > 0 ? round1((r.score / session.total_marks) * 100) : null,
+      percentage: r.score != null && session.total_marks > 0 ? round2((r.score / session.total_marks) * 100) : null,
       grade: null, // §16 — no grading scale configured in this system yet
       status: r.score != null ? "Completed" : (ended ? "Absent" : "Scheduled"),
     }));
@@ -319,7 +319,7 @@ const getClassResultsReport = async (req, res) => {
       let totalObtained = 0, totalPossible = 0, scoredCount = 0;
       const subjectMarks = subjects.map((sub) => {
         const score = subMap[`${st.id}:${sub.e_assessment_id}`];
-        const percentage = score != null && sub.total_marks > 0 ? round1((score / sub.total_marks) * 100) : null;
+        const percentage = score != null && sub.total_marks > 0 ? round2((score / sub.total_marks) * 100) : null;
         if (score != null) { totalObtained += score; totalPossible += sub.total_marks || 0; scoredCount += 1; }
         return { subject: sub.subject, score: score ?? null, total_marks: sub.total_marks, percentage, grade: null };
       });
@@ -330,7 +330,7 @@ const getClassResultsReport = async (req, res) => {
         subjects: subjectMarks,
         total_marks_obtained: scoredCount ? totalObtained : null,
         total_marks_possible: scoredCount ? totalPossible : null,
-        average_percentage: scoredCount && totalPossible > 0 ? round1((totalObtained / totalPossible) * 100) : null,
+        average_percentage: scoredCount && totalPossible > 0 ? round2((totalObtained / totalPossible) * 100) : null,
         grade: null,
       };
     });
@@ -504,7 +504,7 @@ const getMarkingProgressReport = async (req, res) => {
         total_submissions: m.total_submissions || 0,
         marked: m.marked || 0,
         unmarked: m.unmarked || 0,
-        progress_pct: m.total_submissions ? round1(((m.marked || 0) / m.total_submissions) * 100) : null,
+        progress_pct: m.total_submissions ? round2(((m.marked || 0) / m.total_submissions) * 100) : null,
       };
     });
 

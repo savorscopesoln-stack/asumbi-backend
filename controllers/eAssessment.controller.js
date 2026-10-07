@@ -2045,7 +2045,7 @@ const getEAssessmentQuickStats = async (req, res) => {
       marked_count: row.marked_count || 0,
       released_count: row.released_count || 0,
       remark_count: row.remark_count || 0,
-      average_score: row.average_score != null ? Math.round(row.average_score) : null,
+      average_score: row.average_score != null ? Math.round((Number(row.average_score) + Number.EPSILON) * 100) / 100 : null,
       highest_score: row.highest_score,
       lowest_score: row.lowest_score,
     });

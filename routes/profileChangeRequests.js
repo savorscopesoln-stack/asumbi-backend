@@ -37,6 +37,26 @@ router.post("/", protect, authorize("student"), async (req, res) => {
       });
     }
 
+    // Class and gender are pick-lists on the form — enforce that here too.
+    // A student's current (possibly legacy free-typed) class is still
+    // accepted so an unchanged value doesn't block other edits.
+    if (!["Male", "Female"].includes(gender)) {
+      return res.status(400).json({ message: "Please select a valid gender" });
+    }
+    const classRows = await pool.request().query(`SELECT name FROM Classes`);
+    const curRow = await pool
+      .request()
+      .input("sid", sql.Int, studentId)
+      .query(`SELECT studentClass FROM Students WHERE id = @sid`);
+    const currentClass = curRow.recordset[0]?.studentClass;
+    if (
+      classRows.recordset.length > 0 &&
+      studentClass !== currentClass &&
+      !classRows.recordset.some((c) => c.name === studentClass)
+    ) {
+      return res.status(400).json({ message: "Please select a class from the list" });
+    }
+
     let cleanPhone = phone;
     if (cleanPhone.startsWith("0")) {
       cleanPhone = "+254" + cleanPhone.substring(1);

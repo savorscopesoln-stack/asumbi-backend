@@ -653,7 +653,7 @@ const getMainExaminationDashboard = async (req, res) => {
       `);
       const row = submissionsResult.recordset[0] || {};
       completedAttempts = row.total_submissions || 0;
-      averagePerformance = row.avg_percentage != null ? Math.round(row.avg_percentage * 10) / 10 : null;
+      averagePerformance = row.avg_percentage != null ? Math.round((Number(row.avg_percentage) + Number.EPSILON) * 100) / 100 : null;
       // Same "pooled across all submissions, not averaged per subject"
       // rule as averagePerformance above (§17) — a subject with more
       // candidates isn't under- or over-weighted in the pass rate either.

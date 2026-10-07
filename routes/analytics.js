@@ -10,7 +10,7 @@ router.get("/teacher", async (req, res) => {
     const classResult = await pool.request().query(`
       SELECT 
         s.studentClass AS class,
-        AVG(m.percentage) AS average
+        ROUND(AVG(CAST(m.percentage AS FLOAT)), 2) AS average
       FROM Marks m
       JOIN Students s ON s.id = m.studentId
       GROUP BY s.studentClass
@@ -29,7 +29,7 @@ router.get("/teacher", async (req, res) => {
     const trendResult = await pool.request().query(`
       SELECT 
         a.name,
-        AVG(m.percentage) AS average
+        ROUND(AVG(CAST(m.percentage AS FLOAT)), 2) AS average
       FROM Marks m
       JOIN Assessments a ON a.id = m.assessmentId
       GROUP BY a.name, a.id
@@ -41,7 +41,7 @@ router.get("/teacher", async (req, res) => {
       SELECT TOP 10
         s.name,
         s.studentClass AS class,
-        AVG(m.percentage) AS average
+        ROUND(AVG(CAST(m.percentage AS FLOAT)), 2) AS average
       FROM Marks m
       JOIN Students s ON s.id = m.studentId
       GROUP BY s.name, s.studentClass

@@ -1011,6 +1011,33 @@ app.get("/api/student/marks", protect, async (req, res) => {
   }
 });
 
+/* =========================================================
+   STUDENT PROFILE — CLASS LIST
+   The classes a student can pick from on the "complete your profile"
+   screen. Lives under /api/student/profile on purpose: authMiddleware
+   lets a profile-incomplete student through ONLY on that path, so the
+   general /api/e-assessments/classes route would 403 them straight
+   back to /complete-profile in a loop. Reads the real Classes table.
+========================================================= */
+app.get("/api/student/profile/classes", protect, async (req, res) => {
+  try {
+    const result = await req.pool
+      .request()
+      .query(`SELECT id, name FROM Classes ORDER BY name ASC`);
+    res.json(
+      result.recordset.map((c) => ({
+        id: c.id,
+        name: c.name,
+        class_id: c.id,
+        class_name: c.name,
+      }))
+    );
+  } catch (err) {
+    console.log("STUDENT PROFILE CLASSES ERROR:", err);
+    res.status(500).json([]);
+  }
+});
+
 app.get("/api/student/profile", protect, async (req, res) => {
   try {
     const pool = req.pool;
@@ -1084,6 +1111,22 @@ app.put("/api/student/profile", protect, authorize("student"), async (req, res) 
     if (!studentClass || !gender || !email || !phone) {
       return res.status(400).json({
         message: "Class, gender, email, and phone are required",
+      });
+    }
+
+    // Class and gender are pick-lists on the form, so enforce that here
+    // too — a hand-crafted request can't save a free-typed value.
+    if (!["Male", "Female"].includes(gender)) {
+      return res.status(400).json({ message: "Please select a valid gender" });
+    }
+
+    const classRows = await pool.request().query(`SELECT name FROM Classes`);
+    if (
+      classRows.recordset.length > 0 &&
+      !classRows.recordset.some((c) => c.name === studentClass)
+    ) {
+      return res.status(400).json({
+        message: "Please select a class from the list",
       });
     }
 
@@ -1284,7 +1327,7 @@ app.get("/api/student/summary", protect, async (req, res) => {
       .request()
       .input("studentId", sql.Int, studentId)
       .query(`
-        SELECT AVG(percentage) AS average, COUNT(*) AS totalSubjects
+        SELECT ROUND(AVG(CAST(percentage AS FLOAT)), 2) AS average, COUNT(*) AS totalSubjects
         FROM Marks
         WHERE studentId = @studentId
       `);
