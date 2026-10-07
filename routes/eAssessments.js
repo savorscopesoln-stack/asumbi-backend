@@ -21,7 +21,7 @@ const {
 
   // exam session / device lock
   startExamSession, activateExamSession, heartbeatExamSession, endExamSession,
-  getExamSessions, unlockExamSession,
+  getExamSessions, unlockExamSession, examSessionStatus, lockExamSession,
 
   // camera violation photos (evidence capture, no longer a lock trigger)
   uploadViolationPhoto, getViolationPhotos,
@@ -155,6 +155,8 @@ router.get("/results/:assessmentId", protect, authorize("student"), getStudentRe
 router.post("/:id/start-exam", protect, authorize("student"), startExamSession);
 router.post("/exam-session/activate", protect, authorize("student"), activateExamSession);
 router.post("/exam-session/heartbeat", protect, authorize("student"), heartbeatExamSession);
+router.post("/exam-session/status", protect, authorize("student"), examSessionStatus);
+router.post("/exam-session/lock", protect, authorize("student"), lockExamSession);
 router.post("/exam-session/end", protect, authorize("student"), endExamSession);
 
 /* camera violation photos — student uploads (fire-and-forget, evidence

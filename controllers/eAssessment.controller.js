@@ -1550,6 +1550,84 @@ const endExamSession = async (req, res) => {
   }
 };
 
+// Read-only session check used by a locked screen. Unlike /activate it NEVER
+// changes the row — the old locked screen polled /activate, and when two
+// devices were both waiting, whichever polled second hit the "different
+// device" branch and re-locked the session right after the admin freed it.
+// `can_resume` is true only once an admin has unlocked it (status 'issued').
+const examSessionStatus = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const { token, device_id } = req.body;
+    const student_id = req.user?.id;
+    if (!token) return res.status(400).json({ message: "token is required" });
+
+    const result = await pool.request()
+      .input("token", sql.Char(6), token)
+      .input("sid", sql.Int, student_id)
+      .query(`SELECT status, device_id, lock_reason FROM e_assessment_exam_sessions WHERE token = @token AND student_id = @sid`);
+    if (!result.recordset.length) return res.status(404).json({ message: "Invalid or expired token" });
+
+    const row = result.recordset[0];
+    res.json({
+      status: row.status,
+      locked: row.status === "locked",
+      ended: row.status === "ended",
+      can_resume: row.status === "issued" || (row.status === "active" && !!device_id && row.device_id === device_id),
+      lock_reason: row.lock_reason || null,
+    });
+  } catch (err) {
+    console.error("EXAM SESSION STATUS ERROR:", err);
+    res.status(500).json({ message: "Failed to check exam session" });
+  }
+};
+
+// Student device reports a local lock (too many violations etc.) so the
+// session shows as Locked on the admin screen. Before this, those locks
+// lived only in the student's browser: the server row stayed 'active', the
+// admin saw no Unlock button, and the student could never be released.
+const lockExamSession = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const { token, device_id, reason } = req.body;
+    const student_id = req.user?.id;
+    if (!token) return res.status(400).json({ message: "token is required" });
+
+    const result = await pool.request()
+      .input("token", sql.Char(6), token)
+      .input("sid", sql.Int, student_id)
+      .query(`SELECT id, status, device_id FROM e_assessment_exam_sessions WHERE token = @token AND student_id = @sid`);
+    if (!result.recordset.length) return res.status(404).json({ message: "Invalid or expired token" });
+
+    const row = result.recordset[0];
+    if (row.status === "ended") return res.json({ success: true, status: "ended" });
+    if (row.status === "issued") return res.json({ success: true, status: row.status }); // not bound yet — nothing to lock
+    if (row.device_id && device_id && row.device_id !== device_id) {
+      return res.status(403).json({ message: "Not the bound device" });
+    }
+
+    const doLock = (text) => pool.request()
+      .input("id", sql.Int, row.id)
+      .input("reason", sql.NVarChar(300), text)
+      .query(`
+        UPDATE e_assessment_exam_sessions
+        SET status = 'locked', locked_at = GETDATE(), lock_reason = @reason
+        WHERE id = @id AND status <> 'ended'
+      `);
+    try {
+      await doLock(String(reason || "Locked by this device").slice(0, 100));
+    } catch (e) {
+      // lock_reason may be a narrower column than expected — the lock itself
+      // matters more than its wording, so retry with a short fixed reason.
+      await doLock("Locked by this device");
+    }
+    res.json({ success: true, status: "locked" });
+  } catch (err) {
+    console.error("LOCK EXAM SESSION ERROR:", err);
+    res.status(500).json({ message: "Failed to lock exam session" });
+  }
+};
+
 // Admin: list locked/active sessions so a genuinely-affected student can be freed
 const getExamSessions = async (req, res) => {
   try {
@@ -1574,12 +1652,16 @@ const unlockExamSession = async (req, res) => {
   try {
     const pool = req.pool;
     const id = toInt(req.params.id);
-    await pool.request().input("id", sql.Int, id).query(`
+    const result = await pool.request().input("id", sql.Int, id).query(`
       UPDATE e_assessment_exam_sessions
       SET status = 'issued', device_id = NULL, device_label = NULL,
           locked_at = NULL, lock_reason = NULL
-      WHERE id = @id
+      WHERE id = @id AND status = 'locked'
     `);
+    // Only a locked row can be unlocked — never revive a submitted exam.
+    if (!result.rowsAffected[0]) {
+      return res.status(409).json({ message: "This session is not locked (it may already be unlocked or finished)" });
+    }
     res.json({ success: true, message: "Session unlocked" });
   } catch (err) {
     console.error("UNLOCK EXAM SESSION ERROR:", err);
@@ -3134,7 +3216,7 @@ module.exports = {
 
   // exam session / device lock
   startExamSession, activateExamSession, heartbeatExamSession, endExamSession,
-  getExamSessions, unlockExamSession,
+  getExamSessions, unlockExamSession, examSessionStatus, lockExamSession,
 
   // camera violation photos (evidence capture, no longer a lock trigger)
   uploadViolationPhoto, getViolationPhotos,
