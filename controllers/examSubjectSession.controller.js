@@ -65,8 +65,17 @@ async function loadMainExam(pool, mainExamId) {
    valid. Deliberately synchronous-looking (awaits inside) so callers can
    just `if (errors.length) return res.status(400)...`.
 ========================================================================= */
-async function validateSessionInput(pool, { mainExam, subject, class_id, exam_date, start_time, end_time, duration_minutes, mainExamId, excludeId }) {
+async function validateSessionInput(pool, { mainExam, subject, class_id, exam_date, start_time, end_time, duration_minutes, mainExamId, excludeId, allowConcurrent = false, paperLabel = null }) {
   const errors = [];
+
+  // SPLIT-PAPER MODE: a subject can be examined as several papers
+  // (e.g. "Paper 1" + "Paper 2") that run at the same time. That is a
+  // special occasion, so it is opt-in per session (allowConcurrent) and
+  // every concurrent paper must carry a label so the papers of one
+  // subject can be told apart.
+  if (allowConcurrent && !(paperLabel && String(paperLabel).trim())) {
+    errors.push("Paper name (e.g. Paper 1) is required when scheduling concurrent papers.");
+  }
 
   if (!subject || !String(subject).trim()) {
     errors.push("Subject / learning area is required.");
@@ -93,6 +102,9 @@ async function validateSessionInput(pool, { mainExam, subject, class_id, exam_da
   }
 
   // Duplicate subject scheduling within the same Main Examination.
+  // Normally a subject can only appear once. In split-paper mode the
+  // same subject may appear several times, but never twice with the
+  // same paper label.
   if (subject && String(subject).trim()) {
     const dupRequest = pool.request()
       .input("mainExaminationId", sql.Int, mainExamId)
@@ -102,13 +114,19 @@ async function validateSessionInput(pool, { mainExam, subject, class_id, exam_da
       WHERE main_examination_id = @mainExaminationId
         AND LOWER(LTRIM(RTRIM(subject))) = LOWER(@subject)
     `;
+    if (allowConcurrent) {
+      dupRequest.input("paperLabel", sql.NVarChar, String(paperLabel || "").trim());
+      dupQuery += " AND LOWER(LTRIM(RTRIM(ISNULL(paper_label, '')))) = LOWER(@paperLabel)";
+    }
     if (excludeId) {
       dupRequest.input("excludeId", sql.Int, excludeId);
       dupQuery += " AND id <> @excludeId";
     }
     const dup = await dupRequest.query(dupQuery);
     if (dup.recordset[0]) {
-      errors.push(`"${subject}" is already scheduled for this Main Examination.`);
+      errors.push(allowConcurrent
+        ? `"${subject}" (${String(paperLabel).trim()}) is already scheduled for this Main Examination.`
+        : `"${subject}" is already scheduled for this Main Examination. Tick "Concurrent / split paper" to schedule another paper of the same subject.`);
     }
   }
 
@@ -136,6 +154,13 @@ async function validateSessionInput(pool, { mainExam, subject, class_id, exam_da
       overlapRequest.input("excludeId", sql.Int, excludeId);
       overlapQuery += " AND id <> @excludeId";
     }
+    // Concurrent papers may share a time slot with other papers of the
+    // SAME subject only — clashing with a different subject is still
+    // an error.
+    if (allowConcurrent && subject && String(subject).trim()) {
+      overlapRequest.input("sameSubject", sql.NVarChar, String(subject).trim());
+      overlapQuery += " AND LOWER(LTRIM(RTRIM(subject))) <> LOWER(@sameSubject)";
+    }
     const overlap = await overlapRequest.query(overlapQuery);
     if (overlap.recordset[0]) {
       errors.push(`Overlaps with "${overlap.recordset[0].subject}", already scheduled at that time.`);
@@ -160,7 +185,10 @@ const addSubjectSession = async (req, res) => {
     const {
       subject, class_id, e_assessment_id, exam_date, start_time, end_time,
       duration_minutes, venue, max_marks, instructions,
+      paper_label, allow_concurrent,
     } = req.body;
+    const allowConcurrent = allow_concurrent === true || allow_concurrent === 1 || allow_concurrent === "true";
+    const paperLabelVal = paper_label && String(paper_label).trim() ? String(paper_label).trim() : null;
 
     const examDateVal = toDateOnly(exam_date);
     const startVal = toDateTime(start_time);
@@ -169,6 +197,7 @@ const addSubjectSession = async (req, res) => {
     const errors = await validateSessionInput(pool, {
       mainExam, subject, class_id: toInt(class_id), exam_date: examDateVal,
       start_time: startVal, end_time: endVal, duration_minutes, mainExamId,
+      allowConcurrent, paperLabel: paperLabelVal,
     });
     if (errors.length) return res.status(400).json({ success: false, message: errors[0], errors });
 
@@ -188,12 +217,14 @@ const addSubjectSession = async (req, res) => {
       .input("venue", sql.NVarChar, venue || null)
       .input("maxMarks", sql.Int, toInt(max_marks))
       .input("instructions", sql.NVarChar, instructions || null)
+      .input("paperLabel", sql.NVarChar, paperLabelVal)
+      .input("allowConcurrent", sql.Bit, allowConcurrent ? 1 : 0)
       .query(`
         INSERT INTO exam_subject_sessions
-          (main_examination_id, e_assessment_id, subject, class_id, exam_date, start_time, end_time, duration_minutes, venue, max_marks, instructions, status)
+          (main_examination_id, e_assessment_id, subject, class_id, exam_date, start_time, end_time, duration_minutes, venue, max_marks, instructions, paper_label, allow_concurrent, status)
         OUTPUT INSERTED.id
         VALUES
-          (@mainExaminationId, @eAssessmentId, @subject, @classId, @examDate, @startTime, @endTime, @durationMinutes, @venue, @maxMarks, @instructions, 'draft')
+          (@mainExaminationId, @eAssessmentId, @subject, @classId, @examDate, @startTime, @endTime, @durationMinutes, @venue, @maxMarks, @instructions, @paperLabel, @allowConcurrent, 'draft')
       `);
 
     const id = result.recordset[0].id;
@@ -204,7 +235,7 @@ const addSubjectSession = async (req, res) => {
       action: "subject_session_added",
       actorId: req.user?.id,
       actorRole: req.user?.role,
-      details: { subject },
+      details: { subject, paper_label: paperLabelVal, allow_concurrent: allowConcurrent },
     });
 
     res.status(201).json({ success: true, id });
@@ -298,11 +329,17 @@ const updateSubjectSession = async (req, res) => {
     const startVal = body.start_time !== undefined ? toDateTime(body.start_time) : current.start_time;
     const endVal = body.end_time !== undefined ? toDateTime(body.end_time) : current.end_time;
     const durationInput = body.duration_minutes !== undefined ? body.duration_minutes : current.duration_minutes;
+    const allowConcurrent = body.allow_concurrent !== undefined
+      ? (body.allow_concurrent === true || body.allow_concurrent === 1 || body.allow_concurrent === "true")
+      : !!current.allow_concurrent;
+    const paperLabelVal = body.paper_label !== undefined
+      ? (body.paper_label && String(body.paper_label).trim() ? String(body.paper_label).trim() : null)
+      : current.paper_label;
 
     const errors = await validateSessionInput(pool, {
       mainExam, subject, class_id: classId, exam_date: examDateVal,
       start_time: startVal, end_time: endVal, duration_minutes: durationInput,
-      mainExamId, excludeId: id,
+      mainExamId, excludeId: id, allowConcurrent, paperLabel: paperLabelVal,
     });
     if (errors.length) return res.status(400).json({ success: false, message: errors[0], errors });
 
@@ -321,14 +358,17 @@ const updateSubjectSession = async (req, res) => {
       .input("venue", sql.NVarChar, body.venue !== undefined ? (body.venue || null) : current.venue)
       .input("maxMarks", sql.Int, body.max_marks !== undefined ? toInt(body.max_marks) : current.max_marks)
       .input("instructions", sql.NVarChar, body.instructions !== undefined ? (body.instructions || null) : current.instructions)
-      .input("eAssessmentId", sql.Int, body.e_assessment_id !== undefined ? toInt(body.e_assessment_id) : current.e_assessment_id);
+      .input("eAssessmentId", sql.Int, body.e_assessment_id !== undefined ? toInt(body.e_assessment_id) : current.e_assessment_id)
+      .input("paperLabel", sql.NVarChar, paperLabelVal)
+      .input("allowConcurrent", sql.Bit, allowConcurrent ? 1 : 0);
 
     await request.query(`
       UPDATE exam_subject_sessions SET
         subject = @subject, class_id = @classId, exam_date = @examDate,
         start_time = @startTime, end_time = @endTime, duration_minutes = @durationMinutes,
         venue = @venue, max_marks = @maxMarks, instructions = @instructions,
-        e_assessment_id = @eAssessmentId, updatedAt = GETDATE()
+        e_assessment_id = @eAssessmentId, paper_label = @paperLabel, allow_concurrent = @allowConcurrent,
+        updatedAt = GETDATE()
       WHERE id = @id
     `);
 

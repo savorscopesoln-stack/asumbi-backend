@@ -1779,6 +1779,20 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       )
     `);
 
+    /* ---------------- exam_subject_sessions: split / concurrent papers ----------------
+       paper_label ("Paper 1", "Paper 2"...) + allow_concurrent let one
+       subject have several papers sitting at the same time (special
+       occasions, e.g. a split paper). Both are optional, so every
+       existing session keeps behaving exactly as before. */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sys.columns WHERE Name = N'paper_label' AND Object_ID = Object_ID(N'exam_subject_sessions'))
+      ALTER TABLE exam_subject_sessions ADD paper_label NVARCHAR(100) NULL
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sys.columns WHERE Name = N'allow_concurrent' AND Object_ID = Object_ID(N'exam_subject_sessions'))
+      ALTER TABLE exam_subject_sessions ADD allow_concurrent BIT NOT NULL DEFAULT 0
+    `);
+
     /* ---------------- exam_audit_log ----------------
        Factual event trail for Main Examination actions (§53) —
        created/scheduled/activated/ended/results-published/etc.
