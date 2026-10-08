@@ -22,6 +22,7 @@ const {
   // exam session / device lock
   startExamSession, activateExamSession, heartbeatExamSession, endExamSession,
   getExamSessions, unlockExamSession, examSessionStatus, lockExamSession,
+  autosaveExamAnswers, getExamDraft, grantResit, cancelResit, getUnsubmittedSessions,
 
   // camera violation photos (evidence capture, no longer a lock trigger)
   uploadViolationPhoto, getViolationPhotos,
@@ -143,7 +144,10 @@ router.put("/admin/grading-system", protect, requirePage("E-Assessments"), updat
    ADMIN — EXAM SESSION / DEVICE-LOCK MANAGEMENT
 ========================================================================= */
 router.get("/admin/exam-sessions", protect, requirePage("E-Assessments"), getExamSessions);
+router.get("/admin/exam-sessions/unsubmitted", protect, requirePage("E-Assessments"), getUnsubmittedSessions);
 router.put("/admin/exam-sessions/:id/unlock", protect, requirePage("E-Assessments"), unlockExamSession);
+router.post("/admin/resit", protect, requirePage("E-Assessments"), grantResit);
+router.post("/admin/resit/cancel", protect, requirePage("E-Assessments"), cancelResit);
 
 /* =========================================================================
    STUDENT
@@ -153,6 +157,8 @@ router.get("/results/:assessmentId", protect, authorize("student"), getStudentRe
 
 /* exam session lifecycle (single-device token binding) */
 router.post("/:id/start-exam", protect, authorize("student"), startExamSession);
+router.post("/:id/autosave", protect, authorize("student"), autosaveExamAnswers);
+router.get("/:id/draft", protect, authorize("student"), getExamDraft);
 router.post("/exam-session/activate", protect, authorize("student"), activateExamSession);
 router.post("/exam-session/heartbeat", protect, authorize("student"), heartbeatExamSession);
 router.post("/exam-session/status", protect, authorize("student"), examSessionStatus);

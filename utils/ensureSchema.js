@@ -73,6 +73,60 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       ALTER TABLE e_assessment_answers ADD highlighted_html NVARCHAR(MAX) NULL
     `);
 
+    /* ---------------- exam autosave + resit support ----------------
+       e_assessment_drafts: the student's answers, saved to the DB every
+       minute while they sit the exam (one row per student per
+       assessment, overwritten each save). If time runs out before they
+       submit, the server submits from this row (see utils/examAttempts).
+       e_assessment_exam_sessions gains resit_allowed / attempt_no (an
+       admin can grant another attempt), and e_assessment_attempt_history
+       keeps the replaced attempt(s) as JSON snapshots. */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='e_assessment_drafts' AND xtype='U')
+      CREATE TABLE e_assessment_drafts (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        e_assessment_id INT NOT NULL,
+        student_id INT NOT NULL,
+        answers_json NVARCHAR(MAX) NOT NULL,
+        answered_count INT NOT NULL DEFAULT 0,
+        saved_at DATETIME NOT NULL DEFAULT GETDATE(),
+        CONSTRAINT UQ_e_assessment_drafts UNIQUE (e_assessment_id, student_id)
+      )
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='e_assessment_attempt_history' AND xtype='U')
+      CREATE TABLE e_assessment_attempt_history (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        e_assessment_id INT NOT NULL,
+        student_id INT NOT NULL,
+        attempt_no INT NOT NULL DEFAULT 1,
+        score INT NULL,
+        status NVARCHAR(30) NULL,
+        submitted_at DATETIME NULL,
+        submission_json NVARCHAR(MAX) NULL,
+        answers_json NVARCHAR(MAX) NULL,
+        archived_reason NVARCHAR(200) NULL,
+        archived_at DATETIME NOT NULL DEFAULT GETDATE()
+      )
+    `);
+    for (const [col, ddl] of [
+      ["resit_allowed", "BIT NOT NULL CONSTRAINT DF_eaes_resit_allowed DEFAULT 0"],
+      ["attempt_no", "INT NOT NULL CONSTRAINT DF_eaes_attempt_no DEFAULT 1"],
+      ["resit_granted_at", "DATETIME NULL"],
+      ["resit_granted_by", "INT NULL"],
+      ["auto_submitted", "BIT NOT NULL CONSTRAINT DF_eaes_auto_submitted DEFAULT 0"],
+      ["resit_policy", "NVARCHAR(20) NOT NULL CONSTRAINT DF_eaes_resit_policy DEFAULT 'replace'"],
+    ]) {
+      await pool.request().query(`
+        IF EXISTS (SELECT * FROM sysobjects WHERE name='e_assessment_exam_sessions' AND xtype='U')
+        AND NOT EXISTS (
+          SELECT * FROM sys.columns
+          WHERE Name = N'${col}' AND Object_ID = Object_ID(N'e_assessment_exam_sessions')
+        )
+        ALTER TABLE e_assessment_exam_sessions ADD ${col} ${ddl}
+      `);
+    }
+
     /* ---------------- e_assessment_question_setters ----------------
        Admin picks, at create/edit time, exactly which teacher(s) are
        allowed to add/edit/delete questions on an assessment — separate

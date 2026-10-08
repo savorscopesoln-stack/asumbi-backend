@@ -11,6 +11,7 @@ const { coverPageUrlFor, deleteCoverPageByUrl } = require("../middleware/coverPa
 const { QUESTION_IMAGES_DIR, questionImageUrlFor, deleteQuestionImageByUrl } = require("../middleware/questionImageUpload");
 const { saveViolationPhoto, violationPhotoUrlFor } = require("../middleware/violationPhotoUpload");
 const { getPool, listTenantKeys } = require("../config/db");
+const { persistAttempt } = require("../utils/examAttempts");
 
 /* =========================================================================
    HELPERS
@@ -336,13 +337,17 @@ const getEAssessments = async (req, res) => {
         (SELECT COUNT(*) FROM e_assessment_submissions es WHERE es.e_assessment_id = ea.id) AS submission_count
         ${isStudent ? `,
         sub.id AS my_submission_id, sub.status AS my_submission_status,
-        sub.score AS my_score, sub.submitted_at AS my_submitted_at` : ""}
+        sub.score AS my_score, sub.submitted_at AS my_submitted_at,
+        ISNULL(mysess.resit_allowed, 0) AS my_resit_allowed,
+        ISNULL(mysess.attempt_no, 1) AS my_attempt_no` : ""}
       FROM e_assessments ea
       LEFT JOIN Teachers t ON ea.teacher_id = t.id
       LEFT JOIN Classes c ON ea.class_id = c.id
       ${isStudent ? `
       LEFT JOIN e_assessment_submissions sub
-        ON sub.e_assessment_id = ea.id AND sub.student_id = @studentId` : ""}
+        ON sub.e_assessment_id = ea.id AND sub.student_id = @studentId
+      LEFT JOIN e_assessment_exam_sessions mysess
+        ON mysess.e_assessment_id = ea.id AND mysess.student_id = @studentId` : ""}
       ${isTeacher ? `
       WHERE ea.teacher_id = @teacherId
          OR EXISTS (
@@ -1372,6 +1377,7 @@ const startExamSession = async (req, res) => {
         token: row.token,
         status: row.status,
         device_bound: !!row.device_id,
+        attempt_no: row.attempt_no || 1,
       });
     }
 
@@ -1419,6 +1425,7 @@ const startExamSession = async (req, res) => {
               token: row.token,
               status: row.status,
               device_bound: !!row.device_id,
+              attempt_no: row.attempt_no || 1,
             });
           }
           throw insertErr; // no row found after all — genuine error, let the outer catch handle it
@@ -1434,7 +1441,7 @@ const startExamSession = async (req, res) => {
       }
     }
 
-    res.json({ success: true, session_id: sessionId, token, status: "issued", device_bound: false });
+    res.json({ success: true, session_id: sessionId, token, status: "issued", device_bound: false, attempt_no: 1 });
   } catch (err) {
     console.error("START EXAM SESSION ERROR:", err);
     res.status(500).json({ message: "Failed to start exam session" });
@@ -1550,6 +1557,255 @@ const endExamSession = async (req, res) => {
   }
 };
 
+/* =========================================================================
+   AUTOSAVE — the exam page posts the student's answers here every minute.
+   The row is overwritten each time (latest wins) and is what the server
+   submits if time runs out before the student does (utils/examAttempts).
+========================================================================= */
+const autosaveExamAnswers = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const assessmentId = toInt(req.params.id);
+    const student_id = req.user?.id;
+    const { answers, token, device_id } = req.body;
+    if (!assessmentId || !student_id) return res.status(400).json({ message: "Missing assessment or student" });
+    if (req.user?.examOnly && req.user.examAssessmentId !== assessmentId) {
+      return res.status(403).json({ message: "This exam session isn't valid for this assessment" });
+    }
+    if (!answers || typeof answers !== "object" || Array.isArray(answers)) {
+      return res.status(400).json({ message: "answers must be an object of questionId -> answer" });
+    }
+
+    // Only the live, bound device of an active session may save.
+    const sessRes = await pool.request()
+      .input("aid", sql.Int, assessmentId)
+      .input("sid", sql.Int, student_id)
+      .query(`SELECT status, token, device_id FROM e_assessment_exam_sessions WHERE e_assessment_id = @aid AND student_id = @sid`);
+    const sess = sessRes.recordset[0];
+    if (!sess) return res.status(404).json({ message: "No exam session found" });
+    if (sess.status === "ended") return res.status(409).json({ ended: true, message: "This assessment has already been completed" });
+    if (sess.status === "locked") return res.status(423).json({ locked: true, message: "Exam session is locked" });
+    if (token && sess.token !== token) return res.status(403).json({ message: "Token does not match this session" });
+    if (sess.device_id && device_id && sess.device_id !== device_id) {
+      return res.status(423).json({ locked: true, message: "Device mismatch" });
+    }
+
+    // Keep only non-empty answers, keyed by question id.
+    const clean = {};
+    Object.entries(answers).forEach(([qid, val]) => {
+      if (!/^\d+$/.test(qid)) return;
+      if (val === null || val === undefined || String(val).trim() === "") return;
+      clean[qid] = typeof val === "string" ? val : String(val);
+    });
+    const json = JSON.stringify(clean);
+    const count = Object.keys(clean).length;
+    // Never let an empty payload (e.g. a device that failed to restore its
+    // answers) overwrite a real draft.
+    if (count === 0) return res.json({ success: true, saved: 0, skipped: true });
+
+    await pool.request()
+      .input("aid", sql.Int, assessmentId)
+      .input("sid", sql.Int, student_id)
+      .input("json", sql.NVarChar(sql.MAX), json)
+      .input("count", sql.Int, count)
+      .query(`
+        UPDATE e_assessment_drafts
+        SET answers_json = @json, answered_count = @count, saved_at = GETDATE()
+        WHERE e_assessment_id = @aid AND student_id = @sid;
+        IF @@ROWCOUNT = 0
+          INSERT INTO e_assessment_drafts (e_assessment_id, student_id, answers_json, answered_count)
+          VALUES (@aid, @sid, @json, @count);
+      `);
+
+    res.json({ success: true, saved: count, saved_at: new Date().toISOString() });
+  } catch (err) {
+    console.error("AUTOSAVE EXAM ERROR:", err);
+    res.status(500).json({ message: "Autosave failed" });
+  }
+};
+
+// Returns the last autosaved answers so a student who comes back (new
+// device after an unlock, cleared browser, etc.) continues where they were.
+const getExamDraft = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const assessmentId = toInt(req.params.id);
+    const student_id = req.user?.id;
+    if (req.user?.examOnly && req.user.examAssessmentId !== assessmentId) {
+      return res.status(403).json({ message: "This exam session isn't valid for this assessment" });
+    }
+    const r = await pool.request()
+      .input("aid", sql.Int, assessmentId)
+      .input("sid", sql.Int, student_id)
+      .query(`SELECT answers_json, saved_at FROM e_assessment_drafts WHERE e_assessment_id = @aid AND student_id = @sid`);
+
+    // Time left according to the SERVER clock (exam start + duration), so a
+    // page refresh can't hand the student a fresh full-length timer — and so
+    // the on-screen clock agrees with when the server auto-submits.
+    let secondsLeft = null;
+    try {
+      const t = await pool.request()
+        .input("aid", sql.Int, assessmentId)
+        .input("sid", sql.Int, student_id)
+        .query(`
+          SELECT DATEDIFF(SECOND, GETDATE(), DATEADD(MINUTE, ISNULL(a.duration_minutes, 30), es.activated_at)) AS seconds_left
+          FROM e_assessment_exam_sessions es
+          INNER JOIN e_assessments a ON a.id = es.e_assessment_id
+          WHERE es.e_assessment_id = @aid AND es.student_id = @sid
+            AND es.status = 'active' AND es.activated_at IS NOT NULL
+        `);
+      if (t.recordset.length && t.recordset[0].seconds_left != null) {
+        secondsLeft = Math.max(0, Number(t.recordset[0].seconds_left));
+      }
+    } catch (_) { /* fall back to the full duration on the client */ }
+
+    let answers = {};
+    let savedAt = null;
+    if (r.recordset.length) {
+      try { answers = JSON.parse(r.recordset[0].answers_json) || {}; } catch (_) { answers = {}; }
+      savedAt = r.recordset[0].saved_at;
+    }
+    res.json({ answers, saved_at: savedAt, seconds_left: secondsLeft });
+  } catch (err) {
+    console.error("GET EXAM DRAFT ERROR:", err);
+    res.status(500).json({ answers: {} });
+  }
+};
+
+/* =========================================================================
+   ADMIN — GRANT RESIT
+   Gives one student another attempt at one assessment. Their current
+   submission stays untouched (and keeps its marks) until they actually
+   submit the resit; at that point it is archived and replaced. The exam
+   session is reset with a fresh token so they can sign in and sit it again.
+========================================================================= */
+const grantResit = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const assessmentId = toInt(req.body.assessment_id);
+    const studentId = toInt(req.body.student_id);
+    if (!assessmentId || !studentId) {
+      return res.status(400).json({ message: "assessment_id and student_id are required" });
+    }
+
+    const sessRes = await pool.request()
+      .input("aid", sql.Int, assessmentId)
+      .input("sid", sql.Int, studentId)
+      .query(`SELECT * FROM e_assessment_exam_sessions WHERE e_assessment_id = @aid AND student_id = @sid`);
+    const sess = sessRes.recordset[0];
+    const subRes = await pool.request()
+      .input("aid", sql.Int, assessmentId)
+      .input("sid", sql.Int, studentId)
+      .query(`SELECT id FROM e_assessment_submissions WHERE e_assessment_id = @aid AND student_id = @sid`);
+    const hasSubmission = subRes.recordset.length > 0;
+
+    if (!sess && !hasSubmission) {
+      return res.status(404).json({ message: "This student has not sat this assessment yet" });
+    }
+    if (sess && sess.resit_allowed) {
+      return res.status(409).json({ message: "A resit has already been granted and not yet taken" });
+    }
+    if (sess && (sess.status === "active" || sess.status === "locked") && !hasSubmission) {
+      return res.status(409).json({ message: "This student is still sitting the exam. Unlock or wait for them to finish first." });
+    }
+
+    // "replace": the resit's mark replaces the old one. "keep_best": the
+    // official mark becomes whichever of the two is higher.
+    const policy = req.body.score_policy === "keep_best" ? "keep_best" : "replace";
+    const nextAttempt = (sess?.attempt_no || 1) + 1;
+    const grantedBy = toInt(req.user?.id);
+
+    let newToken = null;
+    for (let i = 0; i < 5 && !newToken; i++) {
+      const t = generateToken();
+      try {
+        if (sess) {
+          await pool.request()
+            .input("id", sql.Int, sess.id)
+            .input("token", sql.Char(6), t)
+            .input("attempt", sql.Int, nextAttempt)
+            .input("by", sql.Int, grantedBy)
+            .input("policy", sql.NVarChar(20), policy)
+            .query(`
+              UPDATE e_assessment_exam_sessions
+              SET status = 'issued', token = @token, device_id = NULL, device_label = NULL,
+                  locked_at = NULL, lock_reason = NULL, ended_at = NULL, activated_at = NULL,
+                  last_heartbeat = NULL, auto_submitted = 0,
+                  resit_allowed = 1, attempt_no = @attempt, resit_policy = @policy,
+                  resit_granted_at = GETDATE(), resit_granted_by = @by
+              WHERE id = @id
+            `);
+        } else {
+          // Submission exists but its session row is gone (older data) — recreate it.
+          await pool.request()
+            .input("aid", sql.Int, assessmentId)
+            .input("sid", sql.Int, studentId)
+            .input("token", sql.Char(6), t)
+            .input("attempt", sql.Int, nextAttempt)
+            .input("by", sql.Int, grantedBy)
+            .input("policy", sql.NVarChar(20), policy)
+            .query(`
+              INSERT INTO e_assessment_exam_sessions
+                (e_assessment_id, student_id, token, status, resit_allowed, attempt_no, resit_policy, resit_granted_at, resit_granted_by)
+              VALUES (@aid, @sid, @token, 'issued', 1, @attempt, @policy, GETDATE(), @by)
+            `);
+        }
+        newToken = t;
+      } catch (e) {
+        if (e.number === 2627 || e.number === 2601) continue; // token collision — try another
+        throw e;
+      }
+    }
+    if (!newToken) return res.status(500).json({ message: "Could not issue a new exam token. Please try again." });
+
+    // Start the resit from a clean slate.
+    await pool.request()
+      .input("aid", sql.Int, assessmentId)
+      .input("sid", sql.Int, studentId)
+      .query(`DELETE FROM e_assessment_drafts WHERE e_assessment_id = @aid AND student_id = @sid`);
+
+    try {
+      const info = await pool.request().input("aid", sql.Int, assessmentId)
+        .query(`SELECT title FROM e_assessments WHERE id = @aid`);
+      await notifyOne(pool, studentId, "Students", {
+        title: "Resit Opportunity",
+        message: `You have been given another attempt at "${info.recordset[0]?.title || "an assessment"}". Sign in to the exam to retake it.`,
+        type: "exam",
+      });
+    } catch (e) { console.error("RESIT NOTIFY ERROR:", e.message); }
+
+    res.json({ success: true, message: "Resit granted", attempt_no: nextAttempt, score_policy: policy });
+  } catch (err) {
+    console.error("GRANT RESIT ERROR:", err);
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// Admin: cancel a resit that was granted but not yet taken.
+const cancelResit = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const assessmentId = toInt(req.body.assessment_id);
+    const studentId = toInt(req.body.student_id);
+    const r = await pool.request()
+      .input("aid", sql.Int, assessmentId)
+      .input("sid", sql.Int, studentId)
+      .query(`
+        UPDATE e_assessment_exam_sessions
+        SET resit_allowed = 0, status = 'ended', ended_at = GETDATE(),
+            attempt_no = CASE WHEN attempt_no > 1 THEN attempt_no - 1 ELSE 1 END
+        WHERE e_assessment_id = @aid AND student_id = @sid AND resit_allowed = 1 AND status = 'issued'
+      `);
+    if (!r.rowsAffected[0]) {
+      return res.status(409).json({ message: "No pending resit to cancel (the student may have already started it)" });
+    }
+    res.json({ success: true, message: "Resit cancelled" });
+  } catch (err) {
+    console.error("CANCEL RESIT ERROR:", err);
+    res.status(500).json({ message: err.message });
+  }
+};
+
 // Read-only session check used by a locked screen. Unlike /activate it NEVER
 // changes the row — the old locked screen polled /activate, and when two
 // devices were both waiting, whichever polled second hit the "different
@@ -1643,6 +1899,36 @@ const getExamSessions = async (req, res) => {
     res.json(result.recordset || []);
   } catch (err) {
     console.error("GET EXAM SESSIONS ERROR:", err);
+    res.status(500).json([]);
+  }
+};
+
+// Admin: students who sat down for an exam (a session exists and has ended)
+// but have NO submission — e.g. time ran out with nothing saved, or the
+// session was closed. They have no row on the submissions tab, so this is
+// where an admin finds them to grant a resit.
+const getUnsubmittedSessions = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const result = await pool.request().query(`
+      SELECT es.id, es.e_assessment_id, es.student_id, es.status, es.attempt_no,
+             es.activated_at, es.ended_at, es.auto_submitted,
+             st.name AS student_name, st.studentClass AS student_class,
+             a.title AS assessment_title, a.subject AS subject_name
+      FROM e_assessment_exam_sessions es
+      INNER JOIN e_assessments a ON a.id = es.e_assessment_id
+      LEFT JOIN Students st ON st.id = es.student_id
+      WHERE es.status = 'ended'
+        AND ISNULL(es.resit_allowed, 0) = 0
+        AND NOT EXISTS (
+          SELECT 1 FROM e_assessment_submissions s
+          WHERE s.e_assessment_id = es.e_assessment_id AND s.student_id = es.student_id
+        )
+      ORDER BY es.ended_at DESC
+    `);
+    res.json(result.recordset || []);
+  } catch (err) {
+    console.error("GET UNSUBMITTED SESSIONS ERROR:", err);
     res.status(500).json([]);
   }
 };
@@ -1764,7 +2050,6 @@ const getViolationPhotos = async (req, res) => {
 ========================================================================= */
 const submitEAssessment = async (req, res) => {
   const pool = req.pool;
-  const transaction = new sql.Transaction(pool);
   try {
     const { assessment_id, answers, token, device_id } = req.body;
     const student_id = req.user?.id;
@@ -1794,90 +2079,27 @@ const submitEAssessment = async (req, res) => {
       }
     }
 
-    await transaction.begin();
+    // One shared code path (utils/examAttempts) writes the submission, so a
+    // normal submit, a time-up submit and the server's autosave finalizer
+    // all behave identically — including archiving the previous attempt
+    // when an admin has granted this student a resit.
+    const result = await persistAttempt(pool, {
+      assessmentId: Number(assessment_id),
+      studentId: Number(student_id),
+      answers,
+    });
 
-    const existing = await new sql.Request(transaction)
-      .input("assessment_id", sql.Int, Number(assessment_id))
-      .input("student_id", sql.Int, Number(student_id))
-      .query(`SELECT id FROM e_assessment_submissions WHERE e_assessment_id = @assessment_id AND student_id = @student_id`);
-
-    if (existing.recordset.length > 0) {
-      await transaction.rollback();
+    if (!result.ok) {
       return res.status(409).json({
         success: false,
         message: "You have already submitted this assessment",
-        submission_id: existing.recordset[0].id,
+        submission_id: result.submissionId,
       });
     }
 
-    const submissionResult = await new sql.Request(transaction)
-      .input("e_assessment_id", sql.Int, Number(assessment_id))
-      .input("student_id", sql.Int, Number(student_id))
-      .query(`
-        INSERT INTO e_assessment_submissions (e_assessment_id, student_id, submitted_at, status)
-        OUTPUT INSERTED.id
-        VALUES (@e_assessment_id, @student_id, GETDATE(), 'submitted')
-      `);
-    const submissionId = submissionResult.recordset[0].id;
-// Pull each question's correct answer & marks once, so we can auto-mark MCQs as they're inserted
-const questionRows = await new sql.Request(transaction)
-  .input("assessment_id", sql.Int, Number(assessment_id))
-  .query(`SELECT id, correct_answer, marks, question_type FROM e_assessment_questions WHERE e_assessment_id = @assessment_id`);
-const questionMap = {};
-questionRows.recordset.forEach((q) => { questionMap[q.id] = q; });
-const hasEssay = questionRows.recordset.some((q) => q.question_type === "essay");
-    for (const ans of answers) {
-  if (!ans.question_id) continue;
-  const isEssay = typeof ans.essay_answer !== "undefined";
-  const q = questionMap[ans.question_id];
-
-  let isCorrect = null;
-  let marksAwarded = null;
-  if (!isEssay && q) {
-    const selected = (ans.selected_option || "").toString().trim().toLowerCase();
-    const correct  = (q.correct_answer || "").toString().trim().toLowerCase();
-    isCorrect = selected.length > 0 && selected === correct;
-    marksAwarded = isCorrect ? (q.marks || 0) : 0;
-  }
-
-  await new sql.Request(transaction)
-    .input("submission_id", sql.Int, submissionId)
-    .input("question_id", sql.Int, Number(ans.question_id))
-    .input("selected_answer", sql.NVarChar(sql.MAX), isEssay ? null : (ans.selected_option || null))
-    .input("essay_answer", sql.NVarChar(sql.MAX), isEssay ? (ans.essay_answer || "") : null)
-    .input("is_correct", sql.Bit, isCorrect == null ? null : (isCorrect ? 1 : 0))
-    .input("marks_awarded", sql.Int, marksAwarded)
-    .query(`
-      INSERT INTO e_assessment_answers
-        (submission_id, question_id, selected_answer, essay_answer, is_correct, marks_awarded)
-      VALUES
-        (@submission_id, @question_id, @selected_answer, @essay_answer, @is_correct, @marks_awarded)
-    `);
-}
-
-// Pure-MCQ assessments need no teacher marking at all — finalize immediately
-if (!hasEssay) {
-  const mcqTotal = await new sql.Request(transaction)
-    .input("submission_id", sql.Int, submissionId)
-    .query(`SELECT ISNULL(SUM(marks_awarded), 0) AS total FROM e_assessment_answers WHERE submission_id = @submission_id`);
-
-  await new sql.Request(transaction)
-    .input("submission_id", sql.Int, submissionId)
-    .input("score", sql.Int, mcqTotal.recordset[0].total)
-    .query(`UPDATE e_assessment_submissions SET score = @score, status = 'marked', remark_completed = 1 WHERE id = @submission_id`);
-}
-
-    await transaction.commit();
-
-    if (token) {
-      await pool.request().input("token", sql.Char(6), token)
-        .query(`UPDATE e_assessment_exam_sessions SET status = 'ended', ended_at = GETDATE() WHERE token = @token`);
-    }
-
-    return res.status(201).json({ success: true, submission_id: submissionId, message: "Assessment submitted successfully" });
+    return res.status(201).json({ success: true, submission_id: result.submissionId, message: "Assessment submitted successfully" });
   } catch (err) {
     console.error("SUBMIT ERROR:", err);
-    try { await transaction.rollback(); } catch (_) {}
     return res.status(500).json({ success: false, message: "Submission failed", error: err.message });
   }
 };
@@ -2924,6 +3146,41 @@ const ensureAssessmentForEAssessment = async (transaction, eAssessmentId, subjec
   return assessmentId;
 };
 
+/* Writes a released e-assessment mark into Marks. Normally that is a plain
+   insert. If the student already has a mark for this assessment (only
+   possible after a "keep best" resit — "replace" removes the old one when
+   the resit is submitted) the higher percentage is kept, so a resit can
+   only ever improve the official mark under that policy. */
+const writeReleasedMark = async (transaction, { studentId, subjectId, assessmentId, score, percentage }) => {
+  const existing = await new sql.Request(transaction)
+    .input("studentId", sql.Int, studentId)
+    .input("assessmentId", sql.Int, assessmentId)
+    .query(`SELECT TOP 1 id, percentage FROM Marks WHERE studentId = @studentId AND assessmentId = @assessmentId ORDER BY id DESC`);
+
+  if (existing.recordset.length) {
+    const old = existing.recordset[0];
+    if (percentage != null && (old.percentage == null || percentage > Number(old.percentage))) {
+      await new sql.Request(transaction)
+        .input("id", sql.Int, old.id)
+        .input("score", sql.Int, score)
+        .input("percentage", sql.Float, percentage)
+        .query(`UPDATE Marks SET score = @score, percentage = @percentage, createdAt = GETDATE() WHERE id = @id`);
+    }
+    return; // otherwise the earlier, higher mark stays
+  }
+
+  await new sql.Request(transaction)
+    .input("studentId", sql.Int, studentId)
+    .input("subjectId", sql.Int, subjectId)
+    .input("assessmentId", sql.Int, assessmentId)
+    .input("score", sql.Int, score)
+    .input("percentage", sql.Float, percentage)
+    .query(`
+      INSERT INTO Marks (studentId, subjectId, assessmentId, score, percentage, createdAt)
+      VALUES (@studentId, @subjectId, @assessmentId, @score, @percentage, GETDATE())
+    `);
+};
+
 const releaseMarks = async (req, res) => {
   const pool = req.pool;
   const transaction = new sql.Transaction(pool);
@@ -2960,16 +3217,7 @@ WHERE s.id = @id
     // sub.assessment_id, which was actually e_assessments.id).
     const assessmentId = await ensureAssessmentForEAssessment(transaction, sub.assessment_id, subjectId);
 
-    await new sql.Request(transaction)
-      .input("studentId", sql.Int, sub.student_id)
-      .input("subjectId", sql.Int, subjectId)
-      .input("assessmentId", sql.Int, assessmentId)
-      .input("score", sql.Int, sub.score)
-      .input("percentage", sql.Float, percentage)
-      .query(`
-        INSERT INTO Marks (studentId, subjectId, assessmentId, score, percentage, createdAt)
-        VALUES (@studentId, @subjectId, @assessmentId, @score, @percentage, GETDATE())
-      `);
+    await writeReleasedMark(transaction, { studentId: sub.student_id, subjectId, assessmentId, score: sub.score, percentage });
 
     await new sql.Request(transaction).input("id", sql.Int, submission_id).query(`
       UPDATE e_assessment_submissions SET status = 'released', released_at = GETDATE() WHERE id = @id
@@ -3025,16 +3273,7 @@ const bulkReleaseMarks = async (req, res) => {
         // with the single releaseMarks() fix.
         const assessmentId = await ensureAssessmentForEAssessment(transaction, sub.assessment_id, subjectId);
 
-        await new sql.Request(transaction)
-          .input("studentId", sql.Int, sub.student_id)
-          .input("subjectId", sql.Int, subjectId)
-          .input("assessmentId", sql.Int, assessmentId)
-          .input("score", sql.Int, sub.score)
-          .input("percentage", sql.Float, percentage)
-          .query(`
-            INSERT INTO Marks (studentId, subjectId, assessmentId, score, percentage, createdAt)
-            VALUES (@studentId, @subjectId, @assessmentId, @score, @percentage, GETDATE())
-          `);
+        await writeReleasedMark(transaction, { studentId: sub.student_id, subjectId, assessmentId, score: sub.score, percentage });
 
         await new sql.Request(transaction).input("id", sql.Int, id).query(`
           UPDATE e_assessment_submissions SET status = 'released', released_at = GETDATE() WHERE id = @id
@@ -3217,6 +3456,7 @@ module.exports = {
   // exam session / device lock
   startExamSession, activateExamSession, heartbeatExamSession, endExamSession,
   getExamSessions, unlockExamSession, examSessionStatus, lockExamSession,
+  autosaveExamAnswers, getExamDraft, grantResit, cancelResit, getUnsubmittedSessions,
 
   // camera violation photos (evidence capture, no longer a lock trigger)
   uploadViolationPhoto, getViolationPhotos,
