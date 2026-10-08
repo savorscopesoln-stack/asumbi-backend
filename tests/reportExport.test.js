@@ -54,7 +54,10 @@ test("excel: multi-sheet workbook builds, is a valid zip, percent+totals formatt
   assert.ok(zip.file("xl/workbook.xml"), "is a well-formed .xlsx (has workbook.xml)");
   const sheetXml = await zip.file("xl/worksheets/sheet1.xml").async("string");
   assert.match(sheetXml, /<pane ySplit="\d+"[^>]*state="frozen"/, "header rows are frozen");
-  assert.match(sheetXml, /0\.7025/, "totals row percent value stored as a real fraction (70.25 -> 0.7025), not text");
+  // v3: percentages are deliberately rounded DOWN to whole numbers (see the v2.1 floor-rounding
+  // policy in reportExport.js / mainExamAnalytics.controller.js), so 70.25 -> 70% -> 0.7.
+  assert.match(sheetXml, /<v>0\.7<\/v>/, "totals row percent stored as a real fraction, floored to a whole percent (70.25 -> 70% -> 0.7), not text");
+  assert.match(sheetXml, /<v>0\.68<\/v>/, "row percent floored to a whole percent (68.4 -> 68% -> 0.68)");
 });
 
 test("excel: an empty-data sheet renders a note instead of crashing (§50 — no fabricated data)", async () => {

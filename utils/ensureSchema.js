@@ -1779,20 +1779,6 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       )
     `);
 
-    /* ---------------- exam_subject_sessions: split / concurrent papers ----------------
-       paper_label ("Paper 1", "Paper 2"...) + allow_concurrent let one
-       subject have several papers sitting at the same time (special
-       occasions, e.g. a split paper). Both are optional, so every
-       existing session keeps behaving exactly as before. */
-    await pool.request().query(`
-      IF NOT EXISTS (SELECT * FROM sys.columns WHERE Name = N'paper_label' AND Object_ID = Object_ID(N'exam_subject_sessions'))
-      ALTER TABLE exam_subject_sessions ADD paper_label NVARCHAR(100) NULL
-    `);
-    await pool.request().query(`
-      IF NOT EXISTS (SELECT * FROM sys.columns WHERE Name = N'allow_concurrent' AND Object_ID = Object_ID(N'exam_subject_sessions'))
-      ALTER TABLE exam_subject_sessions ADD allow_concurrent BIT NOT NULL DEFAULT 0
-    `);
-
     /* ---------------- exam_audit_log ----------------
        Factual event trail for Main Examination actions (§53) —
        created/scheduled/activated/ended/results-published/etc.
@@ -2460,7 +2446,214 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       ALTER TABLE Users ADD mfaEnabled BIT NOT NULL DEFAULT 0
     `);
 
-    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, PortalPageSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, leave_outs code-verification columns, meal_daily_codes, leave_auto_approve, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl, Students.profileCompleted, student_profile_change_requests, website_content, contact_messages, newsletter_subscribers, e_assessments.cover_page_url, e_assessments.cover_page_width/height, e_assessment_question_images, e_assessment_violation_photos, e_assessment_sync_devices, e_assessment_sync_devices.tenant_key, e_assessment_sync_device_assessments, e_assessment_sync_logs, e_assessment_submissions.sync_batch_id, SchoolSettings, SchoolOfficials, SchoolOfficials.stampUrl, ClassTeachers.stampUrl, GradingSystem, main_examinations, exam_subject_sessions, exam_audit_log, Assessments.examScope/sourceSystem/sourceRefId, Marks indexes, main_examinations.is_report_exam, institution_wallets, wallet_ledger, institution_payments, credit_issuances, student_exam_entitlements, institution_exam_billing_settings, student_exam_payments, finance_audit_log, finance_invoices, finance_receipts, Users.mfaSecret/mfaEnabled)");
+    /* ================= AI-ASSISTED ESSAY MARKING WALLET/BILLING =================
+       Master Implementation Prompt, Phase 2. See
+       migrations/2026-09-30_add_ai_marking_wallet.sql for the full
+       design rationale (why this is a SEPARATE table family from
+       institution_wallets/wallet_ledger above, why balances are
+       DECIMAL not INT, why e_assessment_* references below have no
+       FOREIGN KEY, and the owner_type='teacher' groundwork). Applied
+       here the same way every other block above is: additive,
+       idempotent CREATE TABLE statements, safe to run against a
+       database that already has some or all of them. */
+
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='ai_marking_wallets' AND xtype='U')
+      CREATE TABLE ai_marking_wallets (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        owner_type NVARCHAR(20) NOT NULL,
+        owner_id INT NULL,
+        available_balance DECIMAL(18,4) NOT NULL DEFAULT 0,
+        reserved_balance DECIMAL(18,4) NOT NULL DEFAULT 0,
+        currency NVARCHAR(10) NOT NULL DEFAULT 'KES',
+        createdAt DATETIME NOT NULL DEFAULT GETDATE(),
+        updatedAt DATETIME NOT NULL DEFAULT GETDATE(),
+        CONSTRAINT CK_ai_marking_wallets_owner_type CHECK (owner_type IN ('institution','teacher')),
+        CONSTRAINT CK_ai_marking_wallets_owner_id_teacher CHECK (owner_type <> 'teacher' OR owner_id IS NOT NULL),
+        CONSTRAINT CK_ai_marking_wallets_available_nonneg CHECK (available_balance >= 0),
+        CONSTRAINT CK_ai_marking_wallets_reserved_nonneg CHECK (reserved_balance >= 0)
+      )
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'UQ_ai_marking_wallets_institution')
+      AND EXISTS (SELECT * FROM sysobjects WHERE name='ai_marking_wallets' AND xtype='U')
+      CREATE UNIQUE NONCLUSTERED INDEX UQ_ai_marking_wallets_institution
+        ON ai_marking_wallets(owner_type) WHERE owner_type = 'institution'
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'UQ_ai_marking_wallets_teacher')
+      AND EXISTS (SELECT * FROM sysobjects WHERE name='ai_marking_wallets' AND xtype='U')
+      CREATE UNIQUE NONCLUSTERED INDEX UQ_ai_marking_wallets_teacher
+        ON ai_marking_wallets(owner_id) WHERE owner_type = 'teacher'
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT 1 FROM ai_marking_wallets WHERE owner_type = 'institution')
+      INSERT INTO ai_marking_wallets (owner_type, owner_id, available_balance, reserved_balance)
+      VALUES ('institution', NULL, 0, 0)
+    `);
+
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='ai_marking_ledger' AND xtype='U')
+      CREATE TABLE ai_marking_ledger (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        wallet_id INT NOT NULL,
+        entry_type NVARCHAR(30) NOT NULL,
+        amount_delta DECIMAL(18,4) NOT NULL,
+        available_after DECIMAL(18,4) NOT NULL,
+        reserved_after DECIMAL(18,4) NOT NULL,
+        ai_marking_job_id INT NULL,
+        finance_reference NVARCHAR(100) NULL,
+        actor_id INT NULL,
+        actor_role NVARCHAR(30) NULL,
+        reason NVARCHAR(500) NULL,
+        idempotency_key NVARCHAR(100) NULL,
+        createdAt DATETIME NOT NULL DEFAULT GETDATE(),
+        CONSTRAINT CK_ai_marking_ledger_entry_type CHECK (entry_type IN ('topup','reserve','release','consume','reverse')),
+        CONSTRAINT FK_ai_marking_ledger_wallet FOREIGN KEY (wallet_id) REFERENCES ai_marking_wallets(id)
+      )
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'UQ_ai_marking_ledger_idempotency_key')
+      AND EXISTS (SELECT * FROM sysobjects WHERE name='ai_marking_ledger' AND xtype='U')
+      CREATE UNIQUE NONCLUSTERED INDEX UQ_ai_marking_ledger_idempotency_key
+        ON ai_marking_ledger(idempotency_key) WHERE idempotency_key IS NOT NULL
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'IX_ai_marking_ledger_wallet_id')
+      AND EXISTS (SELECT * FROM sysobjects WHERE name='ai_marking_ledger' AND xtype='U')
+      CREATE NONCLUSTERED INDEX IX_ai_marking_ledger_wallet_id ON ai_marking_ledger(wallet_id)
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'IX_ai_marking_ledger_job_id')
+      AND EXISTS (SELECT * FROM sysobjects WHERE name='ai_marking_ledger' AND xtype='U')
+      CREATE NONCLUSTERED INDEX IX_ai_marking_ledger_job_id ON ai_marking_ledger(ai_marking_job_id)
+    `);
+
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='ai_marking_pricing' AND xtype='U')
+      CREATE TABLE ai_marking_pricing (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        price_per_answer DECIMAL(18,4) NOT NULL,
+        currency NVARCHAR(10) NOT NULL DEFAULT 'KES',
+        volume_discount_json NVARCHAR(MAX) NULL,
+        institution_wallets_enabled BIT NOT NULL DEFAULT 1,
+        teacher_wallets_enabled BIT NOT NULL DEFAULT 0,
+        effective_from DATETIME NOT NULL DEFAULT GETDATE(),
+        set_by INT NULL,
+        notes NVARCHAR(500) NULL,
+        createdAt DATETIME NOT NULL DEFAULT GETDATE(),
+        CONSTRAINT CK_ai_marking_pricing_price_nonneg CHECK (price_per_answer >= 0)
+      )
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'IX_ai_marking_pricing_effective')
+      AND EXISTS (SELECT * FROM sysobjects WHERE name='ai_marking_pricing' AND xtype='U')
+      CREATE NONCLUSTERED INDEX IX_ai_marking_pricing_effective ON ai_marking_pricing(effective_from DESC)
+    `);
+
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='ai_marking_jobs' AND xtype='U')
+      AND EXISTS (SELECT * FROM sysobjects WHERE name='main_examinations' AND xtype='U')
+      CREATE TABLE ai_marking_jobs (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        e_assessment_id INT NULL,
+        main_examination_id INT NULL,
+        teacher_id INT NOT NULL,
+        selection_criteria NVARCHAR(MAX) NULL,
+        wallet_id INT NOT NULL,
+        pricing_id INT NULL,
+        eligible_count INT NOT NULL DEFAULT 0,
+        reserved_count INT NOT NULL DEFAULT 0,
+        processed_count INT NOT NULL DEFAULT 0,
+        failed_count INT NOT NULL DEFAULT 0,
+        cancelled_count INT NOT NULL DEFAULT 0,
+        unit_price DECIMAL(18,4) NOT NULL,
+        quoted_total DECIMAL(18,4) NOT NULL,
+        actual_total DECIMAL(18,4) NOT NULL DEFAULT 0,
+        currency NVARCHAR(10) NOT NULL DEFAULT 'KES',
+        model NVARCHAR(100) NULL,
+        provider NVARCHAR(50) NULL,
+        status NVARCHAR(20) NOT NULL DEFAULT 'pending',
+        idempotency_key NVARCHAR(100) NULL,
+        createdAt DATETIME NOT NULL DEFAULT GETDATE(),
+        completedAt DATETIME NULL,
+        CONSTRAINT CK_ai_marking_jobs_status CHECK (status IN ('pending','reserved','processing','completed','failed','cancelled')),
+        CONSTRAINT CK_ai_marking_jobs_counts_nonneg CHECK (eligible_count >= 0 AND reserved_count >= 0 AND processed_count >= 0 AND failed_count >= 0 AND cancelled_count >= 0),
+        CONSTRAINT FK_ai_marking_jobs_wallet FOREIGN KEY (wallet_id) REFERENCES ai_marking_wallets(id),
+        CONSTRAINT FK_ai_marking_jobs_pricing FOREIGN KEY (pricing_id) REFERENCES ai_marking_pricing(id),
+        CONSTRAINT FK_ai_marking_jobs_main_exam FOREIGN KEY (main_examination_id) REFERENCES main_examinations(id)
+      )
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'UQ_ai_marking_jobs_idempotency_key')
+      AND EXISTS (SELECT * FROM sysobjects WHERE name='ai_marking_jobs' AND xtype='U')
+      CREATE UNIQUE NONCLUSTERED INDEX UQ_ai_marking_jobs_idempotency_key
+        ON ai_marking_jobs(idempotency_key) WHERE idempotency_key IS NOT NULL
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'IX_ai_marking_jobs_status')
+      AND EXISTS (SELECT * FROM sysobjects WHERE name='ai_marking_jobs' AND xtype='U')
+      CREATE NONCLUSTERED INDEX IX_ai_marking_jobs_status ON ai_marking_jobs(status)
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'IX_ai_marking_jobs_teacher')
+      AND EXISTS (SELECT * FROM sysobjects WHERE name='ai_marking_jobs' AND xtype='U')
+      CREATE NONCLUSTERED INDEX IX_ai_marking_jobs_teacher ON ai_marking_jobs(teacher_id)
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'IX_ai_marking_jobs_assessment')
+      AND EXISTS (SELECT * FROM sysobjects WHERE name='ai_marking_jobs' AND xtype='U')
+      CREATE NONCLUSTERED INDEX IX_ai_marking_jobs_assessment ON ai_marking_jobs(e_assessment_id)
+    `);
+
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='ai_marking_evaluations' AND xtype='U')
+      AND EXISTS (SELECT * FROM sysobjects WHERE name='ai_marking_jobs' AND xtype='U')
+      CREATE TABLE ai_marking_evaluations (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        ai_marking_job_id INT NOT NULL,
+        submission_id INT NOT NULL,
+        question_id INT NOT NULL,
+        answer_id INT NULL,
+        answer_content_hash CHAR(64) NOT NULL,
+        marking_guide_hash CHAR(64) NULL,
+        model NVARCHAR(100) NOT NULL,
+        prompt_version NVARCHAR(30) NOT NULL,
+        criteria_json NVARCHAR(MAX) NULL,
+        suggested_total DECIMAL(6,2) NOT NULL,
+        max_marks DECIMAL(6,2) NOT NULL,
+        review_flags NVARCHAR(MAX) NULL,
+        token_usage_json NVARCHAR(MAX) NULL,
+        processing_cost DECIMAL(10,4) NULL,
+        status NVARCHAR(20) NOT NULL DEFAULT 'pending',
+        teacher_final_mark DECIMAL(6,2) NULL,
+        teacher_approved_by INT NULL,
+        teacher_approved_at DATETIME NULL,
+        createdAt DATETIME NOT NULL DEFAULT GETDATE(),
+        CONSTRAINT CK_ai_marking_evaluations_status CHECK (status IN ('pending','success','failed','needs_review')),
+        CONSTRAINT CK_ai_marking_evaluations_marks_bounds CHECK (suggested_total >= 0 AND suggested_total <= max_marks),
+        CONSTRAINT FK_ai_marking_evaluations_job FOREIGN KEY (ai_marking_job_id) REFERENCES ai_marking_jobs(id)
+      )
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'IX_ai_marking_evaluations_job')
+      AND EXISTS (SELECT * FROM sysobjects WHERE name='ai_marking_evaluations' AND xtype='U')
+      CREATE NONCLUSTERED INDEX IX_ai_marking_evaluations_job ON ai_marking_evaluations(ai_marking_job_id)
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'UQ_ai_marking_evaluations_job_submission_question')
+      AND EXISTS (SELECT * FROM sysobjects WHERE name='ai_marking_evaluations' AND xtype='U')
+      CREATE UNIQUE NONCLUSTERED INDEX UQ_ai_marking_evaluations_job_submission_question
+        ON ai_marking_evaluations(ai_marking_job_id, submission_id, question_id)
+    `);
+
+    // AI marking Phase-2 fixes (reserved_delta, append-only triggers, scheme
+    // versions, adjustment log, ...). Kept in its own module so this
+    // already-huge function stays readable; never throws.
+    await require("./aiMarkingSchema").ensureAiMarkingSchemaUpgrades(pool);
+
+
+    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, PortalPageSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, leave_outs code-verification columns, meal_daily_codes, leave_auto_approve, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl, Students.profileCompleted, student_profile_change_requests, website_content, contact_messages, newsletter_subscribers, e_assessments.cover_page_url, e_assessments.cover_page_width/height, e_assessment_question_images, e_assessment_violation_photos, e_assessment_sync_devices, e_assessment_sync_devices.tenant_key, e_assessment_sync_device_assessments, e_assessment_sync_logs, e_assessment_submissions.sync_batch_id, SchoolSettings, SchoolOfficials, SchoolOfficials.stampUrl, ClassTeachers.stampUrl, GradingSystem, main_examinations, exam_subject_sessions, exam_audit_log, Assessments.examScope/sourceSystem/sourceRefId, Marks indexes, main_examinations.is_report_exam, institution_wallets, wallet_ledger, institution_payments, credit_issuances, student_exam_entitlements, institution_exam_billing_settings, student_exam_payments, finance_audit_log, finance_invoices, finance_receipts, Users.mfaSecret/mfaEnabled, ai_marking_wallets, ai_marking_ledger, ai_marking_pricing, ai_marking_jobs, ai_marking_evaluations, ai_marking_scheme_versions, ai_marking_adjustments)");
   } catch (err) {
     console.error("⚠️  Schema ensure failed:", err.message);
   }

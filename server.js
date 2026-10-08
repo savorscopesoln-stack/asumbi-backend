@@ -1,4 +1,6 @@
 require("dotenv").config();
+// Phase 11: in production, refuse to start with a missing/default/short JWT_SECRET (see the file header).
+require("./utils/securityStartupCheck").enforceSecurityConfig();
 const express = require("express");
 const http = require("http");
 const cors = require("cors");
@@ -266,9 +268,14 @@ app.use("/api/meals", protect, mealRoutes);
 app.use("/api/gate", protect, gateRoutes);
 app.use("/api/kitchen", protect, kitchenRoutes);
 app.use("/api/attendance", protect, attendanceRoutes);
+// AI-assisted essay marking (teacher). Must be mounted BEFORE the e-assessments router so its fixed
+// paths are not swallowed by that router's "/:id" routes. Protects internally (protect + authorize("teacher")).
+// Jobs and the worker are OFF unless AI_MARKING_JOBS_ENABLED / AI_MARKING_WORKER_ENABLED are "true".
+app.use("/api/e-assessments/ai-marking", require("./routes/aiMarkingTeacher"));
 app.use("/api/e-assessments", eAssessmentRoutes); // already protects internally
 app.use("/api/main-exams", mainExamsRoutes); // already protects internally (protect + requirePage("E-Assessments"))
 app.use("/api/finance", financeRoutes); // already protects internally (protect + financeOnly — strict, no admin bypass, see middleware/financeAuth.js)
+app.use("/api/ai-marking-analytics", require("./routes/aiMarkingAnalytics")); // Phase 10, read-only; protects internally (protect + exact role check)
 app.use("/api/wallet", walletRoutes); // already protects internally (protect + requirePage("Wallet"))
 // Deliberately a distinct base path, not "/api/main-exams/student" — the
 // admin router above has a catch-all "/:id" route that would otherwise
@@ -303,6 +310,10 @@ startNotificationScheduler(getPool, listTenantKeys, io, dispatchBroadcast);
 // notification scheduler above, just a second independent tick function
 // rather than a second scheduling mechanism.
 startExamScheduler(getPool, listTenantKeys, io);
+
+// AI marking background worker — a no-op unless AI_MARKING_WORKER_ENABLED=true.
+const { startAiMarkingWorker } = require("./services/aiMarkingWorker.runner");
+const aiMarkingWorker = startAiMarkingWorker(getPool, listTenantKeys);
 
 /* =========================================================
    CLASSES

@@ -24,6 +24,16 @@ const {
   downloadReceiptPdf,
   downloadPaymentReceipt,
 } = require("../controllers/financeInvoice.controller");
+const {
+  getAiMarkingOverview,
+  listAiMarkingLedger,
+  listAiMarkingPricing,
+  setAiMarkingPricing,
+  topUpAiMarkingWallet,
+  reverseAiMarkingEntry,
+} = require("../controllers/aiMarkingFinance.controller");
+const analytics = require("../controllers/aiMarkingAnalytics.controller");
+const { finance: aiFinanceLimit } = require("../middleware/aiMarkingRateLimit");
 
 /* =========================================================================
    Every route below is protect + financeOnly — financeOnly is a
@@ -61,6 +71,20 @@ router.post("/institutions/:tenantKey/invoices/:invoiceId/void", voidInvoice);
 router.post("/institutions/:tenantKey/payments/verify", verifyPayment);
 router.post("/institutions/:tenantKey/credits/issue", issueCredits);
 router.post("/institutions/:tenantKey/credits/reverse", reverseCredits);
+
+/* AI-assisted marking wallet & pricing — a SEPARATE credit system from the
+   exam credits above (see controllers/aiMarkingFinance.controller.js). Same
+   protect + financeOnly gate as everything in this router. */
+router.get("/institutions/:tenantKey/ai-marking", getAiMarkingOverview);
+router.get("/institutions/:tenantKey/ai-marking/ledger", listAiMarkingLedger);
+// Phase 10 — AI marking analytics incl. provider cost and margin (finance only; read-only).
+// Fixed path "/ai-marking/analytics" cannot collide with the ":tenantKey" routes.
+router.get("/ai-marking/analytics", aiFinanceLimit, analytics.financePlatform);
+router.get("/institutions/:tenantKey/ai-marking/analytics", aiFinanceLimit, analytics.financeInstitution);
+router.get("/institutions/:tenantKey/ai-marking/pricing", listAiMarkingPricing);
+router.post("/institutions/:tenantKey/ai-marking/pricing", setAiMarkingPricing);
+router.post("/institutions/:tenantKey/ai-marking/topup", topUpAiMarkingWallet);
+router.post("/institutions/:tenantKey/ai-marking/ledger/:ledgerId/reverse", reverseAiMarkingEntry);
 
 router.post("/mfa/enroll", enrollMfa);
 router.post("/mfa/confirm", confirmMfa);

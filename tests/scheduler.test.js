@@ -15,11 +15,16 @@ async function runOneTick(pool, io) {
   global.setTimeout = (fn) => { captured = fn; };
   try {
     startExamScheduler(() => Promise.resolve(pool), () => ["default"], io);
-    await captured();
   } finally {
+    // Restore IMMEDIATELY, before any await. tinytest starts every test
+    // concurrently, so leaving these stubbed across `await captured()` let
+    // other suites' real timers (e.g. the AI engine's abort timeout) be
+    // swallowed — their promises never settled and run-all.js exited 0
+    // without printing a summary.
     global.setInterval = realSetInterval;
     global.setTimeout = realSetTimeout;
   }
+  await captured();
 }
 
 function makeIo() {
