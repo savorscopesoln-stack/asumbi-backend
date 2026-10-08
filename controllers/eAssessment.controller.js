@@ -2126,7 +2126,7 @@ const getStudentResult = async (req, res) => {
         WHERE s.e_assessment_id = @assessmentId AND s.student_id = @studentId
       `);
 
-    const submission = subResult.recordset[0] || null;
+    const submission = fixTotalMarks(subResult.recordset[0] || null);
     if (!submission) return res.json({ submission: null, released: false, questions: [] });
 
     // Marks/answers are only ever shown to the student once the submission
@@ -3050,6 +3050,18 @@ const reviewRemarkRequest = async (req, res) => {
 /* =========================================================================
    RELEASE MARKS
 ========================================================================= */
+/* `SELECT s.*, ..., a.total_marks AS total_marks` returns TWO columns named
+   total_marks when the submissions table has one of its own — the driver
+   then hands back an array (e.g. [0, 30]) instead of a number, which the
+   screens printed as "030" and turned into NaN%. The assessment's total
+   is the last one selected, so take that. */
+const fixTotalMarks = (row) => {
+  if (row && Array.isArray(row.total_marks)) {
+    row.total_marks = row.total_marks[row.total_marks.length - 1];
+  }
+  return row;
+};
+
 const getReleasedMarks = async (req, res) => {
   try {
     const pool = req.pool;
@@ -3062,7 +3074,7 @@ LEFT JOIN Students st ON st.id = s.student_id
 WHERE s.status = 'released'
 ORDER BY s.released_at DESC
     `);
-    res.status(200).json(result.recordset);
+    res.status(200).json(result.recordset.map(fixTotalMarks));
   } catch (err) {
     console.error("GET RELEASED MARKS ERROR:", err);
     res.status(500).json({ message: "Failed to fetch released marks", error: err.message });
