@@ -214,7 +214,7 @@ function drawExamTable(doc, exam, theme) {
     const cells = [
       s.subjectCode || "—",
       s.subjectName || "-",
-      s.percentage != null && !Number.isNaN(Number(s.percentage)) ? `${Number(s.percentage).toFixed(2)}%` : "—",
+      s.percentage != null && !Number.isNaN(Number(s.percentage)) ? `${Math.floor(Number(s.percentage)+1e-9)}%` : "—",
       s.grade || "—",
       s.points || "—",
       s.result || "—",
@@ -234,7 +234,7 @@ function drawExamTable(doc, exam, theme) {
   doc.rect(pageLeft, y, usableWidth, ROW_H).fill(theme.primary);
   doc.fillColor(theme.onPrimary).fontSize(8).font("Helvetica-Bold");
   doc.text("EXAM AVERAGE", pageLeft + 4, y + 4, { width: codeW + subjectW - 8 });
-  doc.text(exam.average != null ? `${Number(exam.average).toFixed(2)}%` : "—", colX[2] + 4, y + 4, { width: scoreW - 8, align: "center" });
+  doc.text(exam.average != null ? `${Math.floor(Number(exam.average)+1e-9)}%` : "—", colX[2] + 4, y + 4, { width: scoreW - 8, align: "center" });
   doc.text(exam.overallResult || "—", colX[3], y + 4, { width: gradeW + pointsW + resultW - 4, align: "center" });
   doc.fillColor("#000").font("Helvetica");
   y += ROW_H;
@@ -263,7 +263,7 @@ function drawCumulativeSummary(doc, page, theme) {
   doc.rect(pageLeft, doc.y, usableWidth, 26).fill(theme.zebra);
   doc.fillColor(theme.primary).fontSize(9).font("Helvetica-Bold")
     .text(
-      `Cumulative Average across ${page.exams.length} exams: ${page.cumulativeAverage != null ? `${Number(page.cumulativeAverage).toFixed(2)}%` : "—"}  (${page.cumulativeResult || "—"})`,
+      `Cumulative Average across ${page.exams.length} exams: ${page.cumulativeAverage != null ? `${Math.floor(Number(page.cumulativeAverage)+1e-9)}%` : "—"}  (${page.cumulativeResult || "—"})`,
       pageLeft + 8, doc.y + 8
     );
   doc.fillColor("#000");

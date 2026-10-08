@@ -223,6 +223,19 @@ const SHAPES = {
     ];
     const classRows = data.class_performance || [];
 
+    // Gender analysis — overall and per class (from getSummaryReport's gender_performance).
+    const genderCols = [
+      { header: "Class", key: "class", width: 16 },
+      { header: "Gender", key: "gender", width: 14 },
+      { header: "Registered", key: "registered", width: 12 },
+      { header: "Scored", key: "scored", width: 10 },
+      { header: "Mean (%)", key: "mean", width: 12, percent: true },
+      { header: "Highest (%)", key: "highest", width: 12, percent: true },
+      { header: "Lowest (%)", key: "lowest", width: 12, percent: true },
+      { header: "Pass Rate (%)", key: "pass_rate", width: 12, percent: true },
+    ];
+    const genderRows = data.gender_performance || [];
+
     // Class Performance Ranking — every scored candidate, ranked WITHIN
     // their own class (class_position, from getSummaryReport's
     // class_ranking — §51, same figure the Nominal Roll already shows
@@ -253,6 +266,7 @@ const SHAPES = {
         { name: "Performance", title: "Overall Performance", columns: overviewCols, rows: perfRows },
         { name: "Subject Summary", title: "Performance by Subject", columns: subjectCols, rows: subjectRows },
         { name: "Class Performance", title: "Class Performance", columns: classCols, rows: classRows, note: !classRows.length ? "No registered candidates found." : null },
+        { name: "Gender Analysis", title: "Gender Analysis", columns: genderCols, rows: genderRows, note: !genderRows.length ? "No registered candidates found." : null },
         { name: "Class Ranking", title: "Class Performance Ranking", columns: classRankingCols, rows: classRankingRows, note: !classRankingRows.length ? "No candidates have been scored yet." : null },
         { name: "Overall Ranking", title: "Overall Performance — Candidate Ranking", columns: overallCols, rows: overallRows, note: !overallRows.length ? "No candidates have been scored yet." : null },
         { name: "Grade Distribution", title: "Grade Distribution", columns: gradeCols, rows: gradeRows, note: gradeNote },
@@ -264,6 +278,7 @@ const SHAPES = {
         { heading: "Overall Performance", columns: overviewCols, rows: perfRows },
         { heading: "Performance by Subject", columns: subjectCols, rows: subjectRows },
         { heading: "Class Performance", columns: classCols, rows: classRows },
+        { heading: "Gender Analysis", columns: genderCols, rows: genderRows },
         { heading: "Class Performance Ranking", columns: classRankingCols, rows: classRankingRows },
         { heading: "Overall Performance — Candidate Ranking", columns: overallCols, rows: overallRows },
         { heading: "Grade Distribution", columns: gradeCols, rows: gradeRows, text: gradeNote || undefined },
@@ -286,7 +301,7 @@ const SHAPES = {
     const rows = data.rows || [];
     const scored = rows.filter((r) => r.percentage != null);
     const totals = scored.length
-      ? { name: "Average", percentage: Math.round(((scored.reduce((a, r) => a + r.percentage, 0) / scored.length) + Number.EPSILON) * 100) / 100 }
+      ? { name: "Average", percentage: Math.floor((scored.reduce((a, r) => a + r.percentage, 0) / scored.length) + 1e-9) }
       : null;
     return {
       title: `Subject Results — ${data.subject?.subject || ""}`,

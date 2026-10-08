@@ -186,8 +186,8 @@ function addReportSheet(workbook, { name, title, subtitle, columns, rows, totals
       const cellRef = XLSX.utils.encode_cell({ r: excelRow, c: colIdx });
       const cell = ws[cellRef];
       if (cell && typeof cell.v === "number") {
-        cell.v = Math.round((cell.v + Number.EPSILON) * 100) / 100 / 100;
-        cell.z = "0.00%";
+        cell.v = Math.floor(cell.v + 1e-9) / 100;
+        cell.z = "0%";
       }
     });
   });
@@ -199,8 +199,8 @@ function addReportSheet(workbook, { name, title, subtitle, columns, rows, totals
       const cellRef = XLSX.utils.encode_cell({ r: headerRowIndex + 1 + rowIdx, c: colIdx });
       const cell = ws[cellRef];
       if (cell && typeof cell.v === "number" && !Number.isInteger(cell.v)) {
-        cell.v = Math.round((cell.v + Number.EPSILON) * 100) / 100;
-        cell.z = "0.00";
+        cell.v = Math.floor(cell.v + 1e-9);
+        cell.z = "0";
       }
     });
   });
@@ -377,7 +377,7 @@ function drawPdfTable(doc, { columns, rows, theme }) {
       const shown = val == null || val === ""
         ? "-"
         : (typeof val === "number" && (c.percent || !Number.isInteger(val)))
-          ? val.toFixed(2)
+          ? String(Math.floor(val + 1e-9))
           : String(val);
       doc.text(shown, x + 3, y + 4, { width: colWidths[i] - 6, align: c.align || "left", lineBreak: false, ellipsis: true });
       x += colWidths[i];

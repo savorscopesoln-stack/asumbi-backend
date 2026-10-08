@@ -5,6 +5,7 @@ const {
   getStudentExaminationProfile,
   loadNominalRoll,
   computeClassPerformance,
+  computeGenderPerformance,
 } = require("./mainExamAnalytics.controller");
 
 /* =========================================================================
@@ -39,7 +40,7 @@ const toInt = (v) => {
   const n = parseInt(v, 10);
   return Number.isNaN(n) ? null : n;
 };
-const round2 = (n) => (n == null ? null : Math.round((Number(n) + Number.EPSILON) * 100) / 100);
+const round2 = (n) => (n == null ? null : Math.floor(Number(n) + 1e-9));
 
 /* -------------------------------------------------------------------------
    Calls one of the Phase 9 Express handlers in-process and captures the
@@ -107,6 +108,7 @@ const getSummaryReport = async (req, res) => {
     // (data.performance.pass_mark), so it always agrees with the
     // exam-wide pass rate shown above it.
     const classPerformance = computeClassPerformance(nominalRoll.rows || [], data.performance.pass_mark);
+    const genderPerformance = computeGenderPerformance(nominalRoll.rows || [], data.performance.pass_mark);
 
     // Class Performance Ranking — every scored candidate, ranked WITHIN
     // their own class/stream (class_position, from loadNominalRoll's
@@ -120,7 +122,7 @@ const getSummaryReport = async (req, res) => {
     // scored candidates and carrying `class_position` instead of
     // `overall_position`.
     const classRanking = (nominalRoll.rows || [])
-      .filter((r) => r.average_percentage != null)
+      .filter((r) => r.average_percentage != null && r.class)
       .map((r) => ({
         class_position: r.class_position,
         student_id: r.student_id,
@@ -148,6 +150,7 @@ const getSummaryReport = async (req, res) => {
       subjects: data.subjects,
       overall_ranking: overallRanking,
       class_performance: classPerformance,
+      gender_performance: genderPerformance,
       class_ranking: classRanking,
       nominal_roll: nominalRoll,
     });

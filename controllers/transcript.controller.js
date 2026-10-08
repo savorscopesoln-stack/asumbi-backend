@@ -4,7 +4,7 @@ const { buildTranscriptPdf } = require("../utils/transcriptPdf");
 const { loadGradingSystem, getGradeForScore, getOverallResultForScore } = require("../utils/grading");
 
 const toInt = (v) => { const n = parseInt(v, 10); return Number.isNaN(n) ? null : n; };
-const round2 = (n) => (n == null ? null : Math.round((Number(n) + Number.EPSILON) * 100) / 100);
+const round2 = (n) => (n == null ? null : Math.floor(Number(n) + 1e-9));
 
 /* =========================================================================
    TRANSCRIPT DOWNLOAD

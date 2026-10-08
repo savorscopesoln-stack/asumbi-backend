@@ -44,7 +44,8 @@ const MIN_DIFFICULTY_SAMPLE = 5;
 const MIN_DISCRIMINATION_SAMPLE = 10;
 const DISCRIMINATION_GROUP_FRACTION = 0.27; // standard top/bottom 27% split
 
-const round2 = (n) => (n == null ? null : Math.round((Number(n) + Number.EPSILON) * 100) / 100);
+const round2 = (n) => (n == null ? null : Math.floor(Number(n) + 1e-9)); // scores/percentages: rounded DOWN to whole numbers
+const roundDec = (n) => (n == null ? null : Math.round((Number(n) + Number.EPSILON) * 100) / 100); // true decimals (std dev, discrimination index)
 const round1 = (n) => (n == null ? null : Math.round(n * 10) / 10); // minutes only
 const pct = (num, denom) => (denom > 0 ? round2((num / denom) * 100) : null);
 
@@ -210,7 +211,7 @@ async function computeMainExaminationSummary(pool, id) {
     median: round2(perfRow.median),
     highest: round2(perfRow.highest),
     lowest: round2(perfRow.lowest),
-    std_dev: round2(perfRow.std_dev),
+    std_dev: roundDec(perfRow.std_dev),
     sample_size: perfRow.n || 0,
     pass_mark: passMark,
     pass_rate: perfRow.n ? pct(perfRow.passed, perfRow.n) : null,
@@ -377,7 +378,8 @@ function assignOverallPositions(rows) {
 function computeClassPerformance(rows, passMark) {
   const byClass = new Map();
   rows.forEach((r) => {
-    const key = r.class || "Unassigned";
+    if (!r.class) return; // only real classes from the Classes table
+    const key = r.class;
     if (!byClass.has(key)) byClass.set(key, []);
     byClass.get(key).push(r);
   });
@@ -403,6 +405,49 @@ function computeClassPerformance(rows, passMark) {
     if (b.mean == null) return -1;
     return b.mean - a.mean;
   });
+  return out;
+}
+
+// Gender analysis — same per-candidate average_percentage as every other
+// roll-up (§51). Returns one row per gender for the whole exam
+// (class = "All classes") followed by one row per class × gender, using
+// only classes from the Classes table (row.class is null otherwise).
+function normalizeGender(g) {
+  const v = String(g || "").trim().toLowerCase();
+  if (v === "m" || v === "male" || v === "boy") return "Male";
+  if (v === "f" || v === "female" || v === "girl") return "Female";
+  return "Not specified";
+}
+function computeGenderPerformance(rows, passMark) {
+  const order = { Male: 0, Female: 1, "Not specified": 2 };
+  const summarize = (group, className, gender) => {
+    const scored = group.filter((r) => r.average_percentage != null);
+    const mean = scored.length ? scored.reduce((s, r) => s + r.average_percentage, 0) / scored.length : null;
+    return {
+      class: className,
+      gender,
+      registered: group.length,
+      scored: scored.length,
+      mean: round2(mean),
+      highest: scored.length ? round2(Math.max(...scored.map((r) => r.average_percentage))) : null,
+      lowest: scored.length ? round2(Math.min(...scored.map((r) => r.average_percentage))) : null,
+      pass_rate: scored.length ? pct(scored.filter((r) => r.average_percentage >= passMark).length, scored.length) : null,
+    };
+  };
+  const build = (subset, className) => {
+    const byGender = new Map();
+    subset.forEach((r) => {
+      const g = normalizeGender(r.gender);
+      if (!byGender.has(g)) byGender.set(g, []);
+      byGender.get(g).push(r);
+    });
+    return [...byGender.entries()]
+      .sort((a, b) => order[a[0]] - order[b[0]])
+      .map(([g, group]) => summarize(group, className, g));
+  };
+  const out = build(rows, "All classes");
+  const classNames = [...new Set(rows.filter((r) => r.class).map((r) => r.class))].sort((a, b) => String(a).localeCompare(String(b)));
+  classNames.forEach((c) => out.push(...build(rows.filter((r) => r.class === c), c)));
   return out;
 }
 
@@ -441,6 +486,15 @@ async function loadNominalRoll(pool, mainExaminationId) {
 
   const subjectCodes = assignSubjectCodes(subjects);
   const eAssessmentIds = [...new Set(subjects.map((s) => s.e_assessment_id))];
+
+  // Class names come from the Classes table (the school's real classes).
+  // A student's free-text studentClass is matched to one of them
+  // (case/whitespace-insensitive); anything that matches no real class
+  // (import defaults like "A", typos) gets class = null so it never shows
+  // up as a made-up class in the analytics.
+  const dbClassResult = await pool.request().query(`SELECT name FROM Classes`);
+  const dbClassByKey = new Map(dbClassResult.recordset.map((c) => [String(c.name).trim().toLowerCase(), c.name]));
+  const canonClass = (n) => dbClassByKey.get(String(n || "").trim().toLowerCase()) || null;
 
   // Every registered candidate — same EXISTS matching rule as
   // computeMainExaminationSummary's `registered` count (§51).
@@ -493,7 +547,7 @@ async function loadNominalRoll(pool, mainExaminationId) {
       name: st.name,
       admission_no: st.admissionNo,
       gender: st.gender,
-      class: st.studentClass,
+      class: canonClass(st.studentClass),
       year_of_study: st.yearOfStudy,
       marks,
       total_obtained: anyScored ? totalObtained : null,
@@ -629,7 +683,7 @@ const getSubjectAnalytics = async (req, res) => {
     const performance = {
       mean: round2(perfRow.mean), median: round2(perfRow.median),
       highest: round2(perfRow.highest), lowest: round2(perfRow.lowest),
-      std_dev: round2(perfRow.std_dev), sample_size: perfRow.n || 0,
+      std_dev: roundDec(perfRow.std_dev), sample_size: perfRow.n || 0,
       pass_mark: passMark,
       pass_rate: perfRow.n ? pct(perfRow.passed, perfRow.n) : null,
       pass_rate_note: perfRow.n ? `Candidates scoring at or above the configured pass mark (${passMark}%).` : "Unavailable — no candidates have been scored yet.",
@@ -756,7 +810,7 @@ const getSubjectAnalytics = async (req, res) => {
         GROUP BY a.question_id
       `);
       discrimination = discResult.recordset.map((r) => {
-        const index = round2((r.top_correct - r.bottom_correct) / groupSize);
+        const index = roundDec((r.top_correct - r.bottom_correct) / groupSize);
         return { question_id: r.question_id, discrimination_index: index, label: discriminationLabel(index) };
       });
     }
@@ -991,6 +1045,7 @@ module.exports = {
   // "Grade Distribution" reports can never disagree (§51).
   computeMainExaminationSummary,
   computeClassPerformance,
+  computeGenderPerformance,
   loadSubjectsWithAssessment,
   loadNominalRoll,
   // Exported so the Overview dashboard (mainExam.controller.js's

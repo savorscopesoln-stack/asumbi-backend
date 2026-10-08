@@ -1316,9 +1316,14 @@ const deleteQuestion = async (req, res) => {
       return res.status(permission.status).json({ success: false, message: permission.message });
     }
 
+    // Clean up attached images too (rows + files on disk) so nothing is orphaned.
+    const imgs = await pool.request().input("id", sql.Int, questionId)
+      .query(`SELECT image_url FROM e_assessment_question_images WHERE question_id = @id`);
+    await pool.request().input("id", sql.Int, questionId).query(`DELETE FROM e_assessment_question_images WHERE question_id = @id`);
     await pool.request().input("id", sql.Int, questionId).query(`DELETE FROM e_assessment_options WHERE question_id = @id`);
     await pool.request().input("id", sql.Int, questionId).query(`DELETE FROM e_assessment_answers WHERE question_id = @id`);
     await pool.request().input("id", sql.Int, questionId).query(`DELETE FROM e_assessment_questions WHERE id = @id`);
+    imgs.recordset.forEach((r) => deleteQuestionImageByUrl(r.image_url));
 
     res.json({ success: true, message: "Question deleted successfully" });
   } catch (err) {
