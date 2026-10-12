@@ -114,6 +114,22 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       ALTER TABLE e_assessments ADD desktop_only BIT NOT NULL CONSTRAINT DF_e_assessments_desktop_only DEFAULT 0
     `);
 
+    /* ---------------- e_assessments security switches ----------------
+       Per-assessment on/off switches for the exam-security features. All
+       default to 1 (ON = required). An admin/teacher can turn one OFF for a
+       particular assessment (e.g. students with no webcam, or a lab where
+       screen sharing is impractical). */
+    for (const col of ["require_camera", "require_screen_share", "require_fullscreen", "lock_on_violations"]) {
+      await pool.request().query(`
+        IF EXISTS (SELECT * FROM sysobjects WHERE name='e_assessments' AND xtype='U')
+        AND NOT EXISTS (
+          SELECT * FROM sys.columns
+          WHERE Name = N'${col}' AND Object_ID = Object_ID(N'e_assessments')
+        )
+        ALTER TABLE e_assessments ADD ${col} BIT NOT NULL CONSTRAINT DF_e_assessments_${col} DEFAULT 1
+      `);
+    }
+
     /* ---------------- e_assessments.exam_password ----------------
        Lets a student join a single assessment via the standalone
        /take-assessment/:id page (no portal account login) using

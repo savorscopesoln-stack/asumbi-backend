@@ -21,7 +21,7 @@ const {
 
   // exam session / device lock
   startExamSession, activateExamSession, heartbeatExamSession, endExamSession,
-  setDesktopOnly, getActivityLog,
+  setDesktopOnly, setSecuritySettings, getSecuritySettings, getActivityLog,
   getExamSessions, unlockExamSession, getDeviceAccess, allowDevice, revokeDevice, downloadAttendancePdf, examSessionStatus, lockExamSession,
   autosaveExamAnswers, getExamDraft, grantResit, cancelResit, getUnsubmittedSessions,
 
@@ -119,6 +119,7 @@ router.put("/admin/:id/review", protect, requirePage("E-Assessments"), reviewAss
 router.put("/admin/:id/toggle-active", protect, requirePage("E-Assessments"), toggleEAssessmentActive);
 router.get("/admin/activity-log", protect, requirePage("E-Assessments"), getActivityLog);
 router.put("/admin/:id/desktop-only", protect, requirePage("E-Assessments"), setDesktopOnly);
+router.put("/admin/:id/security", protect, requirePage("E-Assessments"), setSecuritySettings);
 router.get("/admin/device-access", protect, requirePage("E-Assessments"), getDeviceAccess);
 router.put("/admin/device-access/:id/allow", protect, requirePage("E-Assessments"), allowDevice);
 router.put("/admin/device-access/:id/revoke", protect, requirePage("E-Assessments"), revokeDevice);
@@ -177,6 +178,7 @@ router.get("/results/:assessmentId", protect, authorize("student"), getStudentRe
 router.post("/:id/start-exam", protect, authorize("student"), enforceDesktopOnly, startExamSession);
 router.post("/:id/autosave", protect, authorize("student"), enforceDesktopOnly, autosaveExamAnswers);
 router.get("/:id/draft", protect, authorize("student"), enforceDesktopOnly, getExamDraft);
+router.get("/:id/security-settings", protect, authorize("student"), getSecuritySettings);
 router.post("/exam-session/activate", protect, authorize("student"), enforceDesktopOnly, activateExamSession);
 router.post("/exam-session/heartbeat", protect, authorize("student"), enforceDesktopOnly, heartbeatExamSession);
 router.post("/exam-session/status", protect, authorize("student"), examSessionStatus);

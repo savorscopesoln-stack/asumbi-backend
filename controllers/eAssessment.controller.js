@@ -2554,6 +2554,72 @@ const setDesktopOnly = async (req, res) => {
 
 
 /* =========================================================================
+   EXAM SECURITY SWITCHES (per assessment)
+   setSecuritySettings — admin/teacher turns individual security features
+                         ON/OFF for one assessment. Partial updates allowed.
+   getSecuritySettings — the exam page reads the switches before the exam
+                         starts (student, exam-only token for THIS exam) and
+                         the admin page can read them too.
+   Unknown/NULL values are treated as ON (strict) everywhere.
+========================================================================= */
+const SECURITY_FIELDS = ["require_camera", "require_screen_share", "require_fullscreen", "lock_on_violations"];
+
+const securityFromRow = (row) => {
+  const out = {};
+  for (const k of SECURITY_FIELDS) out[k] = row && row[k] != null ? !!row[k] : true;
+  return out;
+};
+
+const setSecuritySettings = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const id = toInt(req.params.id);
+    if (!id) return res.status(400).json({ message: "Invalid assessment ID" });
+
+    const updates = SECURITY_FIELDS.filter((k) => k in (req.body || {}));
+    if (!updates.length) return res.status(400).json({ message: "Send at least one of: " + SECURITY_FIELDS.join(", ") });
+    for (const k of updates) {
+      if (typeof req.body[k] !== "boolean") return res.status(400).json({ message: `\`${k}\` must be true or false` });
+    }
+
+    const request = pool.request().input("id", sql.Int, id);
+    updates.forEach((k) => request.input(k, sql.Bit, req.body[k] ? 1 : 0));
+    const r = await request.query(
+      `UPDATE e_assessments SET ${updates.map((k) => `${k} = @${k}`).join(", ")} WHERE id = @id;
+       SELECT @@ROWCOUNT AS n;
+       SELECT ${SECURITY_FIELDS.join(", ")} FROM e_assessments WHERE id = @id;`
+    );
+    if (!r.recordsets[0][0]?.n) return res.status(404).json({ message: "Assessment not found" });
+
+    res.json({ success: true, security: securityFromRow(r.recordsets[1][0]), message: "Security settings updated." });
+  } catch (err) {
+    console.error("SET SECURITY SETTINGS ERROR:", err);
+    res.status(500).json({ message: "Failed to update the security settings" });
+  }
+};
+
+const getSecuritySettings = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const id = toInt(req.params.id);
+    if (!id) return res.status(400).json({ message: "Invalid assessment ID" });
+
+    // A student may only read the switches of the exam their exam-only token is scoped to.
+    if (req.user?.role === "student" && (!req.user.examOnly || req.user.examAssessmentId !== id)) {
+      return res.status(403).json({ message: "Not allowed for this assessment." });
+    }
+
+    const r = await pool.request().input("id", sql.Int, id)
+      .query(`SELECT ${SECURITY_FIELDS.join(", ")} FROM e_assessments WHERE id = @id`);
+    if (!r.recordset.length) return res.status(404).json({ message: "Assessment not found" });
+    res.json({ success: true, security: securityFromRow(r.recordset[0]) });
+  } catch (err) {
+    console.error("GET SECURITY SETTINGS ERROR:", err);
+    res.status(500).json({ message: "Failed to load the security settings" });
+  }
+};
+
+/* =========================================================================
    REJECTED DEVICES + PER-DEVICE ALLOW-LIST (Desktop-only switch)
    getDeviceAccess  — every phone/tablet the switch rejected, with student,
                       assessment, platform (Android/iPhone/...), attempts.
@@ -3909,6 +3975,8 @@ const updateGradingSystem = async (req, res) => {
 ========================================================================= */
 module.exports = {
   setDesktopOnly,
+  setSecuritySettings,
+  getSecuritySettings,
   getActivityLog,
   // core
   createEAssessment, updateEAssessment, getEAssessments, getEAssessmentById,

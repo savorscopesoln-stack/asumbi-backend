@@ -83,6 +83,7 @@ const ROUTE_ACTIONS = {
   "PUT /admin/:id/review":               { action: "review_assessment",       kind: "assessment" },
   "PUT /admin/:id/toggle-active":        { action: "start_stop_assessment",   kind: "assessment" },
   "PUT /admin/:id/desktop-only":         { action: "set_desktop_only",        kind: "assessment" },
+  "PUT /admin/:id/security":             { action: "set_security_settings",   kind: "assessment" },
   "GET /admin/:id/attendance-pdf":      { action: "download_attendance_pdf", kind: "assessment" },
   "PUT /admin/device-access/:id/allow":  { action: "allow_device",            kind: "device_access" },
   "PUT /admin/device-access/:id/revoke": { action: "revoke_device",           kind: "device_access" },
