@@ -119,7 +119,7 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
        default to 1 (ON = required). An admin/teacher can turn one OFF for a
        particular assessment (e.g. students with no webcam, or a lab where
        screen sharing is impractical). */
-    for (const col of ["require_camera", "require_screen_share", "require_fullscreen", "lock_on_violations"]) {
+    for (const col of ["require_camera", "require_screen_share", "require_fullscreen", "lock_on_violations", "use_device_cache"]) {
       await pool.request().query(`
         IF EXISTS (SELECT * FROM sysobjects WHERE name='e_assessments' AND xtype='U')
         AND NOT EXISTS (

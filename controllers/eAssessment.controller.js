@@ -2620,7 +2620,12 @@ const setSebSettings = async (req, res) => {
                          the admin page can read them too.
    Unknown/NULL values are treated as ON (strict) everywhere.
 ========================================================================= */
-const SECURITY_FIELDS = ["require_camera", "require_screen_share", "require_fullscreen", "lock_on_violations"];
+// `use_device_cache` is not a security rule but rides on the same per-assessment
+// switch plumbing: ON (default) = the paper and answers are cached on the
+// student's device (IndexedDB/localStorage) so the exam survives a refresh or
+// a dropped connection; OFF = nothing is stored on the device, the server is
+// the only copy and the exam needs a live connection.
+const SECURITY_FIELDS = ["require_camera", "require_screen_share", "require_fullscreen", "lock_on_violations", "use_device_cache"];
 
 const securityFromRow = (row) => {
   const out = {};
