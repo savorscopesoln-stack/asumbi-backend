@@ -2088,7 +2088,7 @@ const uploadViolationPhoto = async (req, res) => {
   try {
     const pool = req.pool;
     const student_id = req.user?.id;
-    const { assessment_id, token, device_id, image, reason } = req.body;
+    const { assessment_id, token, device_id, image, reason, screenshot, question_id, question_number, answer_text } = req.body;
     const e_assessment_id = toInt(assessment_id);
 
     if (!student_id) return res.status(401).json({ success: false, message: "Unauthorized" });
@@ -2118,6 +2118,26 @@ const uploadViolationPhoto = async (req, res) => {
       return res.status(400).json({ success: false, message: imgErr.message || "Invalid image" });
     }
 
+    // Optional full-screen screenshot taken at the same moment. A bad or
+    // missing screenshot never fails the webcam photo.
+    let screenshotFile = null;
+    if (screenshot) {
+      try { screenshotFile = saveViolationPhoto(screenshot); } catch { screenshotFile = null; }
+    }
+
+    // Which question the student was on. The question text comes from the
+    // database (not trusted from the browser) when the id belongs to this
+    // assessment.
+    let qId = toInt(question_id) || null;
+    let qText = null;
+    if (qId) {
+      const qRes = await pool.request()
+        .input("qid", sql.Int, qId).input("aid", sql.Int, e_assessment_id)
+        .query(`SELECT question_text FROM e_assessment_questions WHERE id = @qid AND e_assessment_id = @aid`);
+      if (qRes.recordset.length) qText = qRes.recordset[0].question_text;
+      else qId = null;
+    }
+
     await pool.request()
       .input("session_id", sql.Int, sessionId)
       .input("e_assessment_id", sql.Int, e_assessment_id)
@@ -2125,10 +2145,17 @@ const uploadViolationPhoto = async (req, res) => {
       .input("device_id", sql.NVarChar(200), device_id || "")
       .input("reason", sql.NVarChar(300), (reason || "").slice(0, 300))
       .input("photo_url", sql.NVarChar(500), violationPhotoUrlFor(filename))
+      .input("screenshot_url", sql.NVarChar(500), screenshotFile ? violationPhotoUrlFor(screenshotFile) : null)
+      .input("question_id", sql.Int, qId)
+      .input("question_number", sql.Int, toInt(question_number) || null)
+      .input("question_text", sql.NVarChar(sql.MAX), qText)
+      .input("answer_text", sql.NVarChar(sql.MAX), typeof answer_text === "string" ? answer_text.slice(0, 4000) : null)
       .query(`
         INSERT INTO e_assessment_violation_photos
-          (session_id, e_assessment_id, student_id, device_id, reason, photo_url)
-        VALUES (@session_id, @e_assessment_id, @student_id, @device_id, @reason, @photo_url)
+          (session_id, e_assessment_id, student_id, device_id, reason, photo_url,
+           screenshot_url, question_id, question_number, question_text, answer_text)
+        VALUES (@session_id, @e_assessment_id, @student_id, @device_id, @reason, @photo_url,
+                @screenshot_url, @question_id, @question_number, @question_text, @answer_text)
       `);
 
     // Fire-and-forget from the student's point of view — this must never
@@ -2151,7 +2178,8 @@ const getViolationPhotos = async (req, res) => {
     const result = await pool.request()
       .input("session_id", sql.Int, sessionId)
       .query(`
-        SELECT id, session_id, e_assessment_id, student_id, device_id, reason, photo_url, createdAt
+        SELECT id, session_id, e_assessment_id, student_id, device_id, reason, photo_url, createdAt,
+               screenshot_url, question_id, question_number, question_text, answer_text
         FROM e_assessment_violation_photos
         WHERE session_id = @session_id
         ORDER BY createdAt DESC
@@ -2950,7 +2978,8 @@ const loadStudentEvidence = async (pool, eAssessmentId, studentIds) => {
     const photosRes = await pool.request()
       .input("aid", sql.Int, eAssessmentId)
       .query(`
-        SELECT id, student_id, reason, photo_url, createdAt
+        SELECT id, student_id, reason, photo_url, createdAt,
+               screenshot_url, question_id, question_number, question_text, answer_text
         FROM e_assessment_violation_photos
         WHERE e_assessment_id = @aid AND student_id IN (${idList})
         ORDER BY createdAt ASC
@@ -2959,6 +2988,11 @@ const loadStudentEvidence = async (pool, eAssessmentId, studentIds) => {
       if (!out[ph.student_id]) out[ph.student_id] = { name: null, profile_photo_url: null, photos: [] };
       out[ph.student_id].photos.push({
         id: ph.id, reason: ph.reason, photo_url: ph.photo_url, created_at: ph.createdAt,
+        screenshot_url: ph.screenshot_url || null,
+        question_id: ph.question_id || null,
+        question_number: ph.question_number || null,
+        question_text: ph.question_text || null,
+        answer_text: ph.answer_text || null,
       });
     });
   } catch (err) {

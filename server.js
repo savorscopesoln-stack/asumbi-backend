@@ -164,6 +164,12 @@ io.on("connection", (socket) => {
 /* ================= MIDDLEWARE ================= */
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
+// The camera-photo upload posts a webcam frame AND a full-screen screenshot
+// as base64 data URLs, which easily exceeds express.json()'s 100kb default
+// (the request used to be rejected with 413 and silently dropped). Give just
+// this one route a bigger limit; it must be registered BEFORE the global
+// parser below, which then skips the already-parsed body.
+app.use("/api/e-assessments/violation-photo", express.json({ limit: "20mb" }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
