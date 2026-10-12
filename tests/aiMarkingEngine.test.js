@@ -10,7 +10,7 @@ const { suite, test, assert } = require("./helpers/tinytest");
 const { resolveConfig, publicConfig, computeCost } = require("../services/aiMarkingEngine.config");
 const P = require("../services/aiMarkingEngine.prompt");
 const V = require("../services/aiMarkingEngine.validate");
-const { ProviderError, createAnthropicProvider, createMockProvider, createProvider } = require("../services/aiMarkingEngine.providers");
+const { ProviderError, createAnthropicProvider, createGeminiProvider, createMockProvider, createProvider } = require("../services/aiMarkingEngine.providers");
 const { evaluateAnswer, toEvaluationRow, toFailureRow } = require("../services/aiMarkingEngine.service");
 
 suite("aiMarkingEngine.test.js");
@@ -424,4 +424,87 @@ test("createProvider refuses an unconfigured engine and requires a key + model f
   assert.throws(() => createProvider(resolveConfig({})), /not configured/);
   assert.throws(() => createAnthropicProvider({ model: "m" }), /apiKey/);
   assert.throws(() => createAnthropicProvider({ apiKey: "k" }), /model/);
+});
+
+/* ------------------------------ Gemini adapter (fake fetch) ------------------------------ */
+const gOk = (extra = {}, cand = {}) => ({ ok: true, status: 200, headers: new Map(), json: async () => ({
+  candidates: [{ content: { role: "model", parts: [{ text: good() }] }, finishReason: "STOP", ...cand }],
+  usageMetadata: { promptTokenCount: 321, candidatesTokenCount: 45 }, modelVersion: "gemini-actual", responseId: "r1", ...extra }) });
+
+test("gemini: builds the request (url, key in header not URL, body) and maps the reply", async () => {
+  const f = fakeFetch(() => gOk());
+  const p = createGeminiProvider({ apiKey: "g-secret", model: "gemini-x", fetchImpl: f });
+  const r = await p.complete({ ...req, messages: [{ role: "user", content: "U" }, { role: "assistant", content: "A" }, { role: "user", content: "U2" }] });
+  assert.strictEqual(f.calls[0].url, "https://generativelanguage.googleapis.com/v1beta/models/gemini-x:generateContent");
+  assert.ok(!f.calls[0].url.includes("g-secret"), "key must never be in the URL");
+  assert.strictEqual(f.calls[0].init.headers["x-goog-api-key"], "g-secret");
+  assert.strictEqual(f.calls[0].init.redirect, "error");
+  const b = JSON.parse(f.calls[0].init.body);
+  assert.strictEqual(b.systemInstruction.parts[0].text, "S");
+  assert.deepStrictEqual(b.contents.map((c) => c.role), ["user", "model", "user"]);
+  assert.deepStrictEqual([b.generationConfig.temperature, b.generationConfig.maxOutputTokens, b.generationConfig.responseMimeType], [0, 1500, "application/json"]);
+  assert.strictEqual(b.generationConfig.thinkingConfig, undefined);
+  assert.deepStrictEqual(r.usage, { inputTokens: 321, outputTokens: 45 });
+  assert.strictEqual(r.model, "gemini-actual"); assert.strictEqual(r.truncated, false); assert.strictEqual(r.requestId, "r1");
+});
+test("gemini: gateway base url, 'models/' prefix tolerated, thinking budget forwarded", async () => {
+  const f = fakeFetch(() => gOk());
+  await createGeminiProvider({ apiKey: "k", model: "models/gemini-x", baseUrl: "https://gw.example.com/", thinkingBudget: 0, fetchImpl: f }).complete(req);
+  assert.strictEqual(f.calls[0].url, "https://gw.example.com/v1beta/models/gemini-x:generateContent");
+  assert.deepStrictEqual(JSON.parse(f.calls[0].init.body).generationConfig.thinkingConfig, { thinkingBudget: 0 });
+});
+test("gemini: thinking tokens are billed as output; thought parts are not part of the reply text", async () => {
+  const f = fakeFetch(() => ({ ok: true, status: 200, headers: new Map(), json: async () => ({
+    candidates: [{ content: { parts: [{ text: "hidden reasoning", thought: true }, { text: good() }] }, finishReason: "STOP" }],
+    usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 40, thoughtsTokenCount: 60 } }) }));
+  const r = await createGeminiProvider({ apiKey: "k", model: "m", fetchImpl: f }).complete(req);
+  assert.strictEqual(r.text, good()); assert.deepStrictEqual(r.usage, { inputTokens: 100, outputTokens: 100 });
+});
+test("gemini: MAX_TOKENS is reported as truncated; empty-but-truncated and blocked replies are INVALID_RESPONSE (not systemic)", async () => {
+  assert.strictEqual((await createGeminiProvider({ apiKey: "k", model: "m", fetchImpl: fakeFetch(() => gOk({}, { finishReason: "MAX_TOKENS" })) }).complete(req)).truncated, true);
+  let e = await createGeminiProvider({ apiKey: "k", model: "m", fetchImpl: fakeFetch(() => gOk({}, { finishReason: "MAX_TOKENS", content: { parts: [] } })) }).complete(req).catch((x) => x);
+  assert.strictEqual(e.kind, "INVALID_RESPONSE"); assert.strictEqual(e.systemic, false); assert.ok(/AI_MARKING_MAX_OUTPUT_TOKENS/.test(e.message));
+  e = await createGeminiProvider({ apiKey: "k", model: "m", fetchImpl: fakeFetch(() => ({ ok: true, status: 200, headers: new Map(), json: async () => ({ promptFeedback: { blockReason: "SAFETY" } }) })) }).complete(req).catch((x) => x);
+  assert.strictEqual(e.kind, "INVALID_RESPONSE"); assert.strictEqual(e.systemic, false);
+  e = await createGeminiProvider({ apiKey: "k", model: "m", fetchImpl: fakeFetch(() => ({ ok: true, status: 200, headers: new Map(), json: async () => ({ candidates: [] }) })) }).complete(req).catch((x) => x);
+  assert.strictEqual(e.kind, "INVALID_RESPONSE");
+});
+test("gemini: HTTP statuses map to the right kind; the provider's error body (student text) is never copied", async () => {
+  const table = [[401, "AUTH", false, true], [403, "AUTH", false, true], [400, "BAD_REQUEST", false, true], [404, "BAD_REQUEST", false, true],
+    [429, "RATE_LIMITED", true, false], [500, "UNAVAILABLE", true, false], [503, "UNAVAILABLE", true, false]];
+  for (const [status, kind, retryable, systemic] of table) {
+    const p = createGeminiProvider({ apiKey: "g-LEAK", model: "m", fetchImpl: fakeFetch(() => ({ ok: false, status, headers: new Map([["retry-after", "7"]]), json: async () => ({ error: { message: "echoed student essay text g-LEAK" } }) })) });
+    const e = await p.complete(req).catch((x) => x);
+    assert.ok(e instanceof ProviderError, `status ${status}`);
+    assert.deepStrictEqual([e.kind, e.retryable, e.systemic], [kind, retryable, systemic], `status ${status}`);
+    assert.ok(!/echoed|g-LEAK/.test(e.message), "error message must not leak body or key");
+    if (status === 429) assert.strictEqual(e.retryAfterMs, 7000);
+  }
+});
+test("gemini: network failure and timeout are retryable and never leak the key", async () => {
+  let e = await createGeminiProvider({ apiKey: "g-LEAK", model: "m", fetchImpl: async () => { throw new Error("ECONNRESET g-LEAK"); } }).complete(req).catch((x) => x);
+  assert.strictEqual(e.kind, "NETWORK"); assert.ok(e.retryable && !/g-LEAK/.test(e.message));
+  const hang = (url, init) => new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(Object.assign(new Error("a"), { name: "AbortError" }))));
+  e = await createGeminiProvider({ apiKey: "k", model: "m", fetchImpl: hang }).complete({ ...req, timeoutMs: 20 }).catch((x) => x);
+  assert.strictEqual(e.kind, "TIMEOUT");
+});
+test("gemini: config + createProvider wiring (key/model required, thinking budget validated)", () => {
+  assert.throws(() => createGeminiProvider({ model: "m" }), /apiKey/);
+  assert.throws(() => createGeminiProvider({ apiKey: "k" }), /model/);
+  const none = resolveConfig({ AI_MARKING_PROVIDER: "gemini", AI_MARKING_MODEL: "m" });
+  assert.strictEqual(none.configured, false); assert.ok(none.missing.includes("AI_MARKING_API_KEY"));
+  const ok = resolveConfig({ AI_MARKING_PROVIDER: "gemini", AI_MARKING_MODEL: "m", AI_MARKING_API_KEY: "k", AI_MARKING_GEMINI_THINKING_BUDGET: "0" });
+  assert.strictEqual(ok.configured, true); assert.strictEqual(ok.geminiThinkingBudget, 0);
+  assert.strictEqual(createProvider(ok).name, "gemini");
+  const bad = resolveConfig({ AI_MARKING_PROVIDER: "gemini", AI_MARKING_MODEL: "m", AI_MARKING_API_KEY: "k", AI_MARKING_GEMINI_THINKING_BUDGET: "abc" });
+  assert.strictEqual(bad.configured, false);
+  assert.strictEqual(resolveConfig({ AI_MARKING_PROVIDER: "openai" }).configured, false);
+  assert.ok(!JSON.stringify(require("../services/aiMarkingEngine.config").publicConfig(ok)).includes('"k"'), "publicConfig must not expose the key");
+});
+test("gemini: end-to-end through evaluateAnswer with a fake fetch", async () => {
+  const f = fakeFetch(() => gOk());
+  const provider = createProvider(resolveConfig({ ...ENV, AI_MARKING_PROVIDER: "gemini", AI_MARKING_API_KEY: "k", AI_MARKING_MODEL: "gemini-x" }), { fetchImpl: f });
+  const r = await evaluateAnswer(INPUT, { config: resolveConfig({ ...ENV, AI_MARKING_PROVIDER: "gemini", AI_MARKING_API_KEY: "k", AI_MARKING_MODEL: "gemini-x" }), provider });
+  assert.strictEqual(r.ok, true); assert.strictEqual(r.totalMarks ?? r.result?.totalMarks ?? 5, 5);
+  assert.strictEqual(f.calls.length, 1);
 });

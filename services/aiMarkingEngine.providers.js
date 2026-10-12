@@ -24,9 +24,10 @@
    INVALID_RESPONSE    no         no        2xx but unusable body
    `systemic` = retrying other answers is pointless: the worker should pause the job.
 
-   Written against the Anthropic Messages API from knowledge of its public
-   shape; it has NOT been run against the live service from here (no
-   network). Test it with scripts/aiMarkingEngineDryRun.js before relying on it.
+   Adapters: "anthropic" (Messages API) and "gemini" (Google generateContent).
+   Both were written against the providers' public API shapes and have NOT
+   been run against the live services from here (no network). Test with
+   scripts/aiMarkingEngineDryRun.js before relying on either.
 ========================================================================= */
 
 class ProviderError extends Error {
@@ -99,6 +100,71 @@ function createAnthropicProvider({ apiKey, model, baseUrl = null, fetchImpl = gl
   };
 }
 
+/** Google Gemini (Generative Language API, generateContent). Same interface as the Anthropic adapter.
+ *  - The key goes in the `x-goog-api-key` header, never in the URL, so it can't leak into logs/proxies/error text.
+ *  - A reply blocked by Gemini's safety filter, or one with no text, is INVALID_RESPONSE (not systemic): that single
+ *    answer falls back to manual marking and the rest of the job carries on.
+ *  - Gemini 2.5-style "thinking" tokens count against maxOutputTokens and are billed as output. If replies come back
+ *    truncated/empty, raise AI_MARKING_MAX_OUTPUT_TOKENS or set AI_MARKING_GEMINI_THINKING_BUDGET (see config). */
+function createGeminiProvider({ apiKey, model, baseUrl = null, thinkingBudget = null, fetchImpl = globalThis.fetch }) {
+  if (!apiKey) throw new Error("createGeminiProvider: apiKey is required");
+  if (!model) throw new Error("createGeminiProvider: model is required");
+  if (typeof fetchImpl !== "function") throw new Error("createGeminiProvider: no fetch implementation (Node 18+ required)");
+  const modelPath = String(model).replace(/^models\//, "");
+  const url = `${(baseUrl || "https://generativelanguage.googleapis.com").replace(/\/+$/, "")}/v1beta/models/${encodeURIComponent(modelPath)}:generateContent`;
+
+  return {
+    name: "gemini", model: modelPath,
+    async complete({ system, messages, maxOutputTokens, temperature = 0, timeoutMs }) {
+      const generationConfig = { temperature, maxOutputTokens, responseMimeType: "application/json" };
+      if (thinkingBudget != null) generationConfig.thinkingConfig = { thinkingBudget };
+      const payload = {
+        systemInstruction: { parts: [{ text: system }] },
+        contents: (messages || []).map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: String(m.content) }] })),
+        generationConfig,
+      };
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      let res;
+      try {
+        res = await fetchImpl(url, {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-goog-api-key": apiKey },
+          body: JSON.stringify(payload),
+          signal: controller.signal,
+          redirect: "error", // a redirect would forward the key header and the student text elsewhere
+        });
+      } catch (e) {
+        if (e && (e.name === "AbortError" || e.code === "ABORT_ERR")) throw new ProviderError("TIMEOUT", `Provider call exceeded ${timeoutMs} ms`, { retryable: true });
+        throw new ProviderError("NETWORK", "Could not reach the provider", { retryable: true });
+      } finally { clearTimeout(timer); }
+
+      if (!res.ok) throw classifyStatus(res.status, parseRetryAfter(res.headers));
+
+      let body;
+      try { body = await res.json(); } catch { throw new ProviderError("INVALID_RESPONSE", "Provider returned a body that is not JSON"); }
+      const cand = Array.isArray(body?.candidates) ? body.candidates[0] : null;
+      const parts = Array.isArray(cand?.content?.parts) ? cand.content.parts : [];
+      const text = parts.filter((x) => x && typeof x.text === "string" && !x.thought).map((x) => x.text).join("");
+      if (!cand && body?.promptFeedback?.blockReason) throw new ProviderError("INVALID_RESPONSE", "Provider blocked the request (content filter)");
+      const truncated = cand?.finishReason === "MAX_TOKENS";
+      if (!text.length) {
+        throw new ProviderError("INVALID_RESPONSE", truncated
+          ? "Provider reply was cut off before any answer text (raise AI_MARKING_MAX_OUTPUT_TOKENS or set AI_MARKING_GEMINI_THINKING_BUDGET)"
+          : "Provider reply contained no text");
+      }
+      const u = body?.usageMetadata || {};
+      return {
+        text,
+        // Thinking tokens are billed as output by Gemini, so they are counted as output here.
+        usage: { inputTokens: Number(u.promptTokenCount) || 0, outputTokens: (Number(u.candidatesTokenCount) || 0) + (Number(u.thoughtsTokenCount) || 0) },
+        model: body?.modelVersion || modelPath, requestId: body?.responseId || null,
+        truncated,
+      };
+    },
+  };
+}
+
 /** Deterministic stand-in for development and tests. `script` is an array of replies/errors consumed in order. */
 function createMockProvider({ model = "mock-model", script = [] } = {}) {
   const queue = [...script];
@@ -119,8 +185,9 @@ function createMockProvider({ model = "mock-model", script = [] } = {}) {
 function createProvider(config, deps = {}) {
   if (!config.configured) throw new ProviderError("BAD_REQUEST", "AI marking provider is not configured", { systemic: true });
   if (config.provider === "anthropic") return createAnthropicProvider({ apiKey: config.apiKey, model: config.model, baseUrl: config.baseUrl, fetchImpl: deps.fetchImpl });
+  if (config.provider === "gemini") return createGeminiProvider({ apiKey: config.apiKey, model: config.model, baseUrl: config.baseUrl, thinkingBudget: config.geminiThinkingBudget, fetchImpl: deps.fetchImpl });
   if (config.provider === "mock") return createMockProvider({ model: config.model, script: deps.script });
   throw new ProviderError("BAD_REQUEST", `Unknown provider ${config.provider}`, { systemic: true });
 }
 
-module.exports = { ProviderError, createAnthropicProvider, createMockProvider, createProvider, classifyStatus, parseRetryAfter };
+module.exports = { ProviderError, createAnthropicProvider, createGeminiProvider, createMockProvider, createProvider, classifyStatus, parseRetryAfter };

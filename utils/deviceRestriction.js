@@ -24,6 +24,16 @@
    *Mac* User-Agent by default, so the header alone can't tell an iPad
    from a MacBook. A "Mac" that reports multi-touch is an iPad.
 
+   ALLOWING A SPECIFIC DEVICE
+   ─────────────────────────────────────────────────────────
+   Every rejection is recorded in e_assessment_device_access (student,
+   assessment, platform, device id, attempts, last seen) and shown on the
+   admin Device Locks tab. An admin can click "Allow" on a row: that
+   (student, device, assessment) is then let through even while Desktop-only
+   is ON, and "Revoke" puts the block back. The device is identified by the
+   `exam_device_id` the browser keeps (sent in X-Client-Device); if that's
+   missing the User-Agent is hashed instead.
+
    KNOWN LIMIT: all of this comes from the client, so a determined
    person can spoof it. It reliably stops normal phone/tablet use
    (including "Request Desktop Site"), not a deliberate bypass.
@@ -34,6 +44,7 @@
    that WOULD be blocked, and is cached for a few seconds so a toggle
    still takes effect almost instantly.
 ========================================================================= */
+const crypto = require("crypto");
 const sql = require("mssql");
 
 const DEVICE_NOT_ALLOWED_CODE = "DEVICE_NOT_ALLOWED";
@@ -149,15 +160,111 @@ async function isDesktopOnly(pool, tenant, assessmentId) {
   return value;
 }
 
+
+/* ── DEVICE IDENTITY, REJECTION LOG AND ALLOW-LIST ── */
+function deviceKeyFor(req) {
+  const client = parseClientDevice(req) || {};
+  const id = String(client.deviceId || "").replace(/[^A-Za-z0-9_.:-]/g, "").slice(0, 80);
+  if (id.length >= 8) return id;
+  const ua = String(req.get("user-agent") || "");
+  return "ua:" + crypto.createHash("sha1").update(ua).digest("hex").slice(0, 20);
+}
+
+const ALLOW_TTL_MS = 5000;
+const allowCache = new Map(); // `${tenant}:${aid}:${sid}:${key}` -> { value, at }
+function invalidateDeviceAccessCache() { allowCache.clear(); }
+
+async function isDeviceAllowed(pool, tenant, assessmentId, studentId, deviceKey) {
+  const ck = `${tenant || "default"}:${assessmentId}:${studentId}:${deviceKey}`;
+  const hit = allowCache.get(ck);
+  if (hit && Date.now() - hit.at < ALLOW_TTL_MS) return hit.value;
+  let value = false;
+  try {
+    const r = await pool.request()
+      .input("aid", sql.Int, assessmentId)
+      .input("sid", sql.Int, studentId)
+      .input("dk", sql.NVarChar(100), deviceKey)
+      .query(`SELECT 1 AS ok FROM e_assessment_device_access
+              WHERE e_assessment_id = @aid AND student_id = @sid AND device_key = @dk AND status = 'allowed'`);
+    value = r.recordset.length > 0;
+  } catch (err) {
+    console.error("DEVICE ALLOW LOOKUP ERROR:", err.message);
+    return false; // can't prove it was allowed -> the restriction stands
+  }
+  allowCache.set(ck, { value, at: Date.now() });
+  if (allowCache.size > 5000) allowCache.clear();
+  return value;
+}
+
+// A phone retrying (heartbeat every ~10s) must not hammer the database:
+// write at most once a minute per (assessment, student, device).
+const REJECT_LOG_WINDOW_MS = 60000;
+const rejectSeen = new Map();
+async function recordRejection(pool, tenant, assessmentId, studentId, deviceKey, device, req) {
+  try {
+    const ck = `${tenant || "default"}:${assessmentId}:${studentId}:${deviceKey}`;
+    const now = Date.now();
+    const last = rejectSeen.get(ck);
+    if (last && now - last < REJECT_LOG_WINDOW_MS) return;
+    rejectSeen.set(ck, now);
+    if (rejectSeen.size > 5000) { for (const [k, t] of rejectSeen) if (now - t > 120000) rejectSeen.delete(k); }
+
+    const ip = (String(req.headers["x-forwarded-for"] || "").split(",")[0].trim() || req.ip || "").slice(0, 64) || null;
+    await pool.request()
+      .input("aid", sql.Int, assessmentId)
+      .input("sid", sql.Int, studentId)
+      .input("dk", sql.NVarChar(100), deviceKey)
+      .input("platform", sql.NVarChar(30), String(device?.platform || "unknown").slice(0, 30))
+      .input("ua", sql.NVarChar(400), String(req.get("user-agent") || "").slice(0, 400) || null)
+      .input("ip", sql.NVarChar(64), ip)
+      .input("reason", sql.NVarChar(200), device?.reason ? String(device.reason).slice(0, 200) : null)
+      .query(`
+        UPDATE e_assessment_device_access
+        SET attempts = attempts + 1, last_seen = GETDATE(), platform = @platform, user_agent = @ua, ip = @ip, reason = @reason
+        WHERE e_assessment_id = @aid AND student_id = @sid AND device_key = @dk;
+        IF @@ROWCOUNT = 0
+          INSERT INTO e_assessment_device_access (e_assessment_id, student_id, device_key, platform, user_agent, ip, reason)
+          VALUES (@aid, @sid, @dk, @platform, @ua, @ip, @reason);
+      `);
+  } catch (err) {
+    if (!/duplicate|UX_e_assessment_device_access/i.test(String(err.message))) {
+      console.error("DEVICE REJECTION LOG ERROR:", err.message); // never affects the response
+    }
+  }
+}
+
+// Who is behind this request? A logged-in student -> req.user.id. The exam
+// login has no token yet, so fall back to the username they typed.
+async function resolveStudentId(pool, req, username) {
+  if (req.user?.role === "student" && req.user.id) return Number(req.user.id) || 0;
+  if (!username) return 0;
+  try {
+    const r = await pool.request().input("u", sql.NVarChar(150), String(username).slice(0, 150))
+      .query(`SELECT id FROM Students WHERE username = @u`);
+    return r.recordset[0]?.id || 0;
+  } catch { return 0; }
+}
+
 /**
  * Core check. Returns { blocked: false } or { blocked: true, device }.
  */
-async function checkDesktopOnly(req, pool, tenant, assessmentId) {
+async function checkDesktopOnly(req, pool, tenant, assessmentId, opts = {}) {
   if (!assessmentId) return { blocked: false };
   const device = classifyDevice(req);
   if (device.allowed) return { blocked: false, device }; // normal laptop: no DB hit
   const restricted = await isDesktopOnly(pool, tenant, assessmentId);
-  return restricted ? { blocked: true, device } : { blocked: false, device };
+  if (!restricted) return { blocked: false, device };
+
+  // A phone/tablet on a restricted exam: let it through only if an admin
+  // allowed THIS device for THIS student; otherwise record the attempt (so the
+  // admin sees it on the Device Locks tab) and block.
+  const studentId = await resolveStudentId(pool, req, opts.username);
+  const deviceKey = deviceKeyFor(req);
+  if (await isDeviceAllowed(pool, tenant, assessmentId, studentId, deviceKey)) {
+    return { blocked: false, device, allowedByAdmin: true };
+  }
+  recordRejection(pool, tenant, assessmentId, studentId, deviceKey, device, req); // fire-and-forget
+  return { blocked: true, device };
 }
 
 function sendBlocked(res, device) {
@@ -205,4 +312,6 @@ module.exports = {
   enforceDesktopOnly,
   sendBlocked,
   invalidateDesktopOnlyCache,
+  invalidateDeviceAccessCache,
+  deviceKeyFor,
 };

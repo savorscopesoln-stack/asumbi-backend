@@ -8,7 +8,7 @@
    suggestions next to your own marks. Nothing is stored anywhere.
 
    Usage (set the same variables the server uses):
-     AI_MARKING_PROVIDER=anthropic AI_MARKING_API_KEY=... AI_MARKING_MODEL=<model id> \
+     AI_MARKING_PROVIDER=gemini|anthropic AI_MARKING_API_KEY=... AI_MARKING_MODEL=<model id> \
      AI_MARKING_COST_INPUT_PER_MTOK=<price> AI_MARKING_COST_OUTPUT_PER_MTOK=<price> \
      node scripts/aiMarkingEngineDryRun.js samples.json
 

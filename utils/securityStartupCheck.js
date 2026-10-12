@@ -48,7 +48,7 @@ function checkSecurityConfig(env = process.env) {
   const provider = String(env.AI_MARKING_PROVIDER || "").trim().toLowerCase();
   if (provider) {
     if (provider === "mock" && production) fatal.push("AI_MARKING_PROVIDER=mock is not allowed in production.");
-    if (String(env.AI_MARKING_JOBS_ENABLED || "").toLowerCase() === "true" && !env.AI_MARKING_API_KEY && provider === "anthropic") {
+    if (String(env.AI_MARKING_JOBS_ENABLED || "").toLowerCase() === "true" && !env.AI_MARKING_API_KEY && (provider === "anthropic" || provider === "gemini")) {
       warnings.push("AI_MARKING_JOBS_ENABLED is true but AI_MARKING_API_KEY is empty: AI jobs will fail until it is set.");
     }
   }
