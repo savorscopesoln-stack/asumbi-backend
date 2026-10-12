@@ -164,6 +164,12 @@ io.on("connection", (socket) => {
 /* ================= MIDDLEWARE ================= */
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
+// The camera-photo upload posts a webcam frame AND a full-screen screenshot
+// as base64 data URLs, which easily exceeds express.json()'s 100kb default
+// (the request used to be rejected with 413 and silently dropped). Give just
+// this one route a bigger limit; it must be registered BEFORE the global
+// parser below, which then skips the already-parsed body.
+app.use("/api/e-assessments/violation-photo", express.json({ limit: "20mb" }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -779,6 +785,66 @@ app.post("/api/update-records/delete", protect, adminOnly, async (req, res) => {
   } catch (err) {
     console.log("DELETE ERROR:", err);
     res.status(500).json({ message: "Delete failed" });
+  }
+});
+
+/* =========================================================
+   BULK DELETE RECORDS (admin only)
+   Deletes many rows of one table by primary key in a single
+   transaction: either every selected row is deleted or, if any
+   delete fails (e.g. a foreign key still points at one of the
+   rows), none are. Ids are sent in chunks so we never exceed
+   SQL Server's 2100-parameter limit.
+========================================================= */
+app.post("/api/update-records/bulk-delete", protect, adminOnly, async (req, res) => {
+  let transaction = null;
+  try {
+    const pool = req.pool;
+    const requestedTable = req.body.type || req.body.table;
+    const table = await resolveTableName(pool, requestedTable);
+    if (!table) {
+      return res.status(400).json({ message: `Unknown table "${requestedTable || ""}"` });
+    }
+
+    let ids = Array.isArray(req.body.ids) ? req.body.ids : [];
+    ids = [...new Set(ids.filter((v) => v !== undefined && v !== null && v !== "").map((v) => String(v)))];
+    if (!ids.length) return res.status(400).json({ message: "No records selected" });
+    if (ids.length > 5000) {
+      return res.status(400).json({ message: "Too many records at once (max 5000). Select fewer rows." });
+    }
+
+    // Never let an admin delete the account they're logged in with.
+    if (table.toLowerCase() === "users" && req.user?.id != null && ids.includes(String(req.user.id))) {
+      return res.status(400).json({ message: "You can't delete your own account. Unselect it and try again." });
+    }
+
+    const pk = await getPrimaryKeyColumn(pool, table);
+
+    transaction = pool.transaction();
+    await transaction.begin();
+    let deleted = 0;
+    const CHUNK = 1000;
+    for (let i = 0; i < ids.length; i += CHUNK) {
+      const chunk = ids.slice(i, i + CHUNK);
+      const dbRequest = transaction.request();
+      chunk.forEach((v, j) => dbRequest.input(`id${j}`, v));
+      const result = await dbRequest.query(
+        `DELETE FROM [${table}] WHERE [${pk}] IN (${chunk.map((_, j) => `@id${j}`).join(", ")})`
+      );
+      deleted += (result.rowsAffected || []).reduce((a, b) => a + b, 0);
+    }
+    await transaction.commit();
+
+    res.json({ message: `Deleted ${deleted} record${deleted === 1 ? "" : "s"}`, deleted });
+  } catch (err) {
+    console.log("BULK DELETE ERROR:", err);
+    if (transaction) { try { await transaction.rollback(); } catch { /* already rolled back */ } }
+    const fk = /REFERENCE constraint|FOREIGN KEY/i.test(err.message || "");
+    res.status(fk ? 409 : 500).json({
+      message: fk
+        ? "Nothing was deleted: some of the selected records are still used by other data (e.g. linked results or submissions). Remove or reassign that data first."
+        : "Bulk delete failed — nothing was deleted.",
+    });
   }
 });
 

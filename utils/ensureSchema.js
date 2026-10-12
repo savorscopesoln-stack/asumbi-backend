@@ -1343,6 +1343,27 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       ON e_assessment_violation_photos (session_id, createdAt DESC)
     `);
 
+    /* Context captured with each photo: which question the student was on,
+       what they had typed/selected at that moment, and a full-screen
+       screenshot taken at the same time as the webcam frame. All nullable —
+       older rows and students who decline screen sharing simply have none. */
+    for (const [col, type] of [
+      ["question_id", "INT"],
+      ["question_number", "INT"],
+      ["question_text", "NVARCHAR(MAX)"],
+      ["answer_text", "NVARCHAR(MAX)"],
+      ["screenshot_url", "NVARCHAR(500)"],
+    ]) {
+      await pool.request().query(`
+        IF EXISTS (SELECT * FROM sysobjects WHERE name='e_assessment_violation_photos' AND xtype='U')
+        AND NOT EXISTS (
+          SELECT * FROM sys.columns
+          WHERE Name = N'${col}' AND Object_ID = Object_ID(N'e_assessment_violation_photos')
+        )
+        ALTER TABLE e_assessment_violation_photos ADD ${col} ${type} NULL
+      `);
+    }
+
     /* ---------------- newsletter_subscribers table ----------------
        Backs POST /api/contact/newsletter (public) — the email field in
        the public website's Footer, same "used to go nowhere" gap as
