@@ -21,7 +21,7 @@ const {
 
   // exam session / device lock
   startExamSession, activateExamSession, heartbeatExamSession, endExamSession,
-  setDesktopOnly, setSecuritySettings, getSecuritySettings, getActivityLog,
+  setDesktopOnly, setSecuritySettings, setSebSettings, getSecuritySettings, getActivityLog,
   getExamSessions, unlockExamSession, getDeviceAccess, allowDevice, revokeDevice, downloadAttendancePdf, examSessionStatus, lockExamSession,
   autosaveExamAnswers, getExamDraft, grantResit, cancelResit, getUnsubmittedSessions,
 
@@ -59,6 +59,9 @@ const { runQuestionImageUpload } = require("../middleware/questionImageUpload");
 const { runQuestionDocUpload } = require("../middleware/questionDocUpload");
 const { examLoginConcurrencyGuard } = require("../middleware/examLoginConcurrencyGuard");
 const { enforceDesktopOnly } = require("../utils/deviceRestriction");
+const { enforceSeb } = require("../utils/sebRestriction");
+// Student exam routes: desktop-only check, then the Safe Exam Browser check.
+const enforceExamClient = [enforceDesktopOnly, enforceSeb];
 const { activityLogger, preResolveQuestion } = require("../utils/eAssessmentActivityLog");
 
 // Wrap the promise-based multer runners (see photoUpload.js's runPhotoUpload
@@ -120,6 +123,7 @@ router.put("/admin/:id/toggle-active", protect, requirePage("E-Assessments"), to
 router.get("/admin/activity-log", protect, requirePage("E-Assessments"), getActivityLog);
 router.put("/admin/:id/desktop-only", protect, requirePage("E-Assessments"), setDesktopOnly);
 router.put("/admin/:id/security", protect, requirePage("E-Assessments"), setSecuritySettings);
+router.put("/admin/:id/seb", protect, requirePage("E-Assessments"), setSebSettings);
 router.get("/admin/device-access", protect, requirePage("E-Assessments"), getDeviceAccess);
 router.put("/admin/device-access/:id/allow", protect, requirePage("E-Assessments"), allowDevice);
 router.put("/admin/device-access/:id/revoke", protect, requirePage("E-Assessments"), revokeDevice);
@@ -171,16 +175,16 @@ router.post("/admin/resit/cancel", protect, requirePage("E-Assessments"), cancel
 /* =========================================================================
    STUDENT
 ========================================================================= */
-router.post("/submit", protect, authorize("student"), enforceDesktopOnly, submitEAssessment);
+router.post("/submit", protect, authorize("student"), enforceExamClient, submitEAssessment);
 router.get("/results/:assessmentId", protect, authorize("student"), getStudentResult);
 
 /* exam session lifecycle (single-device token binding) */
-router.post("/:id/start-exam", protect, authorize("student"), enforceDesktopOnly, startExamSession);
-router.post("/:id/autosave", protect, authorize("student"), enforceDesktopOnly, autosaveExamAnswers);
-router.get("/:id/draft", protect, authorize("student"), enforceDesktopOnly, getExamDraft);
+router.post("/:id/start-exam", protect, authorize("student"), enforceExamClient, startExamSession);
+router.post("/:id/autosave", protect, authorize("student"), enforceExamClient, autosaveExamAnswers);
+router.get("/:id/draft", protect, authorize("student"), enforceExamClient, getExamDraft);
 router.get("/:id/security-settings", protect, authorize("student"), getSecuritySettings);
-router.post("/exam-session/activate", protect, authorize("student"), enforceDesktopOnly, activateExamSession);
-router.post("/exam-session/heartbeat", protect, authorize("student"), enforceDesktopOnly, heartbeatExamSession);
+router.post("/exam-session/activate", protect, authorize("student"), enforceExamClient, activateExamSession);
+router.post("/exam-session/heartbeat", protect, authorize("student"), enforceExamClient, heartbeatExamSession);
 router.post("/exam-session/status", protect, authorize("student"), examSessionStatus);
 router.post("/exam-session/lock", protect, authorize("student"), lockExamSession);
 router.post("/exam-session/end", protect, authorize("student"), endExamSession);
@@ -238,7 +242,7 @@ router.put("/:id", protect, authorize("teacher"), updateEAssessment);
    (App.jsx) is supposed to reach.
 ========================================================================= */
 router.post("/:id/questions", protect, authorize("teacher", "admin", "sub_admin", "sub_admin_2"), addEAssessmentQuestion);
-router.get("/:id/questions", protect, enforceDesktopOnly, getAssessmentQuestions);
+router.get("/:id/questions", protect, enforceExamClient, getAssessmentQuestions);
 router.put("/questions/:questionId", protect, authorize("teacher", "admin", "sub_admin", "sub_admin_2"), updateQuestion);
 router.delete("/questions/:questionId", protect, authorize("teacher", "admin", "sub_admin", "sub_admin_2"), deleteQuestion);
 
@@ -263,7 +267,7 @@ router.delete("/questions/:questionId/images/:imageId", protect, authorize("teac
 /* =========================================================================
    IMPORTANT: keep /:id LAST — it will otherwise swallow the named routes above
 ========================================================================= */
-router.get("/:id", protect, enforceDesktopOnly, getEAssessmentById);
+router.get("/:id", protect, enforceExamClient, getEAssessmentById);
 
 /* =========================================================================
    ROUTE-LEVEL ERROR HANDLER

@@ -130,6 +130,21 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       `);
     }
 
+    /* ---------------- e_assessments.require_seb / seb_keys ----------------
+       "Require Safe Exam Browser" switch (default OFF so nothing changes for
+       existing assessments) plus the allowed SEB Config Key(s) / Browser Exam
+       Key(s), one per line. See utils/sebRestriction.js. */
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='e_assessments' AND xtype='U')
+      AND NOT EXISTS (SELECT * FROM sys.columns WHERE Name = N'require_seb' AND Object_ID = Object_ID(N'e_assessments'))
+      ALTER TABLE e_assessments ADD require_seb BIT NOT NULL CONSTRAINT DF_e_assessments_require_seb DEFAULT 0
+    `);
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='e_assessments' AND xtype='U')
+      AND NOT EXISTS (SELECT * FROM sys.columns WHERE Name = N'seb_keys' AND Object_ID = Object_ID(N'e_assessments'))
+      ALTER TABLE e_assessments ADD seb_keys NVARCHAR(MAX) NULL
+    `);
+
     /* ---------------- e_assessments.exam_password ----------------
        Lets a student join a single assessment via the standalone
        /take-assessment/:id page (no portal account login) using

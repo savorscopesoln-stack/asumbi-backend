@@ -135,7 +135,7 @@ const corsOptions = {
     callback(new Error("Not allowed by CORS: " + origin));
   },
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "X-Client-Device"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Client-Device", "X-SafeExamBrowser-RequestHash", "X-SafeExamBrowser-ConfigKeyHash"],
   // Main Examination Excel/PDF exports (Phase 12-13) set Content-Disposition
   // for the download filename; without exposing it cross-origin, the browser
   // can still download the file's bytes but the frontend can't read the

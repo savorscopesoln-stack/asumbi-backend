@@ -15,6 +15,7 @@ const { persistAttempt, FINALIZE_GRACE_MINUTES } = require("../utils/examAttempt
 const { queryActivityLog } = require("../utils/eAssessmentActivityLog");
 const { generateAttendancePdf } = require("../utils/eAssessmentAttendance");
 const { sendPdfBuffer } = require("../utils/reportExport");
+const { checkSeb, sendSebBlocked, parseKeys: parseSebKeys, invalidateSebCache } = require("../utils/sebRestriction");
 const { checkDesktopOnly, sendBlocked, invalidateDesktopOnlyCache, invalidateDeviceAccessCache } = require("../utils/deviceRestriction");
 
 /* =========================================================================
@@ -299,7 +300,7 @@ const deleteCoverPage = async (req, res) => {
 const STAFF_ROLES = ["admin", "sub_admin", "sub_admin_2", "module_admin", "teacher"];
 const redactForRole = (row, role) => {
   if (STAFF_ROLES.includes(role)) return row;
-  const { exam_password, ...rest } = row;
+  const { exam_password, seb_keys, ...rest } = row; // never send secrets to students
   return rest;
 };
 
@@ -655,6 +656,10 @@ const examLogin = async (req, res) => {
     // Desktop-only switch: reject phones/tablets before any token is issued.
     const deviceCheck = await checkDesktopOnly(req, pool, tenant, assessment.id, { username });
     if (deviceCheck.blocked) return sendBlocked(res, deviceCheck.device);
+
+    // Safe Exam Browser switch: refuse to issue a token to any other browser.
+    const sebCheck = await checkSeb(req, pool, tenant, assessment.id);
+    if (sebCheck.blocked) return sendSebBlocked(res);
 
     let sRes;
     try {
@@ -2554,6 +2559,59 @@ const setDesktopOnly = async (req, res) => {
 
 
 /* =========================================================================
+   SAFE EXAM BROWSER switch + allowed keys (see utils/sebRestriction.js)
+   Body: { enabled?: boolean, keys?: string }  — keys = one Config Key /
+   Browser Exam Key (64 hex chars) per line; "" clears them.
+========================================================================= */
+const setSebSettings = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const id = toInt(req.params.id);
+    if (!id) return res.status(400).json({ message: "Invalid assessment ID" });
+
+    const hasEnabled = typeof req.body?.enabled === "boolean";
+    const hasKeys = typeof req.body?.keys === "string";
+    if (!hasEnabled && !hasKeys) return res.status(400).json({ message: "Send `enabled` (true/false) and/or `keys` (text)" });
+
+    let keysValue = null;
+    if (hasKeys) {
+      const { keys, invalid } = parseSebKeys(req.body.keys);
+      if (invalid.length) {
+        return res.status(400).json({ message: `Each key must be 64 hexadecimal characters. Not valid: ${invalid.slice(0, 3).map((k) => k.slice(0, 12) + "…").join(", ")}` });
+      }
+      if (keys.length > 10) return res.status(400).json({ message: "At most 10 keys per assessment." });
+      keysValue = keys.length ? keys.join("\n") : null;
+    }
+
+    const sets = [];
+    const request = pool.request().input("id", sql.Int, id);
+    if (hasEnabled) { sets.push("require_seb = @en"); request.input("en", sql.Bit, req.body.enabled ? 1 : 0); }
+    if (hasKeys) { sets.push("seb_keys = @keys"); request.input("keys", sql.NVarChar(sql.MAX), keysValue); }
+
+    const r = await request.query(
+      `UPDATE e_assessments SET ${sets.join(", ")} WHERE id = @id;
+       SELECT @@ROWCOUNT AS n;
+       SELECT ISNULL(require_seb, 0) AS require_seb, seb_keys FROM e_assessments WHERE id = @id;`
+    );
+    if (!r.recordsets[0][0]?.n) return res.status(404).json({ message: "Assessment not found" });
+
+    invalidateSebCache(req.user?.tenant, id);
+    const row = r.recordsets[1][0] || {};
+    res.json({
+      success: true,
+      require_seb: !!row.require_seb,
+      seb_keys: row.seb_keys || "",
+      message: row.require_seb
+        ? (row.seb_keys ? "Safe Exam Browser is REQUIRED — only SEB with a matching key can take this exam." : "Safe Exam Browser is REQUIRED, but no key is saved yet — only a basic check is applied. Add a Config Key for real protection.")
+        : "Safe Exam Browser is not required for this assessment.",
+    });
+  } catch (err) {
+    console.error("SET SEB SETTINGS ERROR:", err);
+    res.status(500).json({ message: "Failed to update the Safe Exam Browser setting" });
+  }
+};
+
+/* =========================================================================
    EXAM SECURITY SWITCHES (per assessment)
    setSecuritySettings — admin/teacher turns individual security features
                          ON/OFF for one assessment. Partial updates allowed.
@@ -3976,6 +4034,7 @@ const updateGradingSystem = async (req, res) => {
 module.exports = {
   setDesktopOnly,
   setSecuritySettings,
+  setSebSettings,
   getSecuritySettings,
   getActivityLog,
   // core
