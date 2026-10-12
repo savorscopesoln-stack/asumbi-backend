@@ -22,7 +22,7 @@ const {
   // exam session / device lock
   startExamSession, activateExamSession, heartbeatExamSession, endExamSession,
   setDesktopOnly, getActivityLog,
-  getExamSessions, unlockExamSession, examSessionStatus, lockExamSession,
+  getExamSessions, unlockExamSession, getDeviceAccess, allowDevice, revokeDevice, downloadAttendancePdf, examSessionStatus, lockExamSession,
   autosaveExamAnswers, getExamDraft, grantResit, cancelResit, getUnsubmittedSessions,
 
   // camera violation photos (evidence capture, no longer a lock trigger)
@@ -119,7 +119,11 @@ router.put("/admin/:id/review", protect, requirePage("E-Assessments"), reviewAss
 router.put("/admin/:id/toggle-active", protect, requirePage("E-Assessments"), toggleEAssessmentActive);
 router.get("/admin/activity-log", protect, requirePage("E-Assessments"), getActivityLog);
 router.put("/admin/:id/desktop-only", protect, requirePage("E-Assessments"), setDesktopOnly);
+router.get("/admin/device-access", protect, requirePage("E-Assessments"), getDeviceAccess);
+router.put("/admin/device-access/:id/allow", protect, requirePage("E-Assessments"), allowDevice);
+router.put("/admin/device-access/:id/revoke", protect, requirePage("E-Assessments"), revokeDevice);
 router.get("/admin/:id/quick-stats", protect, requirePage("E-Assessments"), getEAssessmentQuickStats);
+router.get("/admin/:id/attendance-pdf", protect, requirePage("E-Assessments"), downloadAttendancePdf);
 router.delete("/admin/delete-assessments", protect, requirePage("E-Assessments"), deleteAssessments);
 router.delete("/admin/delete-assignments", protect, requirePage("E-Assessments"), deleteAssignments);
 
