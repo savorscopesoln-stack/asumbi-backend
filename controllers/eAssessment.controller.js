@@ -11,9 +11,11 @@ const { coverPageUrlFor, deleteCoverPageByUrl } = require("../middleware/coverPa
 const { QUESTION_IMAGES_DIR, questionImageUrlFor, deleteQuestionImageByUrl } = require("../middleware/questionImageUpload");
 const { saveViolationPhoto, violationPhotoUrlFor } = require("../middleware/violationPhotoUpload");
 const { getPool, listTenantKeys } = require("../config/db");
-const { persistAttempt } = require("../utils/examAttempts");
+const { persistAttempt, FINALIZE_GRACE_MINUTES } = require("../utils/examAttempts");
 const { queryActivityLog } = require("../utils/eAssessmentActivityLog");
-const { checkDesktopOnly, sendBlocked, invalidateDesktopOnlyCache } = require("../utils/deviceRestriction");
+const { generateAttendancePdf } = require("../utils/eAssessmentAttendance");
+const { sendPdfBuffer } = require("../utils/reportExport");
+const { checkDesktopOnly, sendBlocked, invalidateDesktopOnlyCache, invalidateDeviceAccessCache } = require("../utils/deviceRestriction");
 
 /* =========================================================================
    HELPERS
@@ -651,7 +653,7 @@ const examLogin = async (req, res) => {
     }
 
     // Desktop-only switch: reject phones/tablets before any token is issued.
-    const deviceCheck = await checkDesktopOnly(req, pool, tenant, assessment.id);
+    const deviceCheck = await checkDesktopOnly(req, pool, tenant, assessment.id, { username });
     if (deviceCheck.blocked) return sendBlocked(res, deviceCheck.device);
 
     let sRes;
@@ -1359,6 +1361,29 @@ const deleteQuestion = async (req, res) => {
        "locks the device."
 ========================================================================= */
 
+// A session counts as "live" while it is active and still inside the exam's
+// duration (+ the same grace window the server's auto-submit uses). Sessions
+// past that are closed by utils/examAttempts.finalizeExpiredAttempts, so they
+// never block a student from sitting their next exam.
+const findOtherLiveSession = async (pool, studentId, assessmentId) => {
+  const r = await pool.request()
+    .input("sid", sql.Int, studentId)
+    .input("aid", sql.Int, assessmentId)
+    .input("grace", sql.Int, FINALIZE_GRACE_MINUTES)
+    .query(`
+      SELECT TOP 1 es.e_assessment_id, a.title
+      FROM e_assessment_exam_sessions es
+      INNER JOIN e_assessments a ON a.id = es.e_assessment_id
+      WHERE es.student_id = @sid
+        AND es.e_assessment_id <> @aid
+        AND es.status = 'active'
+        AND es.activated_at IS NOT NULL
+        AND DATEADD(MINUTE, ISNULL(a.duration_minutes, 30) + @grace, es.activated_at) > GETDATE()
+      ORDER BY es.activated_at DESC
+    `);
+  return r.recordset[0] || null;
+};
+
 // Student starts the exam -> issue (or resume) a token for this device-binding cycle
 const startExamSession = async (req, res) => {
   try {
@@ -1382,6 +1407,21 @@ const startExamSession = async (req, res) => {
       .input("aid", sql.Int, e_assessment_id)
       .input("sid", sql.Int, student_id)
       .query(`SELECT * FROM e_assessment_exam_sessions WHERE e_assessment_id = @aid AND student_id = @sid`);
+
+    // ONE SESSION PER STUDENT: a student can only be sitting one exam at a
+    // time. If they already have a live (active, still inside its time
+    // window) session for a DIFFERENT assessment, starting another is
+    // refused until that one is submitted or runs out. The same assessment
+    // is never affected — resuming it is handled just below, and the
+    // (assessment, student) pair already has exactly one session row.
+    const otherLive = await findOtherLiveSession(pool, student_id, e_assessment_id);
+    if (otherLive) {
+      return res.status(409).json({
+        code: "ACTIVE_EXAM_SESSION",
+        message: `You already have an exam in progress ("${otherLive.title || "another assessment"}"). Submit it first — only one exam session per student is allowed at a time.`,
+        active_assessment_id: otherLive.e_assessment_id,
+      });
+    }
 
     if (existing.recordset.length) {
       const row = existing.recordset[0];
@@ -1488,6 +1528,16 @@ const activateExamSession = async (req, res) => {
     }
 
     if (!row.device_id) {
+      // First activation — one live session per student: re-check here too,
+      // since two exams could both have been "issued" before either started.
+      const otherLive = await findOtherLiveSession(pool, student_id, row.e_assessment_id);
+      if (otherLive) {
+        return res.status(409).json({
+          code: "ACTIVE_EXAM_SESSION",
+          message: `You already have an exam in progress ("${otherLive.title || "another assessment"}"). Submit it first — only one exam session per student is allowed at a time.`,
+          active_assessment_id: otherLive.e_assessment_id,
+        });
+      }
       // First activation — bind this device
       await pool.request()
         .input("id", sql.Int, row.id)
@@ -1575,9 +1625,15 @@ const endExamSession = async (req, res) => {
 };
 
 /* =========================================================================
-   AUTOSAVE — the exam page posts the student's answers here every minute.
-   The row is overwritten each time (latest wins) and is what the server
-   submits if time runs out before the student does (utils/examAttempts).
+   AUTOSAVE / DEVICE SYNC — the exam is cached on the student's device and
+   the device posts its answers here every 30 seconds (and again the moment
+   it comes back online). The row is overwritten each time and is what the
+   server submits if time runs out before the student does
+   (utils/examAttempts).
+   Because a device may queue/retry syncs while offline, each request carries
+   client_saved_at (when the device last changed an answer). A request whose
+   client_saved_at is OLDER than what the server already holds is ignored, so
+   a late-arriving retry can never overwrite newer answers.
 ========================================================================= */
 const autosaveExamAnswers = async (req, res) => {
   try {
@@ -1585,6 +1641,8 @@ const autosaveExamAnswers = async (req, res) => {
     const assessmentId = toInt(req.params.id);
     const student_id = req.user?.id;
     const { answers, token, device_id } = req.body;
+    const clientSavedAtRaw = Number(req.body.client_saved_at);
+    const clientSavedAt = Number.isFinite(clientSavedAtRaw) && clientSavedAtRaw > 0 ? Math.floor(clientSavedAtRaw) : null;
     if (!assessmentId || !student_id) return res.status(400).json({ message: "Missing assessment or student" });
     if (req.user?.examOnly && req.user.examAssessmentId !== assessmentId) {
       return res.status(403).json({ message: "This exam session isn't valid for this assessment" });
@@ -1618,23 +1676,65 @@ const autosaveExamAnswers = async (req, res) => {
     const count = Object.keys(clean).length;
     // Never let an empty payload (e.g. a device that failed to restore its
     // answers) overwrite a real draft.
-    if (count === 0) return res.json({ success: true, saved: 0, skipped: true });
+    if (count === 0) return res.json({ success: true, saved: 0, skipped: true, session_status: sess.status });
 
-    await pool.request()
+    // The UPDATE only applies when this sync is not older than what the server
+    // already holds (client_saved_at). @@ROWCOUNT = 0 then means either "no
+    // row yet" (insert it) or "a newer sync already landed" (ignore this one).
+    const saveRes = await pool.request()
       .input("aid", sql.Int, assessmentId)
       .input("sid", sql.Int, student_id)
       .input("json", sql.NVarChar(sql.MAX), json)
       .input("count", sql.Int, count)
+      .input("cts", sql.BigInt, clientSavedAt)
       .query(`
         UPDATE e_assessment_drafts
-        SET answers_json = @json, answered_count = @count, saved_at = GETDATE()
-        WHERE e_assessment_id = @aid AND student_id = @sid;
+        SET answers_json = @json, answered_count = @count, saved_at = GETDATE(),
+            client_saved_at = ISNULL(@cts, client_saved_at)
+        WHERE e_assessment_id = @aid AND student_id = @sid
+          AND (@cts IS NULL OR client_saved_at IS NULL OR client_saved_at <= @cts);
         IF @@ROWCOUNT = 0
-          INSERT INTO e_assessment_drafts (e_assessment_id, student_id, answers_json, answered_count)
-          VALUES (@aid, @sid, @json, @count);
+        BEGIN
+          IF NOT EXISTS (SELECT 1 FROM e_assessment_drafts WHERE e_assessment_id = @aid AND student_id = @sid)
+          BEGIN
+            INSERT INTO e_assessment_drafts (e_assessment_id, student_id, answers_json, answered_count, client_saved_at)
+            VALUES (@aid, @sid, @json, @count, @cts);
+            SELECT 1 AS applied;
+          END
+          ELSE SELECT 0 AS applied;
+        END
+        ELSE SELECT 1 AS applied;
       `);
+    const applied = !saveRes.recordset?.length || saveRes.recordset[0].applied === 1;
 
-    res.json({ success: true, saved: count, saved_at: new Date().toISOString() });
+    // Server clock is the authority on time left; the device re-syncs its
+    // offline countdown from this on every successful sync.
+    let secondsLeft = null;
+    try {
+      const t = await pool.request()
+        .input("aid", sql.Int, assessmentId)
+        .input("sid", sql.Int, student_id)
+        .query(`
+          SELECT DATEDIFF(SECOND, GETDATE(), DATEADD(MINUTE, ISNULL(a.duration_minutes, 30), es.activated_at)) AS seconds_left
+          FROM e_assessment_exam_sessions es
+          INNER JOIN e_assessments a ON a.id = es.e_assessment_id
+          WHERE es.e_assessment_id = @aid AND es.student_id = @sid
+            AND es.status = 'active' AND es.activated_at IS NOT NULL
+        `);
+      if (t.recordset.length && t.recordset[0].seconds_left != null) {
+        secondsLeft = Math.max(0, Number(t.recordset[0].seconds_left));
+      }
+    } catch (_) { /* optional */ }
+
+    res.json({
+      success: true,
+      saved: count,
+      applied,
+      stale: !applied,
+      saved_at: new Date().toISOString(),
+      session_status: sess.status,
+      seconds_left: secondsLeft,
+    });
   } catch (err) {
     console.error("AUTOSAVE EXAM ERROR:", err);
     res.status(500).json({ message: "Autosave failed" });
@@ -2336,6 +2436,95 @@ const setDesktopOnly = async (req, res) => {
   } catch (err) {
     console.error("SET DESKTOP-ONLY ERROR:", err);
     res.status(500).json({ message: "Failed to update the device restriction" });
+  }
+};
+
+
+/* =========================================================================
+   REJECTED DEVICES + PER-DEVICE ALLOW-LIST (Desktop-only switch)
+   getDeviceAccess  — every phone/tablet the switch rejected, with student,
+                      assessment, platform (Android/iPhone/...), attempts.
+   setDeviceAccess  — "Allow" / "Revoke" one of those devices. Allowed
+                      devices pass the Desktop-only check for that student +
+                      assessment (see utils/deviceRestriction.js).
+========================================================================= */
+const getDeviceAccess = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const request = pool.request();
+    const where = [];
+    const status = String(req.query.status || "").toLowerCase();
+    if (status === "blocked" || status === "allowed") { request.input("status", sql.NVarChar(10), status); where.push("d.status = @status"); }
+    const aid = toInt(req.query.assessmentId);
+    if (aid) { request.input("aid", sql.Int, aid); where.push("d.e_assessment_id = @aid"); }
+    const platform = String(req.query.platform || "").toLowerCase().replace(/[^a-z]/g, "");
+    if (platform) { request.input("platform", sql.NVarChar(30), platform); where.push("d.platform = @platform"); }
+    const r = await request.query(`
+      SELECT TOP 500 d.id, d.e_assessment_id, d.student_id, d.device_key, d.platform, d.user_agent, d.ip, d.reason,
+             d.attempts, d.first_seen, d.last_seen, d.status, d.allowed_at,
+             st.name AS student_name, st.username AS student_username, st.studentClass AS student_class,
+             a.title AS assessment_title, ISNULL(a.desktop_only, 0) AS desktop_only,
+             us.name AS allowed_by_name
+      FROM e_assessment_device_access d
+      LEFT JOIN Students st ON st.id = d.student_id
+      LEFT JOIN e_assessments a ON a.id = d.e_assessment_id
+      LEFT JOIN Users us ON us.id = d.allowed_by
+      ${where.length ? "WHERE " + where.join(" AND ") : ""}
+      ORDER BY CASE d.status WHEN 'blocked' THEN 0 ELSE 1 END, d.last_seen DESC
+    `);
+    res.json(r.recordset || []);
+  } catch (err) {
+    console.error("GET DEVICE ACCESS ERROR:", err);
+    res.status(500).json([]);
+  }
+};
+
+const setDeviceAccess = (allow) => async (req, res) => {
+  try {
+    const pool = req.pool;
+    const id = toInt(req.params.id);
+    if (!id) return res.status(400).json({ message: "Invalid device record" });
+    const r = await pool.request()
+      .input("id", sql.Int, id)
+      .input("status", sql.NVarChar(10), allow ? "allowed" : "blocked")
+      .input("by", sql.Int, allow ? (req.user?.id ?? null) : null)
+      .query(`
+        UPDATE e_assessment_device_access
+        SET status = @status, allowed_by = @by, allowed_at = CASE WHEN @status = 'allowed' THEN GETDATE() ELSE NULL END
+        WHERE id = @id;
+        SELECT e_assessment_id FROM e_assessment_device_access WHERE id = @id;
+      `);
+    if (!r.recordset.length) return res.status(404).json({ message: "Device record not found" });
+    req._auditAssessmentId = r.recordset[0].e_assessment_id; // so the activity log names the exam
+    invalidateDeviceAccessCache(); // this server instance applies it instantly
+    res.json({
+      success: true,
+      status: allow ? "allowed" : "blocked",
+      message: allow
+        ? "Device allowed — the student can now use it for this exam (they may need to press Try again)."
+        : "Device blocked again.",
+    });
+  } catch (err) {
+    console.error("SET DEVICE ACCESS ERROR:", err);
+    res.status(500).json({ message: "Failed to update the device" });
+  }
+};
+const allowDevice = setDeviceAccess(true);
+const revokeDevice = setDeviceAccess(false);
+
+
+/* Printable register (school logo + header) of the students who did this
+   assessment and those who didn't — see utils/eAssessmentAttendance.js. */
+const downloadAttendancePdf = async (req, res) => {
+  try {
+    const id = toInt(req.params.id);
+    if (!id) return res.status(400).json({ message: "Invalid assessment ID" });
+    const out = await generateAttendancePdf(req.pool, id, req.query.tz);
+    if (!out) return res.status(404).json({ message: "Assessment not found" });
+    sendPdfBuffer(res, out.buffer, out.filename);
+  } catch (err) {
+    console.error("ATTENDANCE PDF ERROR:", err);
+    res.status(500).json({ message: "Could not create the attendance PDF" });
   }
 };
 
@@ -3564,6 +3753,7 @@ module.exports = {
   // admin review / stats
   getPendingAssessments, reviewAssessment, toggleEAssessmentActive, getEAssessmentQuickStats,
   deleteAssessments, deleteAssignments,
+  getDeviceAccess, allowDevice, revokeDevice, downloadAttendancePdf,
 
   // support data
   getClasses, getSubjects, getTeachers, assignTeacher, getAssignedTeachers,

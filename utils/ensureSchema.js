@@ -31,6 +31,40 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
     // easy to find/maintain without wading through the rest of this file.
     await ensureElectionSchema(pool, sql);
 
+    /* ---------------- e_assessment_device_access ----------------
+       One row per (assessment, student, device) that the "Desktop only"
+       switch REJECTED (phones/tablets), so the admin can see who tried
+       from which device (Android, iPhone, ...) on the Device Locks tab —
+       and click "Allow" to let that one device through. The same row is the
+       allow-list: status 'allowed' makes utils/deviceRestriction.js let
+       that device in even while Desktop-only is ON. student_id 0 = the
+       student couldn't be identified. device_key is the browser's own
+       exam_device_id (falls back to a hash of its User-Agent). */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='e_assessment_device_access' AND xtype='U')
+      CREATE TABLE e_assessment_device_access (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        e_assessment_id INT NOT NULL,
+        student_id INT NOT NULL DEFAULT 0,
+        device_key NVARCHAR(100) NOT NULL,
+        platform NVARCHAR(30) NULL,
+        user_agent NVARCHAR(400) NULL,
+        ip NVARCHAR(64) NULL,
+        reason NVARCHAR(200) NULL,
+        attempts INT NOT NULL DEFAULT 1,
+        first_seen DATETIME NOT NULL DEFAULT GETDATE(),
+        last_seen DATETIME NOT NULL DEFAULT GETDATE(),
+        status NVARCHAR(10) NOT NULL DEFAULT 'blocked',
+        allowed_by INT NULL,
+        allowed_at DATETIME NULL
+      )
+    `);
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='e_assessment_device_access' AND xtype='U')
+      AND NOT EXISTS (SELECT * FROM sys.indexes WHERE name = N'UX_e_assessment_device_access' AND object_id = Object_ID(N'e_assessment_device_access'))
+      CREATE UNIQUE INDEX UX_e_assessment_device_access ON e_assessment_device_access (e_assessment_id, student_id, device_key)
+    `);
+
     /* ---------------- e_assessment_activity_log ----------------
        "Who did what, and when" for the E-Assessment exam module, across the
        student, teacher and admin portals (see utils/eAssessmentActivityLog.js).
@@ -124,7 +158,7 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
 
     /* ---------------- exam autosave + resit support ----------------
        e_assessment_drafts: the student's answers, saved to the DB every
-       minute while they sit the exam (one row per student per
+       30 seconds while they sit the exam (one row per student per
        assessment, overwritten each save). If time runs out before they
        submit, the server submits from this row (see utils/examAttempts).
        e_assessment_exam_sessions gains resit_allowed / attempt_no (an
@@ -141,6 +175,19 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
         saved_at DATETIME NOT NULL DEFAULT GETDATE(),
         CONSTRAINT UQ_e_assessment_drafts UNIQUE (e_assessment_id, student_id)
       )
+    `);
+    /* e_assessment_drafts.client_saved_at: the exam page caches answers on the
+       student's own device and syncs them every 30s. Each sync carries the
+       device-side timestamp (ms since epoch) of the answers it holds, so a
+       slow/retried request that arrives AFTER a newer one can never overwrite
+       the newer answers (see autosaveExamAnswers). */
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='e_assessment_drafts' AND xtype='U')
+      AND NOT EXISTS (
+        SELECT * FROM sys.columns
+        WHERE Name = N'client_saved_at' AND Object_ID = Object_ID(N'e_assessment_drafts')
+      )
+      ALTER TABLE e_assessment_drafts ADD client_saved_at BIGINT NULL
     `);
     await pool.request().query(`
       IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='e_assessment_attempt_history' AND xtype='U')

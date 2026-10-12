@@ -10,9 +10,10 @@
    token prices change; they are operational settings, not code.
 
    Variable                          Default   Meaning
-   AI_MARKING_PROVIDER               (unset)   "anthropic" | "mock" (mock refused in production). Unset = engine off.
+   AI_MARKING_PROVIDER               (unset)   "anthropic" | "gemini" | "mock" (mock refused in production). Unset = engine off.
    AI_MARKING_API_KEY                (unset)   Provider secret. Server-only.
    AI_MARKING_MODEL                  (unset)   Exact model id to call. Required — no default on purpose.
+   AI_MARKING_GEMINI_THINKING_BUDGET (unset)   Gemini only. Max "thinking" tokens (0 = off where the model allows it, -1 = dynamic). Thinking tokens count against AI_MARKING_MAX_OUTPUT_TOKENS and are billed as output.
    AI_MARKING_BASE_URL               provider  Optional gateway / proxy base URL. https only; validated (see checkBaseUrl).
    AI_MARKING_ALLOWED_HOSTS          (unset)   Optional comma-separated host allow-list for the base URL.
    AI_MARKING_TIMEOUT_MS             60000     Per provider call.
@@ -76,7 +77,7 @@ function resolveConfig(env = process.env, overrides = {}) {
   const errors = [];
 
   const provider = (e.AI_MARKING_PROVIDER || "").trim().toLowerCase() || null;
-  if (provider && !["anthropic", "mock"].includes(provider)) errors.push("AI_MARKING_PROVIDER must be 'anthropic' or 'mock'");
+  if (provider && !["anthropic", "gemini", "mock"].includes(provider)) errors.push("AI_MARKING_PROVIDER must be 'anthropic', 'gemini' or 'mock'");
   if (provider === "mock" && e.NODE_ENV === "production") errors.push("AI_MARKING_PROVIDER=mock is not allowed in production");
 
   const apiKey = (e.AI_MARKING_API_KEY || "").trim() || null;
@@ -88,6 +89,7 @@ function resolveConfig(env = process.env, overrides = {}) {
   const cfg = {
     provider, apiKey, model,
     baseUrl: null,
+    geminiThinkingBudget: num(e, "AI_MARKING_GEMINI_THINKING_BUDGET", null, { min: -1, max: 32768, integer: true }, errors),
     timeoutMs: num(e, "AI_MARKING_TIMEOUT_MS", DEFAULTS.timeoutMs, { min: 1000, max: 600000, integer: true }, errors),
     maxOutputTokens: num(e, "AI_MARKING_MAX_OUTPUT_TOKENS", DEFAULTS.maxOutputTokens, { min: 200, max: 16000, integer: true }, errors),
     maxAnswerChars: num(e, "AI_MARKING_MAX_ANSWER_CHARS", DEFAULTS.maxAnswerChars, { min: 200, max: 200000, integer: true }, errors),
@@ -110,7 +112,7 @@ function resolveConfig(env = process.env, overrides = {}) {
   const missing = [];
   if (!provider) missing.push("AI_MARKING_PROVIDER");
   if (!model) missing.push("AI_MARKING_MODEL");
-  if (provider === "anthropic" && !apiKey) missing.push("AI_MARKING_API_KEY");
+  if ((provider === "anthropic" || provider === "gemini") && !apiKey) missing.push("AI_MARKING_API_KEY");
   cfg.missing = missing;
   cfg.errors = errors;
   cfg.configured = missing.length === 0 && errors.length === 0;

@@ -23,6 +23,8 @@ require("./aiMarkingLedger.test.js");
 require("./aiMarkingFinance.test.js");
 require("./aiMarkingSchemaFile.test.js");
 require("./aiMarkingTeacher.test.js");
+require("./deviceAccess.test.js");
+require("./eAssessmentAttendance.test.js");
 require("./aiMarkingJobs.test.js");
 require("./aiMarkingEngine.test.js");
 require("./aiMarkingWorker.test.js");
