@@ -1967,9 +1967,11 @@ const examSessionStatus = async (req, res) => {
 const lockExamSession = async (req, res) => {
   try {
     const pool = req.pool;
-    const { token, device_id, reason } = req.body;
+    const { token, device_id, reason, reason_code } = req.body;
     const student_id = req.user?.id;
     if (!token) return res.status(400).json({ message: "token is required" });
+    const fullReason = String(reason || "Locked by this device").slice(0, 300);
+    const codePrefix = reason_code ? `[${String(reason_code).replace(/[^a-z_]/gi, "").slice(0, 30)}] ` : "";
 
     const result = await pool.request()
       .input("token", sql.Char(6), token)
@@ -1989,11 +1991,19 @@ const lockExamSession = async (req, res) => {
       .input("reason", sql.NVarChar(300), text)
       .query(`
         UPDATE e_assessment_exam_sessions
-        SET status = 'locked', locked_at = GETDATE(), lock_reason = @reason
+        SET lock_reason = CASE WHEN status = 'locked' AND lock_reason IS NOT NULL THEN lock_reason ELSE @reason END,
+            locked_at   = CASE WHEN status = 'locked' AND locked_at IS NOT NULL THEN locked_at ELSE GETDATE() END,
+            status = 'locked'
         WHERE id = @id AND status <> 'ended'
       `);
     try {
-      await doLock(String(reason || "Locked by this device").slice(0, 100));
+      // First lock reason wins: a later event must not overwrite what the admin sees.
+      try {
+        await doLock(`${codePrefix}${fullReason}`.slice(0, 300));
+      } catch (wide) {
+        // lock_reason may be a narrower column — keep as much of the reason as fits
+        await doLock(`${codePrefix}${fullReason}`.slice(0, 100));
+      }
     } catch (e) {
       // lock_reason may be a narrower column than expected — the lock itself
       // matters more than its wording, so retry with a short fixed reason.
@@ -2620,12 +2630,7 @@ const setSebSettings = async (req, res) => {
                          the admin page can read them too.
    Unknown/NULL values are treated as ON (strict) everywhere.
 ========================================================================= */
-// `use_device_cache` is not a security rule but rides on the same per-assessment
-// switch plumbing: ON (default) = the paper and answers are cached on the
-// student's device (IndexedDB/localStorage) so the exam survives a refresh or
-// a dropped connection; OFF = nothing is stored on the device, the server is
-// the only copy and the exam needs a live connection.
-const SECURITY_FIELDS = ["require_camera", "require_screen_share", "require_fullscreen", "lock_on_violations", "use_device_cache"];
+const SECURITY_FIELDS = ["require_camera", "require_screen_share", "require_fullscreen", "lock_on_violations"];
 
 const securityFromRow = (row) => {
   const out = {};
