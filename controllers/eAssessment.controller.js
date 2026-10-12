@@ -12,6 +12,8 @@ const { QUESTION_IMAGES_DIR, questionImageUrlFor, deleteQuestionImageByUrl } = r
 const { saveViolationPhoto, violationPhotoUrlFor } = require("../middleware/violationPhotoUpload");
 const { getPool, listTenantKeys } = require("../config/db");
 const { persistAttempt } = require("../utils/examAttempts");
+const { queryActivityLog } = require("../utils/eAssessmentActivityLog");
+const { checkDesktopOnly, sendBlocked, invalidateDesktopOnlyCache } = require("../utils/deviceRestriction");
 
 /* =========================================================================
    HELPERS
@@ -629,6 +631,11 @@ const examLogin = async (req, res) => {
       return res.status(404).json({ success: false, message: "Assessment not found" });
     }
 
+    // Activity log: no JWT exists yet, and req.pool is only the default
+    // tenant — tell the logger which tenant DB/assessment this really is.
+    req.auditPool = pool;
+    req.auditAssessmentId = assessment.id;
+
     if (!assessment.exam_password) {
       return res.status(400).json({ success: false, message: "This assessment has no exam password configured. Ask your teacher to set one, or log in to the student portal normally." });
     }
@@ -642,6 +649,10 @@ const examLogin = async (req, res) => {
     if (assessment.active_status !== "Active") {
       return res.status(400).json({ success: false, message: "This assessment isn't active right now." });
     }
+
+    // Desktop-only switch: reject phones/tablets before any token is issued.
+    const deviceCheck = await checkDesktopOnly(req, pool, tenant, assessment.id);
+    if (deviceCheck.blocked) return sendBlocked(res, deviceCheck.device);
 
     let sRes;
     try {
@@ -659,6 +670,7 @@ const examLogin = async (req, res) => {
       return res.status(400).json({ success: false, message: "No student account found with that username" });
     }
     const student = sRes.recordset[0];
+    req.auditActor = { id: student.id, username: student.username };
 
     // Short-lived on purpose: just long enough to sit the exam, not a
     // standing session. duration_minutes + 20 min buffer, clamped.
@@ -2261,6 +2273,72 @@ const reviewAssessment = async (req, res) => {
   }
 };
 
+// Admin switch: restrict an assessment to Windows/Mac laptops & desktops.
+// Takes an explicit { enabled: true|false } (never a blind flip) and is
+// allowed at any time — including while the exam is live; students already
+// on a phone/tablet are rejected on their next heartbeat/autosave.
+// Admin: browse / export the E-Assessment activity log (who did what, when).
+const getActivityLog = async (req, res) => {
+  try {
+    const wantsCsv = String(req.query.format || "").toLowerCase() === "csv";
+    const { rows, total, page, limit } = await queryActivityLog(req.pool, req.query, { forCsv: wantsCsv });
+
+    if (!wantsCsv) return res.json({ success: true, rows, total, page, limit });
+
+    const esc = (v) => {
+      let t = v == null ? "" : String(v);
+      if (/^[=+\-@]/.test(t)) t = "'" + t; // stop spreadsheet formula injection
+      return `"${t.replace(/"/g, '""')}"`;
+    };
+    const header = ["Time","Portal","Role","Actor","Username","Action","Outcome","HTTP","Assessment","Student","IP","Device","Details"];
+    const lines = [header.map(esc).join(",")];
+    for (const r of rows) {
+      lines.push([
+        r.created_at ? new Date(r.created_at).toISOString() : "",
+        r.portal, r.actor_role, r.actor_name, r.actor_username, r.action, r.outcome, r.http_status,
+        r.assessment_title || r.assessment_id, r.student_name || r.student_username || r.student_id,
+        r.ip, r.device, r.details,
+      ].map(esc).join(","));
+    }
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="e-assessment-activity-${new Date().toISOString().slice(0,10)}.csv"`);
+    res.send("\uFEFF" + lines.join("\r\n"));
+  } catch (err) {
+    console.error("GET ACTIVITY LOG ERROR:", err);
+    res.status(500).json({ success: false, message: "Failed to load the activity log" });
+  }
+};
+
+const setDesktopOnly = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const id = toInt(req.params.id);
+    if (!id) return res.status(400).json({ message: "Invalid assessment ID" });
+    if (typeof req.body?.enabled !== "boolean") {
+      return res.status(400).json({ message: "`enabled` (true/false) is required" });
+    }
+    const enabled = req.body.enabled;
+
+    const r = await pool.request()
+      .input("id", sql.Int, id)
+      .input("v", sql.Bit, enabled ? 1 : 0)
+      .query(`UPDATE e_assessments SET desktop_only = @v WHERE id = @id; SELECT @@ROWCOUNT AS n;`);
+    if (!r.recordset[0]?.n) return res.status(404).json({ message: "Assessment not found" });
+
+    invalidateDesktopOnlyCache(req.user?.tenant, id); // this server instance sees it instantly
+    res.json({
+      success: true,
+      desktop_only: enabled,
+      message: enabled
+        ? "Desktop-only is ON — phones and tablets are now blocked from this exam."
+        : "Desktop-only is OFF — any device can take this exam.",
+    });
+  } catch (err) {
+    console.error("SET DESKTOP-ONLY ERROR:", err);
+    res.status(500).json({ message: "Failed to update the device restriction" });
+  }
+};
+
 const toggleEAssessmentActive = async (req, res) => {
   try {
     const pool = req.pool;
@@ -3453,6 +3531,8 @@ const updateGradingSystem = async (req, res) => {
    EXPORTS (single source of truth — no other module.exports in this file)
 ========================================================================= */
 module.exports = {
+  setDesktopOnly,
+  getActivityLog,
   // core
   createEAssessment, updateEAssessment, getEAssessments, getEAssessmentById,
   addEAssessmentQuestion, getAssessmentQuestions, updateQuestion, deleteQuestion,

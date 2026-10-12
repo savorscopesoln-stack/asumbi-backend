@@ -31,6 +31,55 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
     // easy to find/maintain without wading through the rest of this file.
     await ensureElectionSchema(pool, sql);
 
+    /* ---------------- e_assessment_activity_log ----------------
+       "Who did what, and when" for the E-Assessment exam module, across the
+       student, teacher and admin portals (see utils/eAssessmentActivityLog.js).
+       Append-only. details is a small sanitized JSON string — never
+       passwords, tokens or students' answers. */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='e_assessment_activity_log' AND xtype='U')
+      CREATE TABLE e_assessment_activity_log (
+        id BIGINT IDENTITY(1,1) PRIMARY KEY,
+        created_at DATETIME NOT NULL DEFAULT GETDATE(),
+        actor_id INT NULL,
+        actor_role NVARCHAR(30) NULL,
+        actor_username NVARCHAR(150) NULL,
+        portal NVARCHAR(20) NULL,
+        action NVARCHAR(60) NOT NULL,
+        outcome NVARCHAR(20) NOT NULL DEFAULT 'success',
+        http_status INT NULL,
+        assessment_id INT NULL,
+        student_id INT NULL,
+        target_id INT NULL,
+        ip NVARCHAR(64) NULL,
+        device NVARCHAR(400) NULL,
+        details NVARCHAR(MAX) NULL
+      )
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='IX_ea_activity_created' AND object_id=OBJECT_ID('e_assessment_activity_log'))
+        CREATE INDEX IX_ea_activity_created ON e_assessment_activity_log (created_at DESC);
+      IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='IX_ea_activity_assessment' AND object_id=OBJECT_ID('e_assessment_activity_log'))
+        CREATE INDEX IX_ea_activity_assessment ON e_assessment_activity_log (assessment_id, created_at DESC);
+      IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='IX_ea_activity_actor' AND object_id=OBJECT_ID('e_assessment_activity_log'))
+        CREATE INDEX IX_ea_activity_actor ON e_assessment_activity_log (actor_id, actor_role, created_at DESC);
+    `);
+
+    /* ---------------- e_assessments.desktop_only ----------------
+       Admin switch: when 1, only Windows / macOS laptops and desktops may
+       take this assessment — phones and tablets are rejected (see
+       utils/deviceRestriction.js). Can be flipped at any time, even while
+       the exam is running. Defaults to 0 (off) so nothing changes for
+       existing assessments. */
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='e_assessments' AND xtype='U')
+      AND NOT EXISTS (
+        SELECT * FROM sys.columns
+        WHERE Name = N'desktop_only' AND Object_ID = Object_ID(N'e_assessments')
+      )
+      ALTER TABLE e_assessments ADD desktop_only BIT NOT NULL CONSTRAINT DF_e_assessments_desktop_only DEFAULT 0
+    `);
+
     /* ---------------- e_assessments.exam_password ----------------
        Lets a student join a single assessment via the standalone
        /take-assessment/:id page (no portal account login) using

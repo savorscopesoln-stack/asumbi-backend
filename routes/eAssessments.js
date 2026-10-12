@@ -21,6 +21,7 @@ const {
 
   // exam session / device lock
   startExamSession, activateExamSession, heartbeatExamSession, endExamSession,
+  setDesktopOnly, getActivityLog,
   getExamSessions, unlockExamSession, examSessionStatus, lockExamSession,
   autosaveExamAnswers, getExamDraft, grantResit, cancelResit, getUnsubmittedSessions,
 
@@ -57,6 +58,8 @@ const { runCoverPageUpload } = require("../middleware/coverPageUpload");
 const { runQuestionImageUpload } = require("../middleware/questionImageUpload");
 const { runQuestionDocUpload } = require("../middleware/questionDocUpload");
 const { examLoginConcurrencyGuard } = require("../middleware/examLoginConcurrencyGuard");
+const { enforceDesktopOnly } = require("../utils/deviceRestriction");
+const { activityLogger, preResolveQuestion } = require("../utils/eAssessmentActivityLog");
 
 // Wrap the promise-based multer runners (see photoUpload.js's runPhotoUpload
 // for the pattern this follows) so a bad file (wrong type/too large) comes
@@ -73,6 +76,15 @@ const questionDocMiddleware = async (req, res, next) => {
   try { await runQuestionDocUpload(req, res); next(); }
   catch (err) { res.status(400).json({ message: err.message || "Upload failed" }); }
 };
+
+/* =========================================================================
+   ACTIVITY LOG — records who did what, when, for every student / teacher /
+   admin action in this module (see utils/eAssessmentActivityLog.js for the
+   route→action table). Mounted once, first, so it sees every response.
+   preResolveQuestion captures a question's exam before a delete removes it.
+========================================================================= */
+router.use(activityLogger);
+router.param("questionId", preResolveQuestion);
 
 /* =========================================================================
    HEALTH CHECK
@@ -105,6 +117,8 @@ router.get("/admin/assigned-teachers", protect, requirePage("E-Assessments"), ge
 router.get("/admin/pending", protect, requirePage("E-Assessments"), getPendingAssessments);
 router.put("/admin/:id/review", protect, requirePage("E-Assessments"), reviewAssessment);
 router.put("/admin/:id/toggle-active", protect, requirePage("E-Assessments"), toggleEAssessmentActive);
+router.get("/admin/activity-log", protect, requirePage("E-Assessments"), getActivityLog);
+router.put("/admin/:id/desktop-only", protect, requirePage("E-Assessments"), setDesktopOnly);
 router.get("/admin/:id/quick-stats", protect, requirePage("E-Assessments"), getEAssessmentQuickStats);
 router.delete("/admin/delete-assessments", protect, requirePage("E-Assessments"), deleteAssessments);
 router.delete("/admin/delete-assignments", protect, requirePage("E-Assessments"), deleteAssignments);
@@ -152,15 +166,15 @@ router.post("/admin/resit/cancel", protect, requirePage("E-Assessments"), cancel
 /* =========================================================================
    STUDENT
 ========================================================================= */
-router.post("/submit", protect, authorize("student"), submitEAssessment);
+router.post("/submit", protect, authorize("student"), enforceDesktopOnly, submitEAssessment);
 router.get("/results/:assessmentId", protect, authorize("student"), getStudentResult);
 
 /* exam session lifecycle (single-device token binding) */
-router.post("/:id/start-exam", protect, authorize("student"), startExamSession);
-router.post("/:id/autosave", protect, authorize("student"), autosaveExamAnswers);
-router.get("/:id/draft", protect, authorize("student"), getExamDraft);
-router.post("/exam-session/activate", protect, authorize("student"), activateExamSession);
-router.post("/exam-session/heartbeat", protect, authorize("student"), heartbeatExamSession);
+router.post("/:id/start-exam", protect, authorize("student"), enforceDesktopOnly, startExamSession);
+router.post("/:id/autosave", protect, authorize("student"), enforceDesktopOnly, autosaveExamAnswers);
+router.get("/:id/draft", protect, authorize("student"), enforceDesktopOnly, getExamDraft);
+router.post("/exam-session/activate", protect, authorize("student"), enforceDesktopOnly, activateExamSession);
+router.post("/exam-session/heartbeat", protect, authorize("student"), enforceDesktopOnly, heartbeatExamSession);
 router.post("/exam-session/status", protect, authorize("student"), examSessionStatus);
 router.post("/exam-session/lock", protect, authorize("student"), lockExamSession);
 router.post("/exam-session/end", protect, authorize("student"), endExamSession);
@@ -217,7 +231,7 @@ router.put("/:id", protect, authorize("teacher"), updateEAssessment);
    (App.jsx) is supposed to reach.
 ========================================================================= */
 router.post("/:id/questions", protect, authorize("teacher", "admin", "sub_admin", "sub_admin_2"), addEAssessmentQuestion);
-router.get("/:id/questions", protect, getAssessmentQuestions);
+router.get("/:id/questions", protect, enforceDesktopOnly, getAssessmentQuestions);
 router.put("/questions/:questionId", protect, authorize("teacher", "admin", "sub_admin", "sub_admin_2"), updateQuestion);
 router.delete("/questions/:questionId", protect, authorize("teacher", "admin", "sub_admin", "sub_admin_2"), deleteQuestion);
 
@@ -242,7 +256,7 @@ router.delete("/questions/:questionId/images/:imageId", protect, authorize("teac
 /* =========================================================================
    IMPORTANT: keep /:id LAST — it will otherwise swallow the named routes above
 ========================================================================= */
-router.get("/:id", protect, getEAssessmentById);
+router.get("/:id", protect, enforceDesktopOnly, getEAssessmentById);
 
 /* =========================================================================
    ROUTE-LEVEL ERROR HANDLER
