@@ -93,6 +93,8 @@ const ROUTE_ACTIONS = {
   "POST /admin/resit/cancel":            { action: "cancel_resit",            kind: "body" },
   "POST /admin/assign-teacher":          { action: "assign_teacher",          kind: "body" },
   "POST /admin/assign-teachers-bulk":     { action: "assign_teachers_bulk",    kind: "body" },
+  "POST /admin/smart-distribute":        { action: "smart_distribute",         kind: "body" },
+  "POST /admin/assignment-batches/:id/undo": { action: "undo_assignment",       kind: "none" },
   "POST /admin/assign-submission":       { action: "assign_submission",       kind: "submission_body" },
   "POST /admin/bulk-assign-submissions": { action: "bulk_assign_submissions", kind: "none" },
   "PUT /admin/remark-requests/:id/review": { action: "review_remark_request", kind: "submission" },

@@ -40,7 +40,7 @@ const {
 
   // submissions / marking
   getAllSubmissions, getAssessmentSubmissions, getSubmissionForMarking, getAllSubmissionsForMarking,
-  saveMarking, saveMarkingBulk, assignSubmission, bulkAssignSubmissions, getNextSubmissionForMarking,
+  saveMarking, saveMarkingBulk, assignSubmission, bulkAssignSubmissions, smartDistribute, getAssignmentBatches, undoAssignmentBatch, getNextSubmissionForMarking,
   getMarkingSession, saveMarkingSession, clearMarkingSession,
 
   // remarks
@@ -139,6 +139,9 @@ router.delete("/admin/delete-assignments", protect, requirePage("E-Assessments")
 router.get("/submissions", protect, requirePage("E-Assessments"), getAllSubmissions);
 router.post("/admin/assign-submission", protect, requirePage("E-Assessments"), assignSubmission);
 router.post("/admin/bulk-assign-submissions", protect, requirePage("E-Assessments"), bulkAssignSubmissions);
+router.post("/admin/smart-distribute", protect, requirePage("E-Assessments"), smartDistribute);
+router.get("/admin/assignment-batches", protect, requirePage("E-Assessments"), getAssignmentBatches);
+router.post("/admin/assignment-batches/:id/undo", protect, requirePage("E-Assessments"), undoAssignmentBatch);
 
 /* =========================================================================
    ADMIN — REMARK REQUESTS

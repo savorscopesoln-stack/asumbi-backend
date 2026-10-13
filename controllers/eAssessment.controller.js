@@ -14,6 +14,28 @@ const { getPool, listTenantKeys } = require("../config/db");
 const { persistAttempt, FINALIZE_GRACE_MINUTES } = require("../utils/examAttempts");
 const { queryActivityLog } = require("../utils/eAssessmentActivityLog");
 const { generateAttendancePdf } = require("../utils/eAssessmentAttendance");
+const assignmentEngine = require("../utils/assignmentEngine");
+
+/* A teacher may open a submission when it was assigned to them as a whole OR
+   when some of its answered questions were allocated to them (the
+   "more teachers than submissions" split — utils/assignmentEngine.js).
+   Alias `s` = e_assessment_submissions, parameter @teacherId. */
+const TEACHER_SUB_ACCESS = `(
+  EXISTS (SELECT 1 FROM e_assessment_submission_assignments aa WHERE aa.submission_id = s.id AND aa.teacher_id = @teacherId)
+  OR EXISTS (SELECT 1 FROM e_assessment_answer_assignments ax0 INNER JOIN e_assessment_answers an0 ON an0.id = ax0.answer_id
+             WHERE an0.submission_id = s.id AND ax0.teacher_id = @teacherId))`;
+/* Which answers of such a submission the teacher sees: the ones allocated to
+   them; essay answers nobody was allocated stay with a whole-submission
+   assignee; auto-marked (non-essay) answers are always visible for context.
+   Aliases: a = answers, q = questions, ax = answer assignment (LEFT JOIN). */
+const TEACHER_ANSWER_VISIBLE = `(
+  ax.teacher_id = @teacherId
+  OR (ax.id IS NULL AND (
+        ISNULL(q.question_type, 'mcq') NOT IN ('essay', 'descriptive')
+        OR EXISTS (SELECT 1 FROM e_assessment_submission_assignments aa2 WHERE aa2.submission_id = a.submission_id AND aa2.teacher_id = @teacherId))))`;
+
+// History must never break the real action it describes.
+const safeRecord = async (pool, args) => { try { return await assignmentEngine.recordBatch(pool, args); } catch (e) { console.error("ASSIGNMENT HISTORY ERROR:", e.message); return null; } };
 const { sendPdfBuffer } = require("../utils/reportExport");
 const { checkSeb, sendSebBlocked, parseKeys: parseSebKeys, invalidateSebCache } = require("../utils/sebRestriction");
 const { checkDesktopOnly, sendBlocked, invalidateDesktopOnlyCache, invalidateDeviceAccessCache } = require("../utils/deviceRestriction");
@@ -361,6 +383,10 @@ const getEAssessments = async (req, res) => {
               INNER JOIN e_assessment_submission_assignments aa
                 ON aa.submission_id = s.id AND aa.teacher_id = @teacherId
               WHERE s.e_assessment_id = ea.id
+            )
+         OR EXISTS (
+              SELECT 1 FROM e_assessment_answer_assignments axl
+              WHERE axl.e_assessment_id = ea.id AND axl.teacher_id = @teacherId
             )
          OR EXISTS (
               SELECT 1 FROM e_assessment_question_setters qs
@@ -2973,7 +2999,7 @@ const assignTeachersBulk = async (req, res) => {
     // Only validated integers are inlined (never user text).
     const r = await pool.request().query(`
       INSERT INTO TeacherSubjects (teacher_id, subject_id, class_id)
-      OUTPUT inserted.teacher_id
+      OUTPUT inserted.id, inserted.teacher_id, inserted.subject_id, inserted.class_id
       SELECT t.id, s.id, c.id
       FROM Teachers t CROSS JOIN Subjects s CROSS JOIN Classes c
       WHERE t.id IN (${teacherIds.join(",")}) AND s.id IN (${subjectIds.join(",")}) AND c.id IN (${classIds.join(",")})
@@ -2992,7 +3018,11 @@ const assignTeachersBulk = async (req, res) => {
         });
       } catch (_) { /* a failed notification must not undo the assignments */ }
     }
-    res.json({ success: true, created, skipped: combos - created, teachers: Object.keys(perTeacher).length });
+    const batchId = await safeRecord(pool, {
+      kind: "teacher_subject", summary: `Assigned ${created} teacher/subject/class combination(s) to ${Object.keys(perTeacher).length} teacher(s)`, userId: req.user?.id,
+      changes: (r.recordset || []).map((x) => ({ kind: "ts_added", target_id: x.id, teacher_id: x.teacher_id, subject_id: x.subject_id, class_id: x.class_id })),
+    });
+    res.json({ success: true, created, skipped: combos - created, teachers: Object.keys(perTeacher).length, batch_id: batchId });
   } catch (err) {
     console.error("ASSIGN TEACHERS BULK ERROR:", err);
     res.status(500).json({ message: "Assignment failed" });
@@ -3024,10 +3054,21 @@ const deleteAssignments = async (req, res) => {
     const { ids } = req.body;
     if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ message: "No ids provided" });
 
+    const wanted = assignmentEngine.ints(ids);
+    // remember what is being removed so it can be put back with Undo
+    const gone = [];
+    for (const part of (function* () { for (let i = 0; i < wanted.length; i += 1000) yield wanted.slice(i, i + 1000); })()) {
+      const r = await pool.request().query(`SELECT id, teacher_id, subject_id, class_id FROM TeacherSubjects WHERE id IN (${part.join(",")})`);
+      gone.push(...(r.recordset || []));
+    }
     for (const id of ids) {
       await pool.request().input("id", sql.Int, id).query(`DELETE FROM TeacherSubjects WHERE id = @id`);
     }
-    res.json({ success: true, message: "Assignments deleted" });
+    const batchId = await safeRecord(pool, {
+      kind: "teacher_subject", summary: `Removed ${gone.length} teacher/subject/class assignment(s)`, userId: req.user?.id,
+      changes: gone.map((x) => ({ kind: "ts_removed", target_id: x.id, teacher_id: x.teacher_id, subject_id: x.subject_id, class_id: x.class_id })),
+    });
+    res.json({ success: true, message: "Assignments deleted", batch_id: batchId });
   } catch (err) {
     console.error("DELETE ASSIGNMENTS ERROR:", err);
     res.status(500).json({ message: "Delete failed" });
@@ -3081,7 +3122,13 @@ const getAllSubmissions = async (req, res) => {
   st.name AS student_name,
   (SELECT COUNT(*) FROM e_assessment_violation_photos vp
     WHERE vp.e_assessment_id = s.e_assessment_id AND vp.student_id = s.student_id) AS photo_count,
-  aa.teacher_id AS assigned_teacher_id, t.name AS assigned_teacher_name
+  aa.teacher_id AS assigned_teacher_id, t.name AS assigned_teacher_name,
+  (SELECT COUNT(*) FROM e_assessment_answer_assignments axc INNER JOIN e_assessment_answers anc ON anc.id = axc.answer_id
+    WHERE anc.submission_id = s.id) AS alloc_count,
+  STUFF((SELECT DISTINCT ', ' + t2.name FROM e_assessment_answer_assignments ax2
+           INNER JOIN e_assessment_answers an2 ON an2.id = ax2.answer_id
+           INNER JOIN Teachers t2 ON t2.id = ax2.teacher_id
+         WHERE an2.submission_id = s.id FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'), 1, 2, '') AS alloc_teachers
 FROM e_assessment_submissions s
 LEFT JOIN e_assessments a ON a.id = s.e_assessment_id
 LEFT JOIN Students st ON st.id = s.student_id
@@ -3129,8 +3176,8 @@ const getAssessmentSubmissions = async (req, res) => {
       FROM e_assessment_submissions s
       LEFT JOIN e_assessments a ON a.id = s.e_assessment_id
       LEFT JOIN Students st ON st.id = s.student_id
-      ${isTeacher ? "INNER JOIN e_assessment_submission_assignments aa ON aa.submission_id = s.id AND aa.teacher_id = @teacherId" : ""}
       WHERE s.e_assessment_id = @assessmentId
+      ${isTeacher ? "AND " + TEACHER_SUB_ACCESS : ""}
       ORDER BY s.id DESC
     `);
     res.json({ success: true, submissions: result.recordset });
@@ -3212,7 +3259,7 @@ const getSubmissionForMarking = async (req, res) => {
       const owns = await pool.request()
         .input("id", sql.Int, submissionId)
         .input("teacherId", sql.Int, toInt(req.user.id))
-        .query(`SELECT id FROM e_assessment_submission_assignments WHERE submission_id = @id AND teacher_id = @teacherId`);
+        .query(`SELECT s.id FROM e_assessment_submissions s WHERE s.id = @id AND ${TEACHER_SUB_ACCESS}`);
       if (!owns.recordset.length) {
         return res.status(403).json({ message: "This submission was not assigned to you." });
       }
@@ -3221,12 +3268,17 @@ const getSubmissionForMarking = async (req, res) => {
     const submission = await pool.request().input("id", sql.Int, submissionId)
       .query(`SELECT * FROM e_assessment_submissions WHERE id = @id`);
 
-    const answers = await pool.request().input("id", sql.Int, submissionId).query(`
+    const isTeacherViewer = req.user?.role === "teacher";
+    const answersReq = pool.request().input("id", sql.Int, submissionId);
+    if (isTeacherViewer) answersReq.input("teacherId", sql.Int, toInt(req.user.id));
+    const answers = await answersReq.query(`
       SELECT a.id, a.question_id, a.selected_answer, a.essay_answer, a.is_correct, a.marks_awarded, a.highlights, a.highlighted_html,
              q.question_text, q.correct_answer, q.marks AS max_marks, q.question_type
       FROM e_assessment_answers a
       INNER JOIN e_assessment_questions q ON q.id = a.question_id
+      ${isTeacherViewer ? "LEFT JOIN e_assessment_answer_assignments ax ON ax.answer_id = a.id" : ""}
       WHERE a.submission_id = @id
+      ${isTeacherViewer ? "AND " + TEACHER_ANSWER_VISIBLE : ""}
       ORDER BY q.id
     `);
 
@@ -3259,8 +3311,8 @@ const getAllSubmissionsForMarking = async (req, res) => {
     const submissionsResult = await request.query(`
       SELECT s.*
       FROM e_assessment_submissions s
-      ${isTeacher ? "INNER JOIN e_assessment_submission_assignments aa ON aa.submission_id = s.id AND aa.teacher_id = @teacherId" : ""}
       WHERE s.e_assessment_id = @e_assessmentId
+      ${isTeacher ? "AND " + TEACHER_SUB_ACCESS : ""}
     `);
     const submissions = submissionsResult.recordset;
     if (!submissions.length) return res.status(200).json([]);
@@ -3269,12 +3321,16 @@ const getAllSubmissionsForMarking = async (req, res) => {
 
     const finalData = [];
     for (const submission of submissions) {
-      const answersResult = await pool.request().input("submissionId", sql.Int, submission.id).query(`
+      const answersReq = pool.request().input("submissionId", sql.Int, submission.id);
+      if (isTeacher) answersReq.input("teacherId", sql.Int, toInt(req.user.id));
+      const answersResult = await answersReq.query(`
         SELECT a.id, a.submission_id, a.question_id, a.essay_answer, a.marks_awarded, a.highlights, a.highlighted_html,
        q.question_text, q.question_type, q.marks AS max_marks, q.marking_guide
 FROM e_assessment_answers a
 INNER JOIN e_assessment_questions q ON a.question_id = q.id
+${isTeacher ? "LEFT JOIN e_assessment_answer_assignments ax ON ax.answer_id = a.id" : ""}
 WHERE a.submission_id = @submissionId
+${isTeacher ? "AND " + TEACHER_ANSWER_VISIBLE : ""}
       `);
       finalData.push({
         submission,
@@ -3379,6 +3435,10 @@ const saveMarking = async (req, res) => {
           FROM e_assessment_answers a
           INNER JOIN e_assessment_questions q ON q.id = a.question_id
           WHERE a.submission_id = @submission_id AND q.question_type = 'essay' AND a.marks_awarded IS NULL
+            -- an essay the student left blank has nothing to mark (it counts as 0) and is never
+            -- handed out when answered questions are split between teachers, so it must not
+            -- keep the submission from being finished
+            AND LEN(LTRIM(RTRIM(CAST(ISNULL(a.essay_answer, '') AS NVARCHAR(MAX))))) > 0
         `);
       const isFullyMarked = unmarkedEssays.recordset[0].cnt === 0;
 
@@ -3524,22 +3584,9 @@ const assignSubmission = async (req, res) => {
     const pool = req.pool;
     const { submissionId, teacherId } = req.body;
     if (!submissionId || !teacherId) return res.status(400).json({ success: false, message: "submissionId and teacherId are required" });
-
-    const existing = await pool.request().input("submissionId", sql.Int, submissionId)
-      .query(`SELECT id FROM e_assessment_submission_assignments WHERE submission_id = @submissionId`);
-
-    if (existing.recordset.length > 0) {
-      await pool.request().input("submissionId", sql.Int, submissionId).input("teacherId", sql.Int, teacherId).query(`
-        UPDATE e_assessment_submission_assignments SET teacher_id = @teacherId, assigned_at = GETDATE()
-        WHERE submission_id = @submissionId
-      `);
-    } else {
-      await pool.request().input("submissionId", sql.Int, submissionId).input("teacherId", sql.Int, teacherId).query(`
-        INSERT INTO e_assessment_submission_assignments (submission_id, teacher_id, assigned_at)
-        VALUES (@submissionId, @teacherId, GETDATE())
-      `);
-    }
-    res.json({ success: true, message: "Submission assigned successfully" });
+    const changes = await assignmentEngine.distributeBySubmission(pool, [submissionId], [teacherId]);
+    const batchId = await safeRecord(pool, { kind: "submission", summary: "Assigned 1 submission to a teacher", userId: req.user?.id, changes });
+    res.json({ success: true, message: "Submission assigned successfully", batch_id: batchId });
   } catch (err) {
     console.error("ASSIGN SUBMISSION ERROR:", err);
     res.status(500).json({ success: false, message: err.message });
@@ -3552,30 +3599,95 @@ const bulkAssignSubmissions = async (req, res) => {
     const { submission_ids, teacher_ids } = req.body;
     if (!Array.isArray(submission_ids) || !submission_ids.length) return res.status(400).json({ message: "No submissions provided" });
     if (!Array.isArray(teacher_ids) || !teacher_ids.length) return res.status(400).json({ message: "No teachers provided" });
-
-    let i = 0;
-    for (const submissionId of submission_ids) {
-      const teacherId = teacher_ids[i % teacher_ids.length];
-      const existing = await pool.request().input("submissionId", sql.Int, submissionId)
-        .query(`SELECT id FROM e_assessment_submission_assignments WHERE submission_id = @submissionId`);
-
-      if (existing.recordset.length > 0) {
-        await pool.request().input("submissionId", sql.Int, submissionId).input("teacherId", sql.Int, teacherId).query(`
-          UPDATE e_assessment_submission_assignments SET teacher_id = @teacherId, assigned_at = GETDATE()
-          WHERE submission_id = @submissionId
-        `);
-      } else {
-        await pool.request().input("submissionId", sql.Int, submissionId).input("teacherId", sql.Int, teacherId).query(`
-          INSERT INTO e_assessment_submission_assignments (submission_id, teacher_id, assigned_at)
-          VALUES (@submissionId, @teacherId, GETDATE())
-        `);
-      }
-      i++;
-    }
-    res.json({ success: true, message: `${submission_ids.length} submission(s) distributed across ${teacher_ids.length} teacher(s)` });
+    const teachers = assignmentEngine.ints(teacher_ids);
+    const changes = await assignmentEngine.distributeBySubmission(pool, submission_ids, teachers);
+    const batchId = await safeRecord(pool, { kind: "submission", summary: `Distributed ${submission_ids.length} submission(s) across ${teachers.length} teacher(s)`, userId: req.user?.id, changes });
+    res.json({ success: true, message: `${submission_ids.length} submission(s) distributed across ${teachers.length} teacher(s)`, batch_id: batchId });
   } catch (err) {
     console.error("BULK ASSIGN ERROR:", err);
     res.status(500).json({ message: err.message });
+  }
+};
+
+/* SMART DISTRIBUTE — one entry point for "Distribute Equally" / "Auto-Assign All".
+   More teachers than submissions -> split by ANSWERED QUESTIONS (every teacher
+   gets work); otherwise share out whole submissions as before. Either way the
+   action is recorded so it can be undone. */
+const smartDistribute = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const submissionIds = assignmentEngine.ints(req.body.submission_ids);
+    const teacherIds = assignmentEngine.ints(req.body.teacher_ids);
+    if (!submissionIds.length) return res.status(400).json({ message: "No submissions provided" });
+    if (!teacherIds.length) return res.status(400).json({ message: "No teachers provided" });
+
+    const mode = assignmentEngine.chooseMode(teacherIds.length, submissionIds.length);
+    if (mode === assignmentEngine.MODE.SUBMISSION) {
+      const changes = await assignmentEngine.distributeBySubmission(pool, submissionIds, teacherIds);
+      const batchId = await safeRecord(pool, { kind: "submission", summary: `Distributed ${submissionIds.length} submission(s) across ${teacherIds.length} teacher(s)`, userId: req.user?.id, changes });
+      return res.json({ success: true, mode, submissions: submissionIds.length, teachers: teacherIds.length, batch_id: batchId,
+        message: `${submissionIds.length} submission(s) split across ${teacherIds.length} teacher(s)` });
+    }
+
+    const out = await assignmentEngine.distributeByQuestion(pool, submissionIds, teacherIds);
+    if (!out.total) {
+      return res.json({ success: true, mode, allocated: 0, batch_id: null, message: "There are no answered, unmarked essay questions left to allocate." });
+    }
+    const used = Object.keys(out.perTeacher).length;
+    const batchId = await safeRecord(pool, {
+      kind: "question",
+      summary: `More teachers (${teacherIds.length}) than submissions (${submissionIds.length}): split ${out.total} answered question(s) across ${used} teacher(s)`,
+      userId: req.user?.id, changes: out.changes,
+    });
+    for (const [tid, count] of Object.entries(out.perTeacher)) {
+      try {
+        await notifyOne(pool, Number(tid), "Teachers", {
+          title: "New Marking Allocation",
+          message: `You've been allocated ${count} answered question${count === 1 ? "" : "s"} to mark.`,
+          type: "allocation",
+        });
+      } catch (_) { /* a failed notification must not undo the allocation */ }
+    }
+    res.json({
+      success: true, mode, allocated: out.total, teachers: used, per_teacher: out.perTeacher, batch_id: batchId,
+      message: `More teachers than submissions, so the ${out.total} answered question(s) were split across ${used} teacher(s)`,
+    });
+  } catch (err) {
+    console.error("SMART DISTRIBUTE ERROR:", err);
+    res.status(500).json({ message: "Distribution failed" });
+  }
+};
+
+const getAssignmentBatches = async (req, res) => {
+  try {
+    const r = await req.pool.request().query(`
+      SELECT TOP 30 b.id, b.kind, b.summary, b.created_at, b.undone_at, u.name AS created_by_name,
+             (SELECT COUNT(*) FROM e_assessment_assignment_changes c WHERE c.batch_id = b.id) AS change_count
+      FROM e_assessment_assignment_batches b
+      LEFT JOIN Users u ON u.id = b.created_by
+      ORDER BY b.id DESC
+    `);
+    res.json(r.recordset || []);
+  } catch (err) {
+    console.error("GET ASSIGNMENT BATCHES ERROR:", err);
+    res.status(500).json([]);
+  }
+};
+
+const undoAssignmentBatch = async (req, res) => {
+  try {
+    const id = toInt(req.params.id);
+    if (!id) return res.status(400).json({ message: "Invalid action" });
+    const out = await assignmentEngine.undoBatch(req.pool, id, req.user?.id);
+    if (out.status !== 200) return res.status(out.status).json({ message: out.message });
+    const extra = [];
+    if (out.keptMarked) extra.push(`${out.keptMarked} left as they are because marking has already started`);
+    if (out.changedSince) extra.push(`${out.changedSince} skipped because they were changed afterwards`);
+    res.json({ success: true, restored: out.restored, kept_marked: out.keptMarked, changed_since: out.changedSince,
+      message: `Undone: ${out.restored} item${out.restored === 1 ? "" : "s"} restored${extra.length ? " (" + extra.join("; ") + ")" : ""}` });
+  } catch (err) {
+    console.error("UNDO ASSIGNMENT ERROR:", err);
+    res.status(500).json({ message: "Could not undo that action" });
   }
 };
 
@@ -3593,8 +3705,8 @@ const getNextSubmissionForMarking = async (req, res) => {
     const result = await request.query(`
       SELECT TOP 1 s.*
       FROM e_assessment_submissions s
-      ${isTeacher ? "INNER JOIN e_assessment_submission_assignments aa ON aa.submission_id = s.id AND aa.teacher_id = @teacherId" : ""}
       WHERE s.status = 'submitted'
+      ${isTeacher ? "AND " + TEACHER_SUB_ACCESS : ""}
       ORDER BY NEWID()
     `);
     res.json(result.recordset[0] || null);
@@ -4134,7 +4246,7 @@ module.exports = {
 
   // submissions / marking
   getAllSubmissions, getAssessmentSubmissions, getSubmissionForMarking, getAllSubmissionsForMarking,
-  saveMarking, saveMarkingBulk, assignSubmission, bulkAssignSubmissions, getNextSubmissionForMarking,
+  saveMarking, saveMarkingBulk, assignSubmission, bulkAssignSubmissions, smartDistribute, getAssignmentBatches, undoAssignmentBatch, getNextSubmissionForMarking,
   getMarkingSession, saveMarkingSession, clearMarkingSession,
 
   // remarks

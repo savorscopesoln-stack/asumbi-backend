@@ -27,6 +27,7 @@ require("./deviceAccess.test.js");
 require("./sebRestriction.test.js");
 require("./eAssessmentAttendance.test.js");
 require("./assignTeachersBulk.test.js");
+require("./assignmentEngine.test.js");
 require("./aiMarkingJobs.test.js");
 require("./aiMarkingEngine.test.js");
 require("./aiMarkingWorker.test.js");

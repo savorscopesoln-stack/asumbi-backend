@@ -31,6 +31,65 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
     // easy to find/maintain without wading through the rest of this file.
     await ensureElectionSchema(pool, sql);
 
+    /* ---------------- question-level allocation + undo history ----------------
+       e_assessment_answer_assignments: when there are more teachers than
+         submissions the work is split by ANSWERED QUESTION; one row = one
+         answer handed to one teacher (see utils/assignmentEngine.js).
+       e_assessment_assignment_batches / _changes: a history of every
+         assignment/allocation with what each item looked like BEFORE, so any
+         of them can be undone from the admin screen. */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='e_assessment_answer_assignments' AND xtype='U')
+      CREATE TABLE e_assessment_answer_assignments (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        e_assessment_id INT NOT NULL,
+        answer_id INT NOT NULL,
+        teacher_id INT NOT NULL,
+        assigned_at DATETIME NOT NULL DEFAULT GETDATE()
+      )
+    `);
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='e_assessment_answer_assignments' AND xtype='U')
+      AND NOT EXISTS (SELECT * FROM sys.indexes WHERE name = N'UX_answer_assignments_answer' AND object_id = Object_ID(N'e_assessment_answer_assignments'))
+      CREATE UNIQUE INDEX UX_answer_assignments_answer ON e_assessment_answer_assignments (answer_id)
+    `);
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='e_assessment_answer_assignments' AND xtype='U')
+      AND NOT EXISTS (SELECT * FROM sys.indexes WHERE name = N'IX_answer_assignments_teacher' AND object_id = Object_ID(N'e_assessment_answer_assignments'))
+      CREATE INDEX IX_answer_assignments_teacher ON e_assessment_answer_assignments (teacher_id, e_assessment_id)
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='e_assessment_assignment_batches' AND xtype='U')
+      CREATE TABLE e_assessment_assignment_batches (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        kind NVARCHAR(20) NOT NULL,
+        summary NVARCHAR(300) NULL,
+        created_by INT NULL,
+        created_at DATETIME NOT NULL DEFAULT GETDATE(),
+        undone_at DATETIME NULL,
+        undone_by INT NULL
+      )
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='e_assessment_assignment_changes' AND xtype='U')
+      CREATE TABLE e_assessment_assignment_changes (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        batch_id INT NOT NULL,
+        kind NVARCHAR(12) NOT NULL,
+        target_id INT NULL,
+        teacher_id INT NULL,
+        subject_id INT NULL,
+        class_id INT NULL,
+        prev_teacher_id INT NULL,
+        new_teacher_id INT NULL
+      )
+    `);
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='e_assessment_assignment_changes' AND xtype='U')
+      AND NOT EXISTS (SELECT * FROM sys.indexes WHERE name = N'IX_assignment_changes_batch' AND object_id = Object_ID(N'e_assessment_assignment_changes'))
+      CREATE INDEX IX_assignment_changes_batch ON e_assessment_assignment_changes (batch_id)
+    `);
+
     /* ---------------- e_assessment_device_access ----------------
        One row per (assessment, student, device) that the "Desktop only"
        switch REJECTED (phones/tablets), so the admin can see who tried
