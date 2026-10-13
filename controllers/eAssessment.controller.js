@@ -2950,6 +2950,55 @@ const assignTeacher = async (req, res) => {
   }
 };
 
+
+/* Assign MANY teachers to MANY subjects across MANY classes in one go (the
+   "select all teachers / all subjects / all classes" option on the admin
+   screen). Creates every missing (teacher, subject, class) row in a single
+   statement and skips the ones that already exist, so it is safe to run
+   twice. Each affected teacher gets ONE notification, not one per row. */
+const assignTeachersBulk = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const ints = (v) => [...new Set((Array.isArray(v) ? v : []).map(Number).filter((n) => Number.isInteger(n) && n > 0))];
+    const teacherIds = ints(req.body.teacher_ids);
+    const subjectIds = ints(req.body.subject_ids);
+    const classIds = ints(req.body.class_ids);
+    if (!teacherIds.length || !subjectIds.length || !classIds.length) {
+      return res.status(400).json({ message: "Pick at least one teacher, one subject and one class" });
+    }
+    const combos = teacherIds.length * subjectIds.length * classIds.length;
+    if (combos > 20000) {
+      return res.status(400).json({ message: `That would create ${combos} assignments. Please narrow the selection (limit 20,000).` });
+    }
+    // Only validated integers are inlined (never user text).
+    const r = await pool.request().query(`
+      INSERT INTO TeacherSubjects (teacher_id, subject_id, class_id)
+      OUTPUT inserted.teacher_id
+      SELECT t.id, s.id, c.id
+      FROM Teachers t CROSS JOIN Subjects s CROSS JOIN Classes c
+      WHERE t.id IN (${teacherIds.join(",")}) AND s.id IN (${subjectIds.join(",")}) AND c.id IN (${classIds.join(",")})
+        AND NOT EXISTS (SELECT 1 FROM TeacherSubjects x WHERE x.teacher_id = t.id AND x.subject_id = s.id AND x.class_id = c.id)
+    `);
+    const perTeacher = {};
+    for (const row of r.recordset || []) perTeacher[row.teacher_id] = (perTeacher[row.teacher_id] || 0) + 1;
+    const created = Object.values(perTeacher).reduce((a, b) => a + b, 0);
+
+    for (const [tid, count] of Object.entries(perTeacher)) {
+      try {
+        await notifyOne(pool, Number(tid), "Teachers", {
+          title: "New Class Allocation",
+          message: `You've been allocated ${count} new subject/class assignment${count === 1 ? "" : "s"} to mark.`,
+          type: "allocation",
+        });
+      } catch (_) { /* a failed notification must not undo the assignments */ }
+    }
+    res.json({ success: true, created, skipped: combos - created, teachers: Object.keys(perTeacher).length });
+  } catch (err) {
+    console.error("ASSIGN TEACHERS BULK ERROR:", err);
+    res.status(500).json({ message: "Assignment failed" });
+  }
+};
+
 const getAssignedTeachers = async (req, res) => {
   try {
     const pool = req.pool;
@@ -4081,7 +4130,7 @@ module.exports = {
   getDeviceAccess, allowDevice, revokeDevice, downloadAttendancePdf,
 
   // support data
-  getClasses, getSubjects, getTeachers, assignTeacher, getAssignedTeachers,
+  getClasses, getSubjects, getTeachers, assignTeacher, assignTeachersBulk, getAssignedTeachers,
 
   // submissions / marking
   getAllSubmissions, getAssessmentSubmissions, getSubmissionForMarking, getAllSubmissionsForMarking,

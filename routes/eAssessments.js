@@ -36,7 +36,7 @@ const {
   deleteAssessments, deleteAssignments,
 
   // support data
-  getClasses, getSubjects, getTeachers, assignTeacher, getAssignedTeachers,
+  getClasses, getSubjects, getTeachers, assignTeacher, assignTeachersBulk, getAssignedTeachers,
 
   // submissions / marking
   getAllSubmissions, getAssessmentSubmissions, getSubmissionForMarking, getAllSubmissionsForMarking,
@@ -116,6 +116,7 @@ router.get("/teachers", protect, requirePage("E-Assessments"), getTeachers);
    ADMIN — ASSESSMENT MANAGEMENT
 ========================================================================= */
 router.post("/admin/assign-teacher", protect, requirePage("E-Assessments"), assignTeacher);
+router.post("/admin/assign-teachers-bulk", protect, requirePage("E-Assessments"), assignTeachersBulk);
 router.get("/admin/assigned-teachers", protect, requirePage("E-Assessments"), getAssignedTeachers);
 router.get("/admin/pending", protect, requirePage("E-Assessments"), getPendingAssessments);
 router.put("/admin/:id/review", protect, requirePage("E-Assessments"), reviewAssessment);
