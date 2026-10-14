@@ -173,6 +173,47 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       ALTER TABLE e_assessments ADD desktop_only BIT NOT NULL CONSTRAINT DF_e_assessments_desktop_only DEFAULT 0
     `);
 
+    /* ---------------- e_assessments: who can sit + open/close times ----------------
+       restrict_students: 0 (default) = every ACTIVE student in the
+       assessment's class / year of study may sit it. 1 = only the students
+       listed in e_assessment_allowed_students. So nothing changes for
+       existing assessments.
+       available_from / available_until: optional window. Stored as the East
+       Africa Time wall-clock digits the admin typed (same "labelled UTC"
+       convention as main-exam start_time / end_time — see utils/examAccess.js).
+       schedule_opened_at / schedule_closed_at: markers so the scheduler flips
+       active_status once per window edge and never fights a manual Start/Stop.
+       They are reset whenever the window is edited. */
+    for (const [col, ddl] of [
+      ["restrict_students", "BIT NOT NULL CONSTRAINT DF_e_assessments_restrict_students DEFAULT 0"],
+      ["available_from", "DATETIME NULL"],
+      ["available_until", "DATETIME NULL"],
+      ["schedule_opened_at", "DATETIME NULL"],
+      ["schedule_closed_at", "DATETIME NULL"],
+    ]) {
+      await pool.request().query(`
+        IF EXISTS (SELECT * FROM sysobjects WHERE name='e_assessments' AND xtype='U')
+        AND NOT EXISTS (
+          SELECT * FROM sys.columns
+          WHERE Name = N'${col}' AND Object_ID = Object_ID(N'e_assessments')
+        )
+        ALTER TABLE e_assessments ADD ${col} ${ddl}
+      `);
+    }
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='e_assessment_allowed_students' AND xtype='U')
+      CREATE TABLE e_assessment_allowed_students (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        e_assessment_id INT NOT NULL,
+        student_id INT NOT NULL,
+        created_at DATETIME NOT NULL DEFAULT GETDATE()
+      )
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = N'UX_ea_allowed_students' AND object_id = Object_ID(N'e_assessment_allowed_students'))
+      CREATE UNIQUE INDEX UX_ea_allowed_students ON e_assessment_allowed_students (e_assessment_id, student_id)
+    `);
+
     /* ---------------- e_assessments security switches ----------------
        Per-assessment on/off switches for the exam-security features. All
        default to 1 (ON = required). An admin/teacher can turn one OFF for a

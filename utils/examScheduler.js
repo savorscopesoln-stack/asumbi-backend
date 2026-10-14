@@ -2,6 +2,7 @@ const sql = require("mssql");
 const { logExamAudit } = require("./examAuditLog");
 const { notifyUsers } = require("./notify");
 const { finalizeExpiredAttempts } = require("./examAttempts");
+const { applyScheduledOpenClose } = require("./examAccess");
 
 /* =========================================================================
    EXAM SUBJECT SESSION SCHEDULER (§7-§9, §37-§38)
@@ -227,6 +228,11 @@ const startExamScheduler = (getPool, listTenantKeys, io) => {
         const pool = await getPool(tenantKey);
         await activateDueSessions(pool, tenantKey, io);
         await endDueSessions(pool, tenantKey, io);
+        // Standalone e-assessments with an open/close window set by the admin
+        // (Admin > E-Assessments > "Who can sit & schedule"). Own try/catch so a
+        // not-yet-migrated tenant can't block the checks around it.
+        try { await applyScheduledOpenClose(pool, tenantKey, notifyUsers); }
+        catch (e) { console.error(`⚠️ E-assessment open/close schedule skipped (tenant "${tenantKey}"):`, e.message); }
         // E-assessments: submit (from the last autosave) any exam whose time
         // ran out without the student submitting. Own try/catch so a missing
         // table on an un-migrated tenant can't block the checks above.

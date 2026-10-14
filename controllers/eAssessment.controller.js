@@ -38,6 +38,7 @@ const TEACHER_ANSWER_VISIBLE = `(
 const safeRecord = async (pool, args) => { try { return await assignmentEngine.recordBatch(pool, args); } catch (e) { console.error("ASSIGNMENT HISTORY ERROR:", e.message); return null; } };
 const { sendPdfBuffer } = require("../utils/reportExport");
 const { checkSeb, sendSebBlocked, parseKeys: parseSebKeys, invalidateSebCache } = require("../utils/sebRestriction");
+const { checkStudentAccess, getPermittedStudents, toWallClock } = require("../utils/examAccess");
 const { checkDesktopOnly, sendBlocked, invalidateDesktopOnlyCache, invalidateDeviceAccessCache } = require("../utils/deviceRestriction");
 
 /* =========================================================================
@@ -361,7 +362,8 @@ const getEAssessments = async (req, res) => {
       SELECT ea.*, t.name AS teacher_name, c.name AS class_name,
         ${isTeacher ? "CASE WHEN ea.teacher_id = @teacherId THEN 0 ELSE 1 END" : "0"} AS assigned_only,
         (SELECT COUNT(*) FROM e_assessment_questions eq WHERE eq.e_assessment_id = ea.id) AS question_count,
-        (SELECT COUNT(*) FROM e_assessment_submissions es WHERE es.e_assessment_id = ea.id) AS submission_count
+        (SELECT COUNT(*) FROM e_assessment_submissions es WHERE es.e_assessment_id = ea.id) AS submission_count,
+        (SELECT COUNT(*) FROM e_assessment_allowed_students al2 WHERE al2.e_assessment_id = ea.id) AS allowed_count
         ${isStudent ? `,
         sub.id AS my_submission_id, sub.status AS my_submission_status,
         sub.score AS my_score, sub.submitted_at AS my_submitted_at,
@@ -400,7 +402,10 @@ const getEAssessments = async (req, res) => {
               )
               OR ea.year_of_study = (SELECT yearOfStudy FROM Students WHERE id = @studentId)
             )
-        AND ea.active_status = 'Active'` : ""}
+        AND ea.active_status = 'Active'
+        AND (ISNULL(ea.restrict_students, 0) = 0
+             OR EXISTS (SELECT 1 FROM e_assessment_allowed_students al
+                        WHERE al.e_assessment_id = ea.id AND al.student_id = @studentId))` : ""}
       ORDER BY ea.id DESC
     `);
     const rows = (result.recordset || []).map((r) => redactForRole(r, req.user?.role));
@@ -438,52 +443,29 @@ const getEAssessments = async (req, res) => {
   }
 };
 
-// Public (no-auth) list — feeds the standalone /take-assessment picker
-// BEFORE a student logs in. Returns { active, upcoming }:
-//  - active:   every assessment currently switched Active (the Start/Stop
-//              toggle is the source of truth, same as getEAssessments —
-//              approval status and having a cover page don't gate it),
-//              with its scheduled window from exam_subject_sessions if any.
-//  - upcoming: scheduled subject sessions that haven't started yet.
-// Only non-sensitive fields are returned (no questions, password, etc.).
+// Public (no-auth) preview — feeds the cover-page banner shown on the
+// standalone /take-assessment picker BEFORE a student logs in. A
+// student landing on that link has no session yet, so this can't use
+// getEAssessments' class/year targeting; it just returns the currently
+// Active, approved assessments that actually have a cover page
+// uploaded, and only the handful of non-sensitive fields needed to
+// render that banner (no questions, password, instructions, etc.).
 const getPublicAssessmentCovers = async (req, res) => {
   try {
     const pool = req.pool;
-
-    const [activeRes, upcomingRes] = await Promise.all([
-      pool.request().query(`
-        SELECT TOP 20 ea.id, ea.title, ea.subject, ea.duration_minutes,
-          ea.cover_page_url, ea.cover_page_width, ea.cover_page_height,
-          ess.start_time, ess.end_time
-        FROM e_assessments ea
-        OUTER APPLY (
-          SELECT TOP 1 start_time, end_time
-          FROM exam_subject_sessions
-          WHERE e_assessment_id = ea.id
-          ORDER BY start_time DESC
-        ) ess
-        WHERE ea.active_status = 'Active'
-        ORDER BY ea.id DESC
-      `),
-      pool.request().query(`
-        SELECT TOP 20 ea.id, ea.title, ea.subject,
-          COALESCE(ess.duration_minutes, ea.duration_minutes) AS duration_minutes,
-          ess.start_time, ess.end_time
-        FROM exam_subject_sessions ess
-        JOIN e_assessments ea ON ea.id = ess.e_assessment_id
-        WHERE ess.start_time > GETDATE()
-          AND ISNULL(ea.active_status, '') <> 'Active'
-        ORDER BY ess.start_time ASC
-      `),
-    ]);
-
-    res.json({
-      active: activeRes.recordset || [],
-      upcoming: upcomingRes.recordset || [],
-    });
+    const result = await pool.request().query(`
+      SELECT TOP 5 ea.id, ea.title, ea.subject,
+        ea.cover_page_url, ea.cover_page_width, ea.cover_page_height
+      FROM e_assessments ea
+      WHERE ea.active_status = 'Active'
+        AND ea.status = 'approved'
+        AND ea.cover_page_url IS NOT NULL
+      ORDER BY ea.id DESC
+    `);
+    res.json(result.recordset || []);
   } catch (err) {
     console.error("GET PUBLIC ASSESSMENT COVERS ERROR:", err);
-    res.status(500).json({ active: [], upcoming: [], message: "Failed to load assessments" });
+    res.status(500).json([]);
   }
 };
 
@@ -727,6 +709,15 @@ const examLogin = async (req, res) => {
     }
     const student = sRes.recordset[0];
     req.auditActor = { id: student.id, username: student.username };
+
+    // Trainee access list + open/close window (see utils/examAccess.js).
+    // 400 (never 401/403) on purpose — see the note above this function.
+    let accessCheck;
+    try { accessCheck = await checkStudentAccess(pool, assessment.id, student.id); }
+    catch (dbErr) { return respondDbBusy(res, dbErr); }
+    if (!accessCheck.allowed) {
+      return res.status(400).json({ success: false, code: accessCheck.code, message: accessCheck.message });
+    }
 
     // Short-lived on purpose: just long enough to sit the exam, not a
     // standing session. duration_minutes + 20 min buffer, clamped.
@@ -1477,6 +1468,16 @@ const startExamSession = async (req, res) => {
       });
     }
 
+    // Trainee access list + open/close window. A student already mid-exam
+    // (session active) keeps their own timer past the closing time.
+    {
+      const midExam = existing.recordset[0]?.status === "active";
+      const access = await checkStudentAccess(pool, e_assessment_id, student_id, { skipWindow: midExam });
+      if (!access.allowed) {
+        return res.status(409).json({ code: access.code, message: access.message });
+      }
+    }
+
     if (existing.recordset.length) {
       const row = existing.recordset[0];
       if (row.status === "ended") {
@@ -1582,6 +1583,12 @@ const activateExamSession = async (req, res) => {
     }
 
     if (!row.device_id) {
+      // First activation: the access list / window may have changed since the
+      // token was issued, so re-check before the clock starts.
+      const access = await checkStudentAccess(pool, row.e_assessment_id, student_id);
+      if (!access.allowed) {
+        return res.status(409).json({ code: access.code, message: access.message });
+      }
       // First activation — one live session per student: re-check here too,
       // since two exams could both have been "issued" before either started.
       const otherLive = await findOtherLiveSession(pool, student_id, row.e_assessment_id);
@@ -2586,6 +2593,141 @@ const getActivityLog = async (req, res) => {
   }
 };
 
+/* =========================================================================
+   TRAINEE ACCESS + OPEN/CLOSE WINDOW (Admin > E-Assessments > "Who can sit")
+   GET  /admin/:id/access -> { restrict_students, available_from,
+        available_until, allowed_student_ids, students: [...] }
+        (students = active trainees in the assessment's class / year)
+   PUT  /admin/:id/access  body { restrict_students: bool,
+        student_ids?: number[], available_from?: string|null,
+        available_until?: string|null }
+        Times are East Africa Time wall-clock ("YYYY-MM-DDTHH:mm").
+========================================================================= */
+const getAccessSettings = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const id = toInt(req.params.id);
+    if (!id) return res.status(400).json({ message: "Invalid assessment ID" });
+
+    const a = await pool.request().input("id", sql.Int, id).query(`
+      SELECT ISNULL(restrict_students, 0) AS restrict_students, available_from, available_until
+      FROM e_assessments WHERE id = @id`);
+    if (!a.recordset.length) return res.status(404).json({ message: "Assessment not found" });
+
+    const pickable = await pool.request().input("aid", sql.Int, id).query(`
+      SELECT st.id, st.name, st.username, st.studentClass
+      FROM e_assessments ea
+      INNER JOIN Students st ON (
+           st.studentClass IN (SELECT c.name FROM Classes c WHERE c.id = ea.class_id)
+        OR (ea.year_of_study IS NOT NULL AND st.yearOfStudy = ea.year_of_study)
+      )
+      WHERE ea.id = @aid
+        AND (st.status IS NULL OR LTRIM(RTRIM(st.status)) = '' OR LOWER(st.status) = 'active')
+      ORDER BY st.studentClass, st.name`);
+    const allowed = await pool.request().input("aid", sql.Int, id)
+      .query(`SELECT student_id FROM e_assessment_allowed_students WHERE e_assessment_id = @aid`);
+
+    res.json({
+      success: true,
+      restrict_students: !!a.recordset[0].restrict_students,
+      available_from: a.recordset[0].available_from,
+      available_until: a.recordset[0].available_until,
+      allowed_student_ids: allowed.recordset.map((r) => r.student_id),
+      students: pickable.recordset,
+    });
+  } catch (err) {
+    console.error("GET ACCESS SETTINGS ERROR:", err);
+    res.status(500).json({ message: "Failed to load the access settings" });
+  }
+};
+
+const setAccessSettings = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const id = toInt(req.params.id);
+    if (!id) return res.status(400).json({ message: "Invalid assessment ID" });
+    const body = req.body || {};
+    if (typeof body.restrict_students !== "boolean") {
+      return res.status(400).json({ message: "`restrict_students` (true/false) is required" });
+    }
+    const exists = await pool.request().input("id", sql.Int, id).query(`SELECT id FROM e_assessments WHERE id = @id`);
+    if (!exists.recordset.length) return res.status(404).json({ message: "Assessment not found" });
+
+    const touchesWindow = "available_from" in body || "available_until" in body;
+    let from = null, until = null;
+    if (touchesWindow) {
+      from = toWallClock(body.available_from);
+      until = toWallClock(body.available_until);
+      if (body.available_from && !from) return res.status(400).json({ message: "The opening date/time isn't valid" });
+      if (body.available_until && !until) return res.status(400).json({ message: "The closing date/time isn't valid" });
+      if (from && until && until <= from) {
+        return res.status(400).json({ message: "The closing time must be after the opening time" });
+      }
+      if (from || until) {
+        // Assessments run by a Main Examination timetable are opened/closed by
+        // that schedule, so a second window here would just conflict with it.
+        const linked = await pool.request().input("id", sql.Int, id).query(
+          `SELECT TOP 1 1 AS x FROM exam_subject_sessions WHERE e_assessment_id = @id AND status <> 'draft'`);
+        if (linked.recordset.length) {
+          return res.status(409).json({ message: "This assessment is scheduled as a Main Examination subject. Set its times from the Main Examination timetable instead." });
+        }
+      }
+    }
+
+    const ids = Array.isArray(body.student_ids)
+      ? [...new Set(body.student_ids.map(toInt).filter(Boolean))]
+      : null;
+    if (body.restrict_students && ids && ids.length === 0) {
+      return res.status(400).json({ message: "Pick at least one trainee, or choose \"All active trainees\"." });
+    }
+
+    const tx = new sql.Transaction(pool);
+    await tx.begin();
+    try {
+      const rq = new sql.Request(tx).input("id", sql.Int, id).input("r", sql.Bit, body.restrict_students ? 1 : 0);
+      if (touchesWindow) {
+        rq.input("from", sql.DateTime, from).input("until", sql.DateTime, until);
+        await rq.query(`
+          UPDATE e_assessments
+          SET restrict_students = @r, available_from = @from, available_until = @until,
+              schedule_opened_at = NULL, schedule_closed_at = NULL
+          WHERE id = @id`);
+      } else {
+        await rq.query(`UPDATE e_assessments SET restrict_students = @r WHERE id = @id`);
+      }
+      if (ids) {
+        await new sql.Request(tx).input("id", sql.Int, id)
+          .query(`DELETE FROM e_assessment_allowed_students WHERE e_assessment_id = @id`);
+        for (const sid of ids) {
+          await new sql.Request(tx).input("id", sql.Int, id).input("sid", sql.Int, sid)
+            .query(`INSERT INTO e_assessment_allowed_students (e_assessment_id, student_id) VALUES (@id, @sid)`);
+        }
+      }
+      await tx.commit();
+    } catch (txErr) {
+      try { await tx.rollback(); } catch { /* already rolled back */ }
+      throw txErr;
+    }
+
+    const fresh = await pool.request().input("id", sql.Int, id).query(`
+      SELECT ISNULL(restrict_students, 0) AS restrict_students, available_from, available_until,
+             (SELECT COUNT(*) FROM e_assessment_allowed_students WHERE e_assessment_id = @id) AS allowed_count
+      FROM e_assessments WHERE id = @id`);
+    const f = fresh.recordset[0];
+    res.json({
+      success: true,
+      restrict_students: !!f.restrict_students,
+      available_from: f.available_from,
+      available_until: f.available_until,
+      allowed_count: f.allowed_count,
+      message: "Trainee access and schedule saved.",
+    });
+  } catch (err) {
+    console.error("SET ACCESS SETTINGS ERROR:", err);
+    res.status(500).json({ message: "Failed to save the access settings" });
+  }
+};
+
 const setDesktopOnly = async (req, res) => {
   try {
     const pool = req.pool;
@@ -2865,16 +3007,8 @@ const toggleEAssessmentActive = async (req, res) => {
       // than the single class_id it also carries for backward-compat
       // display — that class_id is only a "representative" class, not
       // the whole audience, once year_of_study is set.
-      const students = year_of_study
-        ? await pool.request().input("year", sql.Int, year_of_study)
-            .query(`SELECT id FROM Students WHERE yearOfStudy = @year`)
-        : await pool.request().input("classId", sql.Int, class_id)
-            .query(`
-              SELECT st.id
-              FROM Students st
-              JOIN Classes c ON c.id = @classId
-              WHERE st.studentClass = c.name
-            `);
+      // Only active students who are actually permitted to sit it.
+      const students = { recordset: await getPermittedStudents(pool, id) };
       await notifyUsers(
         pool,
         (students.recordset || []).map((s) => ({ id: s.id, source: "Students" })),
@@ -4227,6 +4361,8 @@ const updateGradingSystem = async (req, res) => {
 ========================================================================= */
 module.exports = {
   setDesktopOnly,
+  getAccessSettings,
+  setAccessSettings,
   setSecuritySettings,
   setSebSettings,
   getSecuritySettings,
