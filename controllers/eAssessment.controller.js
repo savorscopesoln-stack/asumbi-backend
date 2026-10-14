@@ -52,7 +52,7 @@ const SQL_SCHEDULE_STATE = `CASE WHEN ${SQL_IS_ACTIVE} THEN 'active' WHEN ${SQL_
 const safeRecord = async (pool, args) => { try { return await assignmentEngine.recordBatch(pool, args); } catch (e) { console.error("ASSIGNMENT HISTORY ERROR:", e.message); return null; } };
 const { sendPdfBuffer } = require("../utils/reportExport");
 const { checkSeb, sendSebBlocked, parseKeys: parseSebKeys, invalidateSebCache } = require("../utils/sebRestriction");
-const { checkStudentAccess, getPermittedStudents, toWallClock } = require("../utils/examAccess");
+const { checkStudentAccess, getPermittedStudents, toWallClock, isActiveStudent } = require("../utils/examAccess");
 const { checkDesktopOnly, sendBlocked, invalidateDesktopOnlyCache, invalidateDeviceAccessCache } = require("../utils/deviceRestriction");
 
 /* =========================================================================
@@ -699,6 +699,37 @@ const examLogin = async (req, res) => {
     if (assessment.exam_password !== examPassword) {
       return res.status(400).json({ success: false, message: "Incorrect exam password" });
     }
+    // ACCOUNT STATUS: the moment the exam password is accepted, look the
+    // trainee up and refuse an inactive account before anything else (paper
+    // active check, device/SEB checks, token). Blank status = active so
+    // legacy rows aren't locked out; anything else (inactive, graduated,
+    // suspended...) is refused. 400 on purpose, like the other login errors.
+    let sRes;
+    try {
+      sRes = await withTransientRetry(
+        () => pool.request()
+          .input("username", sql.NVarChar, username)
+          .query(`SELECT id, username, name, status FROM Students WHERE username = @username`),
+        { label: "exam-login:fetch-student" }
+      );
+    } catch (dbErr) {
+      return respondDbBusy(res, dbErr);
+    }
+
+    if (!sRes.recordset.length) {
+      return res.status(400).json({ success: false, message: "No student account found with that username" });
+    }
+    const student = sRes.recordset[0];
+    req.auditActor = { id: student.id, username: student.username };
+
+    if (!isActiveStudent(student.status)) {
+      return res.status(400).json({
+        success: false,
+        code: "STUDENT_INACTIVE",
+        message: "Your account isn't active, so you can't take this assessment. Please contact the school office.",
+      });
+    }
+
     // Only the Start/Stop (active_status) toggle decides whether students
     // can enter — approval status is no longer checked here. Strict
     // comparison on purpose: a NULL active_status is NOT treated as active,
@@ -714,24 +745,6 @@ const examLogin = async (req, res) => {
     // Safe Exam Browser switch: refuse to issue a token to any other browser.
     const sebCheck = await checkSeb(req, pool, tenant, assessment.id);
     if (sebCheck.blocked) return sendSebBlocked(res);
-
-    let sRes;
-    try {
-      sRes = await withTransientRetry(
-        () => pool.request()
-          .input("username", sql.NVarChar, username)
-          .query(`SELECT id, username, name FROM Students WHERE username = @username`),
-        { label: "exam-login:fetch-student" }
-      );
-    } catch (dbErr) {
-      return respondDbBusy(res, dbErr);
-    }
-
-    if (!sRes.recordset.length) {
-      return res.status(400).json({ success: false, message: "No student account found with that username" });
-    }
-    const student = sRes.recordset[0];
-    req.auditActor = { id: student.id, username: student.username };
 
     // Trainee access list + open/close window (see utils/examAccess.js).
     // 400 (never 401/403) on purpose — see the note above this function.
