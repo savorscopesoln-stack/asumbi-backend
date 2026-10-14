@@ -34,6 +34,20 @@ const TEACHER_ANSWER_VISIBLE = `(
         ISNULL(q.question_type, 'mcq') NOT IN ('essay', 'descriptive')
         OR EXISTS (SELECT 1 FROM e_assessment_submission_assignments aa2 WHERE aa2.submission_id = a.submission_id AND aa2.teacher_id = @teacherId))))`;
 
+/* ACTIVE vs UPCOMING (what a student sees on their list).
+   Active   = Start/Stop switch is on.
+   Upcoming = not active yet, but an opening time (available_from) is scheduled
+              and the scheduler hasn't opened or closed it yet.
+   Upcoming exams are listed but can't be entered: examLogin still requires
+   active_status = 'Active'. Alias `ea` = e_assessments. */
+const SQL_IS_ACTIVE = `(ea.active_status = 'Active')`;
+const SQL_IS_UPCOMING = `(ISNULL(ea.active_status, 'Inactive') <> 'Active'
+  AND ea.available_from IS NOT NULL
+  AND ea.schedule_opened_at IS NULL
+  AND ea.schedule_closed_at IS NULL)`;
+const SQL_ACTIVE_OR_UPCOMING = `(${SQL_IS_ACTIVE} OR ${SQL_IS_UPCOMING})`;
+const SQL_SCHEDULE_STATE = `CASE WHEN ${SQL_IS_ACTIVE} THEN 'active' WHEN ${SQL_IS_UPCOMING} THEN 'upcoming' ELSE 'closed' END`;
+
 // History must never break the real action it describes.
 const safeRecord = async (pool, args) => { try { return await assignmentEngine.recordBatch(pool, args); } catch (e) { console.error("ASSIGNMENT HISTORY ERROR:", e.message); return null; } };
 const { sendPdfBuffer } = require("../utils/reportExport");
@@ -349,8 +363,10 @@ const getEAssessments = async (req, res) => {
     // whole-year assessment (ea.year_of_study matching their own
     // Students.yearOfStudy — see the ClassMultiSelect/year-of-study
     // work on the admin side) — AND only ones that are currently Active
-    // (ea.active_status = 'Active'). Approval status no longer decides
-    // what a student sees; the Start/Stop (active_status) toggle does.
+    // (ea.active_status = 'Active') or UPCOMING (scheduled to open later,
+    // see SQL_IS_UPCOMING; listed but not enterable). Approval status no
+    // longer decides what a student sees; the Start/Stop toggle and the
+    // schedule do.
     const isTeacher = req.user?.role === "teacher";
     const isStudent = req.user?.role === "student";
 
@@ -369,6 +385,7 @@ const getEAssessments = async (req, res) => {
         sub.score AS my_score, sub.submitted_at AS my_submitted_at,
         ISNULL(mysess.resit_allowed, 0) AS my_resit_allowed,
         ISNULL(mysess.attempt_no, 1) AS my_attempt_no` : ""}
+        ,${SQL_SCHEDULE_STATE} AS schedule_state
       FROM e_assessments ea
       LEFT JOIN Teachers t ON ea.teacher_id = t.id
       LEFT JOIN Classes c ON ea.class_id = c.id
@@ -402,11 +419,11 @@ const getEAssessments = async (req, res) => {
               )
               OR ea.year_of_study = (SELECT yearOfStudy FROM Students WHERE id = @studentId)
             )
-        AND ea.active_status = 'Active'
+        AND ${SQL_ACTIVE_OR_UPCOMING}
         AND (ISNULL(ea.restrict_students, 0) = 0
              OR EXISTS (SELECT 1 FROM e_assessment_allowed_students al
                         WHERE al.e_assessment_id = ea.id AND al.student_id = @studentId))` : ""}
-      ORDER BY ea.id DESC
+      ORDER BY ${isStudent ? `CASE WHEN ${SQL_IS_ACTIVE} THEN 0 ELSE 1 END, ea.available_from ASC, ` : ""}ea.id DESC
     `);
     const rows = (result.recordset || []).map((r) => redactForRole(r, req.user?.role));
 
@@ -455,12 +472,13 @@ const getPublicAssessmentCovers = async (req, res) => {
     const pool = req.pool;
     const result = await pool.request().query(`
       SELECT TOP 5 ea.id, ea.title, ea.subject,
-        ea.cover_page_url, ea.cover_page_width, ea.cover_page_height
+        ea.cover_page_url, ea.cover_page_width, ea.cover_page_height,
+        ea.available_from, ${SQL_SCHEDULE_STATE} AS schedule_state
       FROM e_assessments ea
-      WHERE ea.active_status = 'Active'
+      WHERE ${SQL_ACTIVE_OR_UPCOMING}
         AND ea.status = 'approved'
         AND ea.cover_page_url IS NOT NULL
-      ORDER BY ea.id DESC
+      ORDER BY CASE WHEN ${SQL_IS_ACTIVE} THEN 0 ELSE 1 END, ea.available_from ASC, ea.id DESC
     `);
     res.json(result.recordset || []);
   } catch (err) {
