@@ -438,29 +438,52 @@ const getEAssessments = async (req, res) => {
   }
 };
 
-// Public (no-auth) preview — feeds the cover-page banner shown on the
-// standalone /take-assessment picker BEFORE a student logs in. A
-// student landing on that link has no session yet, so this can't use
-// getEAssessments' class/year targeting; it just returns the currently
-// Active, approved assessments that actually have a cover page
-// uploaded, and only the handful of non-sensitive fields needed to
-// render that banner (no questions, password, instructions, etc.).
+// Public (no-auth) list — feeds the standalone /take-assessment picker
+// BEFORE a student logs in. Returns { active, upcoming }:
+//  - active:   every assessment currently switched Active (the Start/Stop
+//              toggle is the source of truth, same as getEAssessments —
+//              approval status and having a cover page don't gate it),
+//              with its scheduled window from exam_subject_sessions if any.
+//  - upcoming: scheduled subject sessions that haven't started yet.
+// Only non-sensitive fields are returned (no questions, password, etc.).
 const getPublicAssessmentCovers = async (req, res) => {
   try {
     const pool = req.pool;
-    const result = await pool.request().query(`
-      SELECT TOP 5 ea.id, ea.title, ea.subject,
-        ea.cover_page_url, ea.cover_page_width, ea.cover_page_height
-      FROM e_assessments ea
-      WHERE ea.active_status = 'Active'
-        AND ea.status = 'approved'
-        AND ea.cover_page_url IS NOT NULL
-      ORDER BY ea.id DESC
-    `);
-    res.json(result.recordset || []);
+
+    const [activeRes, upcomingRes] = await Promise.all([
+      pool.request().query(`
+        SELECT TOP 20 ea.id, ea.title, ea.subject, ea.duration_minutes,
+          ea.cover_page_url, ea.cover_page_width, ea.cover_page_height,
+          ess.start_time, ess.end_time
+        FROM e_assessments ea
+        OUTER APPLY (
+          SELECT TOP 1 start_time, end_time
+          FROM exam_subject_sessions
+          WHERE e_assessment_id = ea.id
+          ORDER BY start_time DESC
+        ) ess
+        WHERE ea.active_status = 'Active'
+        ORDER BY ea.id DESC
+      `),
+      pool.request().query(`
+        SELECT TOP 20 ea.id, ea.title, ea.subject,
+          COALESCE(ess.duration_minutes, ea.duration_minutes) AS duration_minutes,
+          ess.start_time, ess.end_time
+        FROM exam_subject_sessions ess
+        JOIN e_assessments ea ON ea.id = ess.e_assessment_id
+        WHERE ess.start_time > GETDATE()
+          AND ISNULL(ea.active_status, '') <> 'Active'
+        ORDER BY ess.start_time ASC
+      `),
+    ]);
+
+    res.json({
+      active: activeRes.recordset || [],
+      upcoming: upcomingRes.recordset || [],
+    });
   } catch (err) {
     console.error("GET PUBLIC ASSESSMENT COVERS ERROR:", err);
-    res.status(500).json([]);
+    res.status(500).json({ active: [], upcoming: [], message: "Failed to load assessments" });
   }
 };
 
