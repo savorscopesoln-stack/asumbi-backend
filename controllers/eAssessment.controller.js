@@ -460,30 +460,35 @@ const getEAssessments = async (req, res) => {
   }
 };
 
-// Public (no-auth) preview — feeds the cover-page banner shown on the
-// standalone /take-assessment picker BEFORE a student logs in. A
-// student landing on that link has no session yet, so this can't use
-// getEAssessments' class/year targeting; it just returns the currently
-// Active, approved assessments that actually have a cover page
-// uploaded, and only the handful of non-sensitive fields needed to
-// render that banner (no questions, password, instructions, etc.).
+// Public (no-auth) list for the /take-assessment picker. Returns
+// { active: [...], upcoming: [...] }. Every currently Active or Upcoming
+// assessment is listed (cover page optional). Times are sent as "seconds
+// from now", computed by the database, so the browser's timezone never
+// matters. No questions, passwords or other sensitive fields are returned.
 const getPublicAssessmentCovers = async (req, res) => {
   try {
     const pool = req.pool;
     const result = await pool.request().query(`
-      SELECT TOP 5 ea.id, ea.title, ea.subject,
+      SELECT TOP 100 ea.id, ea.title, ea.subject, ea.duration_minutes,
         ea.cover_page_url, ea.cover_page_width, ea.cover_page_height,
-        ea.available_from, ${SQL_SCHEDULE_STATE} AS schedule_state
+        CONVERT(VARCHAR(16), ea.available_from, 126) AS start_label,
+        CASE WHEN ea.available_from  IS NULL THEN NULL
+             ELSE DATEDIFF(SECOND, GETDATE(), ea.available_from)  END AS seconds_until_start,
+        CASE WHEN ea.available_until IS NULL THEN NULL
+             ELSE DATEDIFF(SECOND, GETDATE(), ea.available_until) END AS seconds_until_end,
+        ${SQL_SCHEDULE_STATE} AS schedule_state
       FROM e_assessments ea
       WHERE ${SQL_ACTIVE_OR_UPCOMING}
-        AND ea.status = 'approved'
-        AND ea.cover_page_url IS NOT NULL
       ORDER BY CASE WHEN ${SQL_IS_ACTIVE} THEN 0 ELSE 1 END, ea.available_from ASC, ea.id DESC
     `);
-    res.json(result.recordset || []);
+    const rows = result.recordset || [];
+    res.json({
+      active: rows.filter((r) => r.schedule_state === "active"),
+      upcoming: rows.filter((r) => r.schedule_state === "upcoming"),
+    });
   } catch (err) {
     console.error("GET PUBLIC ASSESSMENT COVERS ERROR:", err);
-    res.status(500).json([]);
+    res.status(500).json({ active: [], upcoming: [], message: "Failed to load assessments" });
   }
 };
 
