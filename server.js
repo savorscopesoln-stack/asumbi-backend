@@ -163,6 +163,16 @@ io.on("connection", (socket) => {
 
 /* ================= MIDDLEWARE ================= */
 app.use(cors(corsOptions));
+
+// Gzip JSON/text responses (the admin E-Assessments lists are large and
+// compress ~10x). Guarded so the server still boots if the package hasn't
+// been installed yet — run `npm install` after pulling this change.
+try {
+  const compression = require("compression");
+  app.use(compression({ threshold: 1024 }));
+} catch (_) {
+  console.warn("compression package not installed — run `npm install` to enable response gzip");
+}
 app.options("*", cors(corsOptions));
 // The camera-photo upload posts a webcam frame AND a full-screen screenshot
 // as base64 data URLs, which easily exceeds express.json()'s 100kb default
