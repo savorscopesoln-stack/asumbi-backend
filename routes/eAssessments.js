@@ -22,7 +22,7 @@ const {
   // exam session / device lock
   startExamSession, activateExamSession, heartbeatExamSession, endExamSession,
   setDesktopOnly, getAccessSettings, setAccessSettings, setSecuritySettings, setSebSettings, getSecuritySettings, getActivityLog,
-  getExamSessions, unlockExamSession, getDeviceAccess, allowDevice, revokeDevice, downloadAttendancePdf, examSessionStatus, lockExamSession,
+  getExamSessions, unlockExamSession, unlockExamSessionsBulk, getDeviceAccess, allowDevice, revokeDevice, downloadAttendancePdf, examSessionStatus, lockExamSession,
   autosaveExamAnswers, getExamDraft, grantResit, cancelResit, getUnsubmittedSessions,
 
   // camera violation photos (evidence capture, no longer a lock trigger)
@@ -174,6 +174,7 @@ router.put("/admin/grading-system", protect, requirePage("E-Assessments"), updat
 ========================================================================= */
 router.get("/admin/exam-sessions", protect, requirePage("E-Assessments"), getExamSessions);
 router.get("/admin/exam-sessions/unsubmitted", protect, requirePage("E-Assessments"), getUnsubmittedSessions);
+router.put("/admin/exam-sessions/unlock-bulk", protect, requirePage("E-Assessments"), unlockExamSessionsBulk);
 router.put("/admin/exam-sessions/:id/unlock", protect, requirePage("E-Assessments"), unlockExamSession);
 router.post("/admin/resit", protect, requirePage("E-Assessments"), grantResit);
 router.post("/admin/resit/cancel", protect, requirePage("E-Assessments"), cancelResit);

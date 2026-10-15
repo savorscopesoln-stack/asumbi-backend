@@ -2108,20 +2108,114 @@ const lockExamSession = async (req, res) => {
   }
 };
 
-// Admin: list locked/active sessions so a genuinely-affected student can be freed
+/* ─────────────────────────────────────────────────────────
+   DEVICE SESSIONS (Admin > E-Assessments > Device Locks)
+   Every exam session in four groups, each with the STEP the
+   device has reached:
+     not_started → token issued, student hasn't entered (or was
+                   unlocked and hasn't resumed yet)
+     active      → entered; answering (N of M answered, connection)
+     locked      → locked by the device-binding / violation rules
+     submitted   → finished (manually or auto-submitted at time up)
+   Steps: 1 token issued · 2 entered / device verified ·
+          3 answering · 4 submitted
+───────────────────────────────────────────────────────── */
+
+// How many questions an autosaved draft ({ "<qid>": value }) has an answer for.
+// Essays count when they have text or a table; "<p><br></p>" doesn't.
+const countDraftAnswers = (json) => {
+  if (!json) return 0;
+  let draft;
+  try { draft = JSON.parse(json); } catch { return 0; }
+  if (!draft || typeof draft !== "object") return 0;
+  return Object.values(draft).filter((v) => {
+    if (v == null) return false;
+    const t = String(v);
+    if (/<table\b/i.test(t)) return true;
+    return t.replace(/<[^>]*>/g, "").replace(/&nbsp;/g, " ").trim().length > 0;
+  }).length;
+};
+
+// Heartbeats arrive every few seconds while a device is connected; this is
+// how long without one before we call it "no signal".
+const HEARTBEAT_STALE_SECONDS = 60;
+
+// Turns a raw session row into the grouped/stepped shape the admin screen shows.
+const describeExamSession = (r) => {
+  const total = r.total_questions || 0;
+  const answered = r.status === "ended" ? (r.submitted_answer_count || 0) : countDraftAnswers(r.answers_json);
+  const hbAge = r.last_heartbeat_age == null ? null : Number(r.last_heartbeat_age);
+  const connection = r.status === "active"
+    ? (hbAge != null && hbAge <= HEARTBEAT_STALE_SECONDS ? "online" : "no_signal")
+    : null;
+  const progress = total ? `${answered} of ${total} answered` : `${answered} answered`;
+
+  let group, step, label;
+  if (r.status === "ended") {
+    group = "submitted"; step = 4;
+    label = `Submitted — ${progress}${r.auto_submitted ? " (auto-submitted at time up)" : ""}`;
+  } else if (r.status === "locked") {
+    group = "locked";
+    step = r.activated_at ? 3 : 2;
+    label = r.activated_at ? `Locked while answering — ${progress}` : "Locked before starting";
+  } else if (r.status === "active") {
+    group = "active";
+    if (answered === 0) { step = 2; label = "Entered — nothing answered yet"; }
+    else if (total && answered >= total) { step = 3; label = `All ${total} answered — hasn't submitted yet`; }
+    else { step = 3; label = `Answering — ${progress}`; }
+  } else {
+    group = "not_started"; step = 1;
+    label = r.activated_at ? "Unlocked — waiting to resume"
+          : r.resit_allowed ? "Resit granted — hasn't entered yet"
+          : "Token issued — hasn't entered yet";
+  }
+
+  const { answers_json, last_heartbeat_age, submitted_answer_count, ...rest } = r; // never ship the drafts themselves
+  return { ...rest, group, step, step_label: label, answered_count: answered, total_questions: total, connection };
+};
+
+// Admin: every exam session (not started / active / locked / submitted) with its
+// step and progress, so the screen can group them, count them, search them and
+// export each group.
 const getExamSessions = async (req, res) => {
   try {
     const pool = req.pool;
-    const result = await pool.request().query(`
-      SELECT es.*, st.name AS student_name, a.title AS assessment_title,
-        (SELECT COUNT(*) FROM e_assessment_violation_photos vp WHERE vp.session_id = es.id) AS photo_count
+    const aid = toInt(req.query.assessmentId);
+    const request = pool.request();
+    if (aid) request.input("aid", sql.Int, aid);
+    const result = await request.query(`
+      SELECT es.id, es.e_assessment_id, es.student_id, es.token, es.status, es.device_id, es.device_label,
+             es.issued_at, es.activated_at, es.last_heartbeat, es.locked_at, es.lock_reason, es.ended_at,
+             es.auto_submitted, es.resit_allowed, es.attempt_no,
+             st.name AS student_name, st.studentClass AS student_class, st.username AS student_username,
+             a.title AS assessment_title, a.subject AS subject_name,
+             ISNULL(a.duration_minutes, 30) AS duration_minutes,
+             (SELECT COUNT(*) FROM e_assessment_violation_photos vp WHERE vp.session_id = es.id) AS photo_count,
+             (SELECT COUNT(*) FROM e_assessment_questions q WHERE q.e_assessment_id = es.e_assessment_id) AS total_questions,
+             sub.id AS submission_id, sub.submitted_at AS submitted_at,
+             CASE WHEN sub.id IS NOT NULL THEN
+               (SELECT COUNT(*) FROM e_assessment_answers ans
+                 WHERE ans.submission_id = sub.id
+                   AND (ISNULL(ans.selected_answer, '') <> '' OR LEN(ISNULL(CAST(ans.essay_answer AS NVARCHAR(MAX)), '')) > 0))
+             END AS submitted_answer_count,
+             CASE WHEN es.status IN ('active','locked') AND es.activated_at IS NOT NULL
+                  THEN DATEDIFF(SECOND, GETDATE(), DATEADD(MINUTE, ISNULL(a.duration_minutes, 30), es.activated_at)) END AS seconds_left,
+             CASE WHEN es.last_heartbeat IS NOT NULL THEN DATEDIFF(SECOND, es.last_heartbeat, GETDATE()) END AS last_heartbeat_age,
+             d.answers_json
       FROM e_assessment_exam_sessions es
       LEFT JOIN Students st ON st.id = es.student_id
       LEFT JOIN e_assessments a ON a.id = es.e_assessment_id
-      WHERE es.status IN ('locked','active','issued')
-      ORDER BY es.status DESC, es.issued_at DESC
+      LEFT JOIN e_assessment_submissions sub
+             ON sub.e_assessment_id = es.e_assessment_id AND sub.student_id = es.student_id
+      LEFT JOIN e_assessment_drafts d
+             ON d.e_assessment_id = es.e_assessment_id AND d.student_id = es.student_id
+            AND es.status IN ('active','locked')
+      WHERE (es.status IN ('locked','active','issued') OR (es.status = 'ended' AND sub.id IS NOT NULL))
+        ${aid ? "AND es.e_assessment_id = @aid" : ""}
+      ORDER BY CASE es.status WHEN 'locked' THEN 0 WHEN 'active' THEN 1 WHEN 'issued' THEN 2 ELSE 3 END,
+               ISNULL(es.last_heartbeat, ISNULL(es.ended_at, es.issued_at)) DESC
     `);
-    res.json(result.recordset || []);
+    res.json((result.recordset || []).map(describeExamSession));
   } catch (err) {
     console.error("GET EXAM SESSIONS ERROR:", err);
     res.status(500).json([]);
@@ -2176,6 +2270,44 @@ const unlockExamSession = async (req, res) => {
     res.json({ success: true, message: "Session unlocked" });
   } catch (err) {
     console.error("UNLOCK EXAM SESSION ERROR:", err);
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// Admin: unlock MANY locked sessions at once (e.g. a network blip locked half
+// the room). Same effect as unlockExamSession per row — clears the device
+// binding so each student can resume on a device of their choice — and, like
+// it, only ever touches rows that are currently 'locked'. Must be told what to
+// unlock, explicitly: a list of session ids, one assessment, or all:true.
+const unlockExamSessionsBulk = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const ids = Array.isArray(req.body?.sessionIds)
+      ? [...new Set(req.body.sessionIds.map(toInt).filter(Boolean))]
+      : null;
+    const aid = toInt(req.body?.assessmentId);
+    const all = req.body?.all === true;
+
+    if (ids && ids.length > 2000) return res.status(400).json({ message: "Too many sessions at once (max 2000)" });
+    if (!(ids && ids.length) && !aid && !all) {
+      return res.status(400).json({ message: "Say what to unlock: sessionIds, assessmentId, or all: true" });
+    }
+
+    const request = pool.request();
+    let scope = "1 = 1";
+    if (ids && ids.length) scope = `id IN (${ids.join(",")})`; // integers only (toInt above) — safe to inline
+    else if (aid) { request.input("aid", sql.Int, aid); scope = "e_assessment_id = @aid"; }
+
+    const result = await request.query(`
+      UPDATE e_assessment_exam_sessions
+      SET status = 'issued', device_id = NULL, device_label = NULL,
+          locked_at = NULL, lock_reason = NULL
+      WHERE status = 'locked' AND ${scope}
+    `);
+    const unlocked = result.rowsAffected[0] || 0;
+    res.json({ success: true, unlocked, message: unlocked ? `${unlocked} session${unlocked === 1 ? "" : "s"} unlocked` : "Nothing to unlock" });
+  } catch (err) {
+    console.error("BULK UNLOCK EXAM SESSIONS ERROR:", err);
     res.status(500).json({ message: err.message });
   }
 };
@@ -4422,7 +4554,7 @@ module.exports = {
 
   // exam session / device lock
   startExamSession, activateExamSession, heartbeatExamSession, endExamSession,
-  getExamSessions, unlockExamSession, examSessionStatus, lockExamSession,
+  getExamSessions, unlockExamSession, unlockExamSessionsBulk, examSessionStatus, lockExamSession,
   autosaveExamAnswers, getExamDraft, grantResit, cancelResit, getUnsubmittedSessions,
 
   // camera violation photos (evidence capture, no longer a lock trigger)

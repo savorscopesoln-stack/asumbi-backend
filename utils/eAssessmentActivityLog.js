@@ -90,6 +90,7 @@ const ROUTE_ACTIONS = {
   "PUT /admin/device-access/:id/allow":  { action: "allow_device",            kind: "device_access" },
   "PUT /admin/device-access/:id/revoke": { action: "revoke_device",           kind: "device_access" },
   "PUT /admin/exam-sessions/:id/unlock": { action: "unlock_device",           kind: "session" },
+  "PUT /admin/exam-sessions/unlock-bulk": { action: "unlock_devices_bulk",       kind: "body" },
   "POST /admin/resit":                   { action: "grant_resit",             kind: "body" },
   "POST /admin/resit/cancel":            { action: "cancel_resit",            kind: "body" },
   "POST /admin/assign-teacher":          { action: "assign_teacher",          kind: "body" },

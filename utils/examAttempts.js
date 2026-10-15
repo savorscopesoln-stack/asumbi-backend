@@ -208,18 +208,23 @@ function draftToAnswerArray(draftObj, questionTypes) {
 
 /* Submits, from the last autosave, every exam whose time ran out without a
    submission. Safe to run every minute: it only touches sessions still
-   'active' and a finished one drops out of the query. Locked sessions are
-   deliberately left alone — an admin may still unlock them. */
+   'active' OR 'locked' and a finished one drops out of the query.
+   LOCKED devices are included on purpose: a student whose device got locked
+   mid-exam can no longer submit anything themselves, so when the time ends
+   the answers they had already done (the last autosave) are submitted for
+   them — they are not lost just because nobody unlocked them in time.
+   An admin can still unlock a locked session any time BEFORE the time ends;
+   once it has been auto-submitted it is finished and can no longer be unlocked. */
 async function finalizeExpiredAttempts(pool) {
   const due = await pool.request()
     .input("grace", sql.Int, FINALIZE_GRACE_MINUTES)
     .query(`
-      SELECT es.id AS session_id, es.e_assessment_id, es.student_id, d.answers_json
+      SELECT es.id AS session_id, es.status AS session_status, es.e_assessment_id, es.student_id, d.answers_json
       FROM e_assessment_exam_sessions es
       INNER JOIN e_assessments a ON a.id = es.e_assessment_id
       LEFT JOIN e_assessment_drafts d
         ON d.e_assessment_id = es.e_assessment_id AND d.student_id = es.student_id
-      WHERE es.status = 'active'
+      WHERE es.status IN ('active','locked')
         AND es.activated_at IS NOT NULL
         AND DATEADD(MINUTE, ISNULL(a.duration_minutes, 30) + @grace, es.activated_at) < GETDATE()
     `);
@@ -236,7 +241,7 @@ async function finalizeExpiredAttempts(pool) {
         await pool.request().input("id", sql.Int, row.session_id).query(`
           UPDATE e_assessment_exam_sessions
           SET status = 'ended', ended_at = GETDATE(), auto_submitted = 1
-          WHERE id = @id AND status = 'active'
+          WHERE id = @id AND status IN ('active','locked')
         `);
         continue;
       }
@@ -255,10 +260,10 @@ async function finalizeExpiredAttempts(pool) {
       });
       if (result.ok) {
         submitted++;
-        console.log(`📥 Auto-submitted unfinished exam from autosave (assessment ${row.e_assessment_id}, student ${row.student_id})`);
+        console.log(`📥 Auto-submitted unfinished exam from autosave (assessment ${row.e_assessment_id}, student ${row.student_id}${row.session_status === "locked" ? ", device was LOCKED" : ""})`);
       } else {
         await pool.request().input("id", sql.Int, row.session_id).query(`
-          UPDATE e_assessment_exam_sessions SET status = 'ended', ended_at = GETDATE() WHERE id = @id AND status = 'active'
+          UPDATE e_assessment_exam_sessions SET status = 'ended', ended_at = GETDATE() WHERE id = @id AND status IN ('active','locked')
         `);
       }
     } catch (err) {
