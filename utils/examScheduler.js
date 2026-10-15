@@ -82,7 +82,7 @@ async function activateDueSessions(pool, tenantKey, io) {
   const due = await pool.request()
     .input("now", sql.DateTime, now)
     .query(`
-    SELECT ess.id, ess.main_examination_id, ess.subject,
+    SELECT ess.id, ess.main_examination_id, ess.subject, ess.start_time,
            ea.id AS e_assessment_id, ea.status AS assessment_status,
            ea.title AS assessment_title, ea.class_id, ea.year_of_study
     FROM exam_subject_sessions ess
@@ -119,7 +119,12 @@ async function activateDueSessions(pool, tenantKey, io) {
 
       await pool.request()
         .input("id", sql.Int, row.e_assessment_id)
-        .query(`UPDATE e_assessments SET active_status = 'Active' WHERE id = @id`);
+        .input("now", sql.DateTime, now)
+        .input("start", sql.DateTime, row.start_time || now)
+        .query(`UPDATE e_assessments
+                SET active_status = 'Active',
+                    started_at = DATEADD(SECOND, DATEDIFF(SECOND, @now, @start), GETDATE())
+                WHERE id = @id`);
 
       // Same "exam is now open" notification the existing manual
       // Start/Stop toggle sends (toggleEAssessmentActive in

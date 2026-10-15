@@ -190,6 +190,7 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       ["available_until", "DATETIME NULL"],
       ["schedule_opened_at", "DATETIME NULL"],
       ["schedule_closed_at", "DATETIME NULL"],
+      ["started_at", "DATETIME NULL"], // real timestamp the paper opened — the exam clock runs from here (utils/examClock.js)
     ]) {
       await pool.request().query(`
         IF EXISTS (SELECT * FROM sysobjects WHERE name='e_assessments' AND xtype='U')
@@ -208,6 +209,22 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
         student_id INT NOT NULL,
         created_at DATETIME NOT NULL DEFAULT GETDATE()
       )
+    `);
+    /* DEACTIVATED students (admin E-Assessments > Students tab). A student
+       listed here cannot see, log in to or start ANY e-assessment; their
+       portal account itself is untouched. */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='e_assessment_blocked_students' AND xtype='U')
+      CREATE TABLE e_assessment_blocked_students (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        student_id INT NOT NULL,
+        deactivated_by INT NULL,
+        created_at DATETIME NOT NULL DEFAULT GETDATE()
+      )
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = N'UX_ea_blocked_students' AND object_id = Object_ID(N'e_assessment_blocked_students'))
+      CREATE UNIQUE INDEX UX_ea_blocked_students ON e_assessment_blocked_students (student_id)
     `);
     await pool.request().query(`
       IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = N'UX_ea_allowed_students' AND object_id = Object_ID(N'e_assessment_allowed_students'))

@@ -34,3 +34,18 @@ test("toWallClock keeps typed digits regardless of server timezone", () => {
   assert.strictEqual(ea.toWallClock(""), null);
   assert.ok(ea.fmtWall(ea.toWallClock("2026-10-14T09:05")).startsWith("14 Oct 2026, 09:05"));
 });
+
+test("deactivated student: blocked, even when the account is active and the class matches", () => {
+  const r = ea.evaluateAccess({ ...base, is_deactivated: 1 }, NOW);
+  assert.strictEqual(r.allowed, false);
+  assert.strictEqual(r.code, "DEACTIVATED");
+  assert.strictEqual(ea.evaluateAccess({ ...base, is_deactivated: 0 }, NOW).allowed, true);
+});
+test("deactivated list is enforced in the access check, the permitted list and the student's own list", () => {
+  const fs = require("fs"), path = require("path");
+  const acc = fs.readFileSync(path.join(__dirname, "../utils/examAccess.js"), "utf8");
+  const ctl = fs.readFileSync(path.join(__dirname, "../controllers/eAssessment.controller.js"), "utf8");
+  assert.ok(acc.includes("is_deactivated") && acc.includes("e_assessment_blocked_students"));
+  assert.ok(/NOT EXISTS \(SELECT 1 FROM e_assessment_blocked_students dz\s+WHERE dz\.student_id = st\.id\)/.test(acc), "permitted list excludes them");
+  assert.ok(ctl.includes("dz.student_id = @studentId") && ctl.includes("getStudentsActivation"), "student's own list hides it");
+});

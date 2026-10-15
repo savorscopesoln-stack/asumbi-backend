@@ -21,7 +21,7 @@ const {
 
   // exam session / device lock
   startExamSession, activateExamSession, heartbeatExamSession, endExamSession,
-  setDesktopOnly, getAccessSettings, setAccessSettings, setSecuritySettings, setSebSettings, getSecuritySettings, getActivityLog,
+  setDesktopOnly, getAccessSettings, setAccessSettings, getStudentsActivation, setStudentsActivation, setSecuritySettings, setSebSettings, getSecuritySettings, getActivityLog,
   getExamSessions, unlockExamSession, unlockExamSessionsBulk, getDeviceAccess, allowDevice, revokeDevice, downloadAttendancePdf, examSessionStatus, lockExamSession,
   autosaveExamAnswers, getExamDraft, grantResit, cancelResit, getUnsubmittedSessions,
 
@@ -125,6 +125,8 @@ router.get("/admin/activity-log", protect, requirePage("E-Assessments"), getActi
 router.put("/admin/:id/desktop-only", protect, requirePage("E-Assessments"), setDesktopOnly);
 router.get("/admin/:id/access", protect, requirePage("E-Assessments"), getAccessSettings);
 router.put("/admin/:id/access", protect, requirePage("E-Assessments"), setAccessSettings);
+router.get("/admin/students-activation", protect, requirePage("E-Assessments"), getStudentsActivation);
+router.put("/admin/students-activation/status", protect, requirePage("E-Assessments"), setStudentsActivation);
 router.put("/admin/:id/security", protect, requirePage("E-Assessments"), setSecuritySettings);
 router.put("/admin/:id/seb", protect, requirePage("E-Assessments"), setSebSettings);
 router.get("/admin/device-access", protect, requirePage("E-Assessments"), getDeviceAccess);

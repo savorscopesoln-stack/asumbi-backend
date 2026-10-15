@@ -25,6 +25,7 @@ require("./aiMarkingSchemaFile.test.js");
 require("./aiMarkingTeacher.test.js");
 require("./deviceAccess.test.js");
 require("./examAccess.test.js");
+require("./examClock.test.js");
 require("./sebRestriction.test.js");
 require("./eAssessmentAttendance.test.js");
 require("./assignTeachersBulk.test.js");

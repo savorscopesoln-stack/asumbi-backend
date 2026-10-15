@@ -12,6 +12,7 @@ const { QUESTION_IMAGES_DIR, questionImageUrlFor, deleteQuestionImageByUrl } = r
 const { saveViolationPhoto, violationPhotoUrlFor } = require("../middleware/violationPhotoUpload");
 const { getPool, listTenantKeys } = require("../config/db");
 const { persistAttempt, FINALIZE_GRACE_MINUTES } = require("../utils/examAttempts");
+const { clockStartSql, secondsLeftSql } = require("../utils/examClock");
 const { queryActivityLog } = require("../utils/eAssessmentActivityLog");
 const { generateAttendancePdf } = require("../utils/eAssessmentAttendance");
 const assignmentEngine = require("../utils/assignmentEngine");
@@ -422,7 +423,9 @@ const getEAssessments = async (req, res) => {
         AND ${SQL_ACTIVE_OR_UPCOMING}
         AND (ISNULL(ea.restrict_students, 0) = 0
              OR EXISTS (SELECT 1 FROM e_assessment_allowed_students al
-                        WHERE al.e_assessment_id = ea.id AND al.student_id = @studentId))` : ""}
+                        WHERE al.e_assessment_id = ea.id AND al.student_id = @studentId))
+        AND NOT EXISTS (SELECT 1 FROM e_assessment_blocked_students dz
+                        WHERE dz.student_id = @studentId)` : ""}
       ORDER BY ${isStudent ? `CASE WHEN ${SQL_IS_ACTIVE} THEN 0 ELSE 1 END, ea.available_from ASC, ` : ""}ea.id DESC
     `);
     const rows = (result.recordset || []).map((r) => redactForRole(r, req.user?.role));
@@ -536,20 +539,22 @@ const getEAssessmentById = async (req, res) => {
     // reloading the page or getting locked/unlocked.
     let remaining_seconds = null;
     if (req.user?.role === "student" && req.user.examOnly && req.user.examAssessmentId === assessmentId) {
+      const totalSeconds = (assessment.duration_minutes || 30) * 60;
+      // Time left on the DB clock, anchored to when the PAPER started (not
+      // when this student logged in) — see utils/examClock.js.
       const sessionResult = await pool.request()
         .input("aid", sql.Int, assessmentId)
         .input("sid", sql.Int, req.user.id)
-        .query(`SELECT activated_at FROM e_assessment_exam_sessions WHERE e_assessment_id = @aid AND student_id = @sid`);
-      const activatedAt = sessionResult.recordset[0]?.activated_at;
-      const totalSeconds = (assessment.duration_minutes || 30) * 60;
-      if (activatedAt) {
-        const elapsedSeconds = Math.floor((Date.now() - new Date(activatedAt).getTime()) / 1000);
-        remaining_seconds = Math.max(0, totalSeconds - elapsedSeconds);
-      } else {
-        // Not activated yet (shouldn't normally happen — this endpoint
-        // is only called after activation) — fall back to full duration.
-        remaining_seconds = totalSeconds;
-      }
+        .query(`
+          SELECT ${secondsLeftSql("a", "es")} AS seconds_left
+          FROM e_assessment_exam_sessions es
+          INNER JOIN e_assessments a ON a.id = es.e_assessment_id
+          WHERE es.e_assessment_id = @aid AND es.student_id = @sid AND es.activated_at IS NOT NULL
+        `);
+      const left = sessionResult.recordset[0]?.seconds_left;
+      // Not activated yet (shouldn't normally happen — this endpoint is only
+      // called after activation) — fall back to full duration.
+      remaining_seconds = left == null ? totalSeconds : Math.max(0, Number(left));
     }
 
     const questionResult = await pool.request()
@@ -1459,7 +1464,7 @@ const findOtherLiveSession = async (pool, studentId, assessmentId) => {
         AND es.e_assessment_id <> @aid
         AND es.status = 'active'
         AND es.activated_at IS NOT NULL
-        AND DATEADD(MINUTE, ISNULL(a.duration_minutes, 30) + @grace, es.activated_at) > GETDATE()
+        AND DATEADD(MINUTE, ISNULL(a.duration_minutes, 30) + @grace, ${clockStartSql("a", "es")}) > GETDATE()
       ORDER BY es.activated_at DESC
     `);
   return r.recordset[0] || null;
@@ -1624,6 +1629,23 @@ const activateExamSession = async (req, res) => {
       const access = await checkStudentAccess(pool, row.e_assessment_id, student_id);
       if (!access.allowed) {
         return res.status(409).json({ code: access.code, message: access.message });
+      }
+      // Late arrival: the clock runs from when the paper STARTED, so a student
+      // who only gets in after the paper's time is up has nothing to sit.
+      const timeCheck = await pool.request()
+        .input("aid", sql.Int, row.e_assessment_id)
+        .input("attempt", sql.Int, row.attempt_no || 1)
+        .query(`
+          SELECT CASE WHEN @attempt <= 1 AND a.started_at IS NOT NULL
+                      THEN DATEDIFF(SECOND, GETDATE(), DATEADD(MINUTE, ISNULL(a.duration_minutes, 30), a.started_at)) END AS paper_seconds_left
+          FROM e_assessments a WHERE a.id = @aid
+        `);
+      const paperLeft = timeCheck.recordset[0]?.paper_seconds_left;
+      if (paperLeft != null && Number(paperLeft) <= 0) {
+        return res.status(409).json({
+          code: "PAPER_TIME_OVER",
+          message: "The time for this paper has already ended, so you can no longer start it. Please contact your invigilator or the school office.",
+        });
       }
       // First activation — one live session per student: re-check here too,
       // since two exams could both have been "issued" before either started.
@@ -1812,7 +1834,7 @@ const autosaveExamAnswers = async (req, res) => {
         .input("aid", sql.Int, assessmentId)
         .input("sid", sql.Int, student_id)
         .query(`
-          SELECT DATEDIFF(SECOND, GETDATE(), DATEADD(MINUTE, ISNULL(a.duration_minutes, 30), es.activated_at)) AS seconds_left
+          SELECT ${secondsLeftSql("a", "es")} AS seconds_left
           FROM e_assessment_exam_sessions es
           INNER JOIN e_assessments a ON a.id = es.e_assessment_id
           WHERE es.e_assessment_id = @aid AND es.student_id = @sid
@@ -1862,7 +1884,7 @@ const getExamDraft = async (req, res) => {
         .input("aid", sql.Int, assessmentId)
         .input("sid", sql.Int, student_id)
         .query(`
-          SELECT DATEDIFF(SECOND, GETDATE(), DATEADD(MINUTE, ISNULL(a.duration_minutes, 30), es.activated_at)) AS seconds_left
+          SELECT ${secondsLeftSql("a", "es")} AS seconds_left
           FROM e_assessment_exam_sessions es
           INNER JOIN e_assessments a ON a.id = es.e_assessment_id
           WHERE es.e_assessment_id = @aid AND es.student_id = @sid
@@ -2199,7 +2221,7 @@ const getExamSessions = async (req, res) => {
                    AND (ISNULL(ans.selected_answer, '') <> '' OR LEN(ISNULL(CAST(ans.essay_answer AS NVARCHAR(MAX)), '')) > 0))
              END AS submitted_answer_count,
              CASE WHEN es.status IN ('active','locked') AND es.activated_at IS NOT NULL
-                  THEN DATEDIFF(SECOND, GETDATE(), DATEADD(MINUTE, ISNULL(a.duration_minutes, 30), es.activated_at)) END AS seconds_left,
+                  THEN ${secondsLeftSql("a", "es")} END AS seconds_left,
              CASE WHEN es.last_heartbeat IS NOT NULL THEN DATEDIFF(SECOND, es.last_heartbeat, GETDATE()) END AS last_heartbeat_age,
              d.answered_count AS draft_answered_count
       FROM e_assessment_exam_sessions es
@@ -2896,6 +2918,84 @@ const setAccessSettings = async (req, res) => {
   }
 };
 
+/* =========================================================================
+   ACTIVATE / DEACTIVATE STUDENTS (Admin > E-Assessments > "Students" tab)
+   GET /admin/students-activation -> every student with ALL their details
+        (for searching) + `deactivated` / `account_active` flags.
+   PUT /admin/students-activation/status  body { student_ids: number[], active: bool }
+        active=false -> the student can no longer see / log in to / start ANY
+                        e-assessment (their portal account is untouched)
+        active=true  -> access restored
+   Enforced everywhere access is checked (exam login, the student's list,
+   starting/resuming a session). Someone already typing keeps their open page
+   until they refresh/resume — they cannot start or resume after that.
+========================================================================= */
+const getStudentsActivation = async (req, res) => {
+  try {
+    const r = await req.pool.request().query(`
+      SELECT st.id, st.name, st.admissionNo, st.username, st.studentClass, st.yearOfStudy,
+             st.gender, st.email, st.phone, st.assessmentNumber, st.status,
+             CASE WHEN bz.id IS NULL THEN 0 ELSE 1 END AS deactivated
+      FROM Students st
+      LEFT JOIN e_assessment_blocked_students bz ON bz.student_id = st.id
+      ORDER BY st.studentClass, st.name`);
+    const students = r.recordset.map((s) => ({
+      ...s,
+      deactivated: !!s.deactivated,
+      account_active: isActiveStudent(s.status),
+    }));
+    res.json({ success: true, students });
+  } catch (err) {
+    console.error("GET STUDENTS ACTIVATION ERROR:", err);
+    res.status(500).json({ message: "Failed to load the students" });
+  }
+};
+
+const setStudentsActivation = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const body = req.body || {};
+    if (typeof body.active !== "boolean") {
+      return res.status(400).json({ message: "`active` (true/false) is required" });
+    }
+    const ids = Array.isArray(body.student_ids)
+      ? [...new Set(body.student_ids.map(toInt).filter(Boolean))]
+      : [];
+    if (!ids.length) return res.status(400).json({ message: "Pick at least one student" });
+    if (ids.length > 5000) return res.status(400).json({ message: "Too many students at once (max 5000)" });
+
+    const by = toInt(req.user?.id) || null;
+    const tx = new sql.Transaction(pool);
+    await tx.begin();
+    try {
+      for (const sid of ids) {
+        const rq = new sql.Request(tx).input("sid", sql.Int, sid);
+        if (body.active) {
+          await rq.query(`DELETE FROM e_assessment_blocked_students WHERE student_id = @sid`);
+        } else {
+          await rq.input("by", sql.Int, by).query(`
+            IF NOT EXISTS (SELECT 1 FROM e_assessment_blocked_students WHERE student_id = @sid)
+              INSERT INTO e_assessment_blocked_students (student_id, deactivated_by) VALUES (@sid, @by)`);
+        }
+      }
+      await tx.commit();
+    } catch (txErr) {
+      try { await tx.rollback(); } catch { /* already rolled back */ }
+      throw txErr;
+    }
+
+    res.json({
+      success: true,
+      active: body.active,
+      student_ids: ids,
+      message: `${ids.length} student${ids.length === 1 ? "" : "s"} ${body.active ? "activated" : "deactivated"} for all assessments.`,
+    });
+  } catch (err) {
+    console.error("SET STUDENTS ACTIVATION ERROR:", err);
+    res.status(500).json({ message: "Failed to update the students" });
+  }
+};
+
 const setDesktopOnly = async (req, res) => {
   try {
     const pool = req.pool;
@@ -3167,7 +3267,9 @@ const toggleEAssessmentActive = async (req, res) => {
     const { class_id, year_of_study, title } = current.recordset[0];
     const next = current.recordset[0].active_status === "Active" ? "Inactive" : "Active";
     await pool.request().input("id", sql.Int, id).input("active_status", sql.NVarChar(20), next)
-      .query(`UPDATE e_assessments SET active_status = @active_status WHERE id = @id`);
+      .query(`UPDATE e_assessments
+              SET active_status = @active_status${next === "Active" ? ", started_at = GETDATE()" : ""}
+              WHERE id = @id`);
 
     if (next === "Active" && (class_id || year_of_study)) {
       // A year-wide assessment (year_of_study set) targets every student
@@ -4529,7 +4631,7 @@ const updateGradingSystem = async (req, res) => {
 ========================================================================= */
 module.exports = {
   setDesktopOnly,
-  getAccessSettings,
+  getAccessSettings, getStudentsActivation, setStudentsActivation,
   setAccessSettings,
   setSecuritySettings,
   setSebSettings,

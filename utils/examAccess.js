@@ -45,6 +45,9 @@ function evaluateAccess(row, now = nowAsSchoolWallClock()) {
   if (!isActiveStudent(row.student_status)) {
     return { allowed: false, code: "STUDENT_INACTIVE", message: "Your account isn't active, so you can't take this assessment. Please contact the school office." };
   }
+  if (row.is_deactivated) {
+    return { allowed: false, code: "DEACTIVATED", message: "Your e-assessment access has been deactivated. Please contact your teacher or the school office." };
+  }
   if (row.restrict_students && !row.is_allowed) {
     return { allowed: false, code: "NOT_ALLOWED", message: "You haven't been permitted to sit this assessment. If you think this is a mistake, please contact your teacher or the school office." };
   }
@@ -73,7 +76,11 @@ async function checkStudentAccess(pool, assessmentId, studentId, { skipWindow = 
                CASE WHEN EXISTS (
                  SELECT 1 FROM e_assessment_allowed_students al
                  WHERE al.e_assessment_id = ea.id AND al.student_id = st.id
-               ) THEN 1 ELSE 0 END AS is_allowed
+               ) THEN 1 ELSE 0 END AS is_allowed,
+               CASE WHEN EXISTS (
+                 SELECT 1 FROM e_assessment_blocked_students dz
+                 WHERE dz.student_id = st.id
+               ) THEN 1 ELSE 0 END AS is_deactivated
         FROM e_assessments ea
         INNER JOIN Students st ON st.id = @sid
         WHERE ea.id = @aid
@@ -105,6 +112,8 @@ async function getPermittedStudents(pool, assessmentId) {
       AND (ISNULL(ea.restrict_students, 0) = 0
            OR EXISTS (SELECT 1 FROM e_assessment_allowed_students al
                       WHERE al.e_assessment_id = ea.id AND al.student_id = st.id))
+      AND NOT EXISTS (SELECT 1 FROM e_assessment_blocked_students dz
+                      WHERE dz.student_id = st.id)
     ORDER BY st.name
   `);
   return r.recordset || [];
@@ -124,7 +133,8 @@ async function applyScheduledOpenClose(pool, tenantKey, notify) {
 
   const opened = await pool.request().input("now", sql.DateTime, now).query(`
     UPDATE e_assessments
-    SET active_status = 'Active', schedule_opened_at = @now
+    SET active_status = 'Active', schedule_opened_at = @now,
+        started_at = DATEADD(SECOND, DATEDIFF(SECOND, @now, available_from), GETDATE())
     OUTPUT INSERTED.id, INSERTED.title
     WHERE available_from IS NOT NULL AND available_from <= @now
       AND (available_until IS NULL OR available_until > @now)

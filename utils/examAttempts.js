@@ -1,4 +1,5 @@
 const sql = require("mssql");
+const { clockStartSql } = require("./examClock");
 
 /* =========================================================================
    E-ASSESSMENT ATTEMPTS — shared by the submit endpoint, the autosave
@@ -226,7 +227,7 @@ async function finalizeExpiredAttempts(pool) {
         ON d.e_assessment_id = es.e_assessment_id AND d.student_id = es.student_id
       WHERE es.status IN ('active','locked')
         AND es.activated_at IS NOT NULL
-        AND DATEADD(MINUTE, ISNULL(a.duration_minutes, 30) + @grace, es.activated_at) < GETDATE()
+        AND DATEADD(MINUTE, ISNULL(a.duration_minutes, 30) + @grace, ${clockStartSql("a", "es")}) < GETDATE()
     `);
 
   let submitted = 0;
