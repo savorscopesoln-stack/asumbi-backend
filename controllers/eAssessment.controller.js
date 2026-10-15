@@ -2143,7 +2143,7 @@ const HEARTBEAT_STALE_SECONDS = 60;
 // Turns a raw session row into the grouped/stepped shape the admin screen shows.
 const describeExamSession = (r) => {
   const total = r.total_questions || 0;
-  const answered = r.status === "ended" ? (r.submitted_answer_count || 0) : countDraftAnswers(r.answers_json);
+  const answered = r.status === "ended" ? (r.submitted_answer_count || 0) : (r.draft_answered_count || 0);
   const hbAge = r.last_heartbeat_age == null ? null : Number(r.last_heartbeat_age);
   const connection = r.status === "active"
     ? (hbAge != null && hbAge <= HEARTBEAT_STALE_SECONDS ? "online" : "no_signal")
@@ -2170,7 +2170,7 @@ const describeExamSession = (r) => {
           : "Token issued — hasn't entered yet";
   }
 
-  const { answers_json, last_heartbeat_age, submitted_answer_count, ...rest } = r; // never ship the drafts themselves
+  const { draft_answered_count, last_heartbeat_age, submitted_answer_count, ...rest } = r; // never ship the drafts themselves
   return { ...rest, group, step, step_label: label, answered_count: answered, total_questions: total, connection };
 };
 
@@ -2201,7 +2201,7 @@ const getExamSessions = async (req, res) => {
              CASE WHEN es.status IN ('active','locked') AND es.activated_at IS NOT NULL
                   THEN DATEDIFF(SECOND, GETDATE(), DATEADD(MINUTE, ISNULL(a.duration_minutes, 30), es.activated_at)) END AS seconds_left,
              CASE WHEN es.last_heartbeat IS NOT NULL THEN DATEDIFF(SECOND, es.last_heartbeat, GETDATE()) END AS last_heartbeat_age,
-             d.answers_json
+             d.answered_count AS draft_answered_count
       FROM e_assessment_exam_sessions es
       LEFT JOIN Students st ON st.id = es.student_id
       LEFT JOIN e_assessments a ON a.id = es.e_assessment_id
