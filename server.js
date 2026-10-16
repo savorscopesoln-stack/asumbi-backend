@@ -180,7 +180,16 @@ app.options("*", cors(corsOptions));
 // this one route a bigger limit; it must be registered BEFORE the global
 // parser below, which then skips the already-parsed body.
 app.use("/api/e-assessments/violation-photo", express.json({ limit: "20mb" }));
-app.use(express.json());
+// Body limits. The old default (100 KB) rejected larger requests with
+// "PayloadTooLargeError". Answers (autosave + submit) can carry rich text and
+// music-paper drawings (small PNGs), so they get a big limit; everything else
+// gets a comfortable 2 MB instead of 100 KB.
+const defaultJson = express.json({ limit: "2mb" });
+const answersJson = express.json({ limit: "20mb" });
+app.use((req, res, next) => {
+  const isAnswerRoute = req.method === "POST" && /(^|\/)e-assessments\/(submit|\d+\/autosave)\/?$/.test(req.path);
+  return (isAnswerRoute ? answersJson : defaultJson)(req, res, next);
+});
 app.use(express.urlencoded({ extended: true }));
 
 const upload = multer({ storage: multer.memoryStorage() });
@@ -1830,6 +1839,16 @@ const PORT = process.env.PORT || 5000;
 // a 900-at-once burst — see the accompanying report for the OS-level
 // follow-up options (and note staging here is Windows; confirm your
 // actual production OS before assuming this alone is sufficient).
+// Oversized request bodies: log exactly which route sent one (the raw
+// PayloadTooLargeError stack trace never says) and answer with a clean 413.
+app.use((err, req, res, next) => {
+  if (err && err.type === "entity.too.large") {
+    console.error(`413 PAYLOAD TOO LARGE: ${req.method} ${req.originalUrl} (${err.length || "?"} bytes, limit ${err.limit})`);
+    return res.status(413).json({ message: "That request was too large to process." });
+  }
+  return next(err);
+});
+
 const LISTEN_BACKLOG = process.env.LISTEN_BACKLOG
   ? parseInt(process.env.LISTEN_BACKLOG, 10)
   : 1024;

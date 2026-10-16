@@ -121,6 +121,9 @@ const createEAssessment = async (req, res) => {
     const pool = req.pool;
     const { title, subject, class_id, year_of_study, duration_minutes, instructions, total_marks, exam_password, questions_deadline, question_setter_teacher_ids } = req.body;
     const teacher_id = req.user?.id || null;
+    // A paper whose subject is Music is identified automatically; the teacher
+    // can still send music_paper explicitly (true/false) to override it.
+    const musicPaper = typeof req.body.music_paper === "boolean" ? req.body.music_paper : /music/i.test(String(subject || ""));
 
     if (!title || !subject || !class_id) {
       return res.status(400).json({ message: "Missing required fields" });
@@ -139,12 +142,13 @@ const createEAssessment = async (req, res) => {
       .input("instructions", sql.NVarChar, instructions || "")
       .input("exam_password", sql.NVarChar, (exam_password || "").trim() || null)
       .input("questions_deadline", sql.DateTime, questions_deadline ? new Date(questions_deadline) : null)
+      .input("music_paper", sql.Bit, musicPaper ? 1 : 0)
       .query(`
         INSERT INTO e_assessments
-          (title, subject, class_id, year_of_study, teacher_id, duration_minutes, total_marks, instructions, status, active_status, exam_password, questions_deadline)
+          (title, subject, class_id, year_of_study, teacher_id, duration_minutes, total_marks, instructions, status, active_status, exam_password, questions_deadline, music_paper)
         OUTPUT INSERTED.id
         VALUES
-          (@title, @subject, @class_id, @year_of_study, @teacher_id, @duration_minutes, @total_marks, @instructions, 'pending', 'Inactive', @exam_password, @questions_deadline)
+          (@title, @subject, @class_id, @year_of_study, @teacher_id, @duration_minutes, @total_marks, @instructions, 'pending', 'Inactive', @exam_password, @questions_deadline, @music_paper)
       `);
     // active_status starts explicitly 'Inactive' (never left NULL) so the
     // admin's Start/Stop button and the isActive check on the frontend
@@ -218,6 +222,14 @@ const updateEAssessment = async (req, res) => {
             questions_deadline = @questions_deadline
         WHERE id = @id
       `);
+
+    // Only touch the music-paper flag when the caller explicitly sent it.
+    if (typeof req.body.music_paper === "boolean") {
+      await pool.request()
+        .input("id", sql.Int, id)
+        .input("v", sql.Bit, req.body.music_paper ? 1 : 0)
+        .query(`UPDATE e_assessments SET music_paper = @v WHERE id = @id`);
+    }
 
     // Only touch the setter list when the caller explicitly sent one —
     // an array (including empty, to clear it) replaces the list; omitting
@@ -1809,6 +1821,11 @@ const endExamSession = async (req, res) => {
    client_saved_at is OLDER than what the server already holds is ignored, so
    a late-arriving retry can never overwrite newer answers.
 ========================================================================= */
+/* A drawing (music paper) is stored inside the answer as a PNG data URL.
+   Cap a single answer so one runaway/hand-crafted payload can't bloat the DB. */
+const MAX_ANSWER_CHARS = 6 * 1024 * 1024;
+const answerTooLarge = (val) => typeof val === "string" && val.length > MAX_ANSWER_CHARS;
+
 const autosaveExamAnswers = async (req, res) => {
   try {
     const pool = req.pool;
@@ -1837,6 +1854,10 @@ const autosaveExamAnswers = async (req, res) => {
     if (token && sess.token !== token) return res.status(403).json({ message: "Token does not match this session" });
     if (sess.device_id && device_id && sess.device_id !== device_id) {
       return res.status(423).json({ locked: true, message: "Device mismatch" });
+    }
+
+    if (Object.values(answers).some(answerTooLarge)) {
+      return res.status(413).json({ message: "One of your answers is too large to save. Clear some of the drawing and try again." });
     }
 
     // Keep only non-empty answers, keyed by question id.
@@ -2523,6 +2544,9 @@ const submitEAssessment = async (req, res) => {
       return res.status(400).json({ success: false, message: "Invalid submission payload" });
     }
     if (!student_id) return res.status(401).json({ success: false, message: "Unauthorized" });
+    if (answers.some((a) => answerTooLarge(a?.essay_answer))) {
+      return res.status(413).json({ success: false, message: "One of your answers is too large to submit. Clear some of the drawing and try again." });
+    }
 
     if (req.user?.examOnly && req.user.examAssessmentId !== toInt(assessment_id)) {
       return res.status(403).json({ success: false, message: "This exam session isn't valid for this assessment" });
@@ -3203,6 +3227,46 @@ const getSecuritySettings = async (req, res) => {
     res.status(500).json({ message: "Failed to load the security settings" });
   }
 };
+
+/* =========================================================================
+   MUSIC PAPER SWITCH
+   Identifies a paper as a Music paper (answers need drawing: staves, notes,
+   rests). When ON, students get the drawing pad on this assessment's essay
+   questions. Allowed for admin/sub_admin and for teachers who own / set
+   questions for the assessment (same gate as editing its questions).
+   Can be flipped at any time; students pick it up on their next page load.
+========================================================================= */
+const setMusicPaper = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const id = toInt(req.params.id);
+    if (!id) return res.status(400).json({ message: "Invalid assessment ID" });
+    if (typeof req.body?.enabled !== "boolean") {
+      return res.status(400).json({ message: "`enabled` (true/false) is required" });
+    }
+    const permission = await canManageAssessmentQuestions(pool, req, id);
+    if (!permission.ok) return res.status(permission.status).json({ message: permission.message });
+
+    const enabled = req.body.enabled;
+    const r = await pool.request()
+      .input("id", sql.Int, id)
+      .input("v", sql.Bit, enabled ? 1 : 0)
+      .query(`UPDATE e_assessments SET music_paper = @v WHERE id = @id; SELECT @@ROWCOUNT AS n;`);
+    if (!r.recordset[0]?.n) return res.status(404).json({ message: "Assessment not found" });
+
+    res.json({
+      success: true,
+      music_paper: enabled,
+      message: enabled
+        ? "Music paper is ON — students get the drawing pad on the essay questions."
+        : "Music paper is OFF — students answer with the normal text box only.",
+    });
+  } catch (err) {
+    console.error("SET MUSIC-PAPER ERROR:", err);
+    res.status(500).json({ message: "Failed to update the music paper setting" });
+  }
+};
+
 
 /* =========================================================================
    REJECTED DEVICES + PER-DEVICE ALLOW-LIST (Desktop-only switch)
@@ -4689,6 +4753,7 @@ const updateGradingSystem = async (req, res) => {
 ========================================================================= */
 module.exports = {
   setDesktopOnly,
+  setMusicPaper,
   getAccessSettings, getStudentsActivation, setStudentsActivation,
   setAccessSettings,
   setSecuritySettings,

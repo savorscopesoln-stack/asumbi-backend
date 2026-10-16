@@ -264,6 +264,23 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       ALTER TABLE e_assessments ADD seb_keys NVARCHAR(MAX) NULL
     `);
 
+    /* ---------------- e_assessments.music_paper ----------------
+       Marks an assessment as a Music paper (or any paper whose answers need
+       drawing: staves, notes, rests, diagrams). When 1, the student exam page
+       unlocks the drawing pad on essay questions and the answer is stored as
+       a small PNG inside the essay answer HTML. Set automatically when the
+       subject contains "music" at creation, and can be switched by the
+       teacher/admin at any time. Defaults to 0 so nothing changes for
+       existing assessments. */
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='e_assessments' AND xtype='U')
+      AND NOT EXISTS (
+        SELECT * FROM sys.columns
+        WHERE Name = N'music_paper' AND Object_ID = Object_ID(N'e_assessments')
+      )
+      ALTER TABLE e_assessments ADD music_paper BIT NOT NULL CONSTRAINT DF_e_assessments_music_paper DEFAULT 0
+    `);
+
     /* ---------------- e_assessments.exam_password ----------------
        Lets a student join a single assessment via the standalone
        /take-assessment/:id page (no portal account login) using

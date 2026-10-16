@@ -21,7 +21,7 @@ const {
 
   // exam session / device lock
   startExamSession, activateExamSession, heartbeatExamSession, endExamSession,
-  setDesktopOnly, getAccessSettings, setAccessSettings, getStudentsActivation, setStudentsActivation, setSecuritySettings, setSebSettings, getSecuritySettings, getActivityLog,
+  setDesktopOnly, setMusicPaper, getAccessSettings, setAccessSettings, getStudentsActivation, setStudentsActivation, setSecuritySettings, setSebSettings, getSecuritySettings, getActivityLog,
   getExamSessions, unlockExamSession, unlockExamSessionsBulk, getDeviceAccess, allowDevice, revokeDevice, downloadAttendancePdf, examSessionStatus, lockExamSession,
   autosaveExamAnswers, getExamDraft, grantResit, cancelResit, getUnsubmittedSessions,
 
@@ -123,6 +123,8 @@ router.put("/admin/:id/review", protect, requirePage("E-Assessments"), reviewAss
 router.put("/admin/:id/toggle-active", protect, requirePage("E-Assessments"), toggleEAssessmentActive);
 router.get("/admin/activity-log", protect, requirePage("E-Assessments"), getActivityLog);
 router.put("/admin/:id/desktop-only", protect, requirePage("E-Assessments"), setDesktopOnly);
+// Music paper switch: admin roles AND the teacher who owns the paper (gate is inside the handler).
+router.put("/:id/music-paper", protect, authorize("teacher", "admin", "sub_admin", "sub_admin_2", "module_admin"), setMusicPaper);
 router.get("/admin/:id/access", protect, requirePage("E-Assessments"), getAccessSettings);
 router.put("/admin/:id/access", protect, requirePage("E-Assessments"), setAccessSettings);
 router.get("/admin/students-activation", protect, requirePage("E-Assessments"), getStudentsActivation);
