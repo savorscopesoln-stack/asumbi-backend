@@ -102,6 +102,11 @@ router.get("/:mainExamId/subjects/:id", getSubjectSessionById);
 router.put("/:mainExamId/subjects/:id", updateSubjectSession);
 router.put("/:mainExamId/subjects/:id/assessment", attachAssessment);
 router.delete("/:mainExamId/subjects/:id", deleteSubjectSession);
+// Replay a finished paper for individually selected students only.
+const { getReplayCandidates, grantReplay, cancelReplay } = require("../controllers/examReplay.controller");
+router.get("/:mainExamId/subjects/:id/replay", getReplayCandidates);
+router.post("/:mainExamId/subjects/:id/replay", grantReplay);
+router.post("/:mainExamId/subjects/:id/replay/cancel", cancelReplay);
 
 /* ---------------- Timetable (§5-§6) ---------------- */
 router.get("/:mainExamId/timetable", getTimetable);

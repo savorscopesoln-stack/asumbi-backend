@@ -58,6 +58,8 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       AND NOT EXISTS (SELECT * FROM sys.indexes WHERE name = N'IX_answer_assignments_teacher' AND object_id = Object_ID(N'e_assessment_answer_assignments'))
       CREATE INDEX IX_answer_assignments_teacher ON e_assessment_answer_assignments (teacher_id, e_assessment_id)
     `);
+    // manual split marking: which teacher marks which question (utils/questionSplit.js)
+    await require("./questionSplit").ensureTable(pool);
     await pool.request().query(`
       IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='e_assessment_assignment_batches' AND xtype='U')
       CREATE TABLE e_assessment_assignment_batches (

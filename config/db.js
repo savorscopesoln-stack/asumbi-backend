@@ -126,7 +126,16 @@ class LazyPool {
         // request reconnects instead of reusing a dead pool.
         pool.on("error", (err) => {
           console.error("⚠️ SQL pool error:", err.message);
-          this._pool = null;
+          // Only throw the pool away when it is really disconnected. An
+          // "operation timed out" error is just a request that waited too long
+          // for a free connection (pool busy); the pool itself is still fine.
+          // Discarding it anyway abandoned up to 50 live connections (never
+          // closed) and opened a brand-new pool in the middle of the load —
+          // which is what made one slow spell snowball into repeated timeouts.
+          if (!pool.connected) {
+            if (this._pool === pool) this._pool = null;
+            pool.close().catch(() => {});
+          }
         });
 
         return pool;
