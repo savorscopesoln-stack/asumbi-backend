@@ -155,7 +155,25 @@ async function undoBatch(pool, batchId, userId) {
   let restored = 0, keptMarked = 0, changedSince = 0;
 
   // answers handed to teachers -> take them back (never those already marked)
-  const ans = rows.filter((r) => r.kind === "ans");
+  // answers that MOVED from one teacher to another go back to the previous teacher
+  const moved = rows.filter((r) => r.kind === "ans" && r.prev_teacher_id);
+  const byBoth = {};
+  moved.forEach((r) => { (byBoth[`${r.new_teacher_id}:${r.prev_teacher_id}`] ||= []).push(r.target_id); });
+  for (const [key, ids] of Object.entries(byBoth)) {
+    const [nt, pt] = key.split(":").map(Number);
+    for (const part of chunks(ids, 1000)) {
+      const upd = await pool.request().input("n", sql.Int, nt).input("p", sql.Int, pt).query(`
+        UPDATE ax SET teacher_id = @p
+        OUTPUT inserted.answer_id
+        FROM e_assessment_answer_assignments ax
+        INNER JOIN e_assessment_answers a ON a.id = ax.answer_id
+        WHERE ax.answer_id IN (${part.join(",")}) AND ax.teacher_id = @n AND a.marks_awarded IS NULL`);
+      const back = (upd.recordset || []).length;
+      restored += back;
+      changedSince += part.length - back;
+    }
+  }
+  const ans = rows.filter((r) => r.kind === "ans" && !r.prev_teacher_id);
   const byTeacher = {};
   ans.forEach((r) => { (byTeacher[r.new_teacher_id] ||= []).push(r.target_id); });
   for (const [tid, ids] of Object.entries(byTeacher)) {

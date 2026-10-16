@@ -49,6 +49,23 @@ const SQL_IS_UPCOMING = `(ISNULL(ea.active_status, 'Inactive') <> 'Active'
 const SQL_ACTIVE_OR_UPCOMING = `(${SQL_IS_ACTIVE} OR ${SQL_IS_UPCOMING})`;
 const SQL_SCHEDULE_STATE = `CASE WHEN ${SQL_IS_ACTIVE} THEN 'active' WHEN ${SQL_IS_UPCOMING} THEN 'upcoming' ELSE 'closed' END`;
 
+// A student with an admin-granted resit / replay that hasn't been started yet.
+// Such a student may enter even though the paper is closed (Inactive, or outside
+// its open/close window) — that is the whole point of a replay.
+const hasPendingResit = async (pool, assessmentId, studentId) => {
+  try {
+    const r = await pool.request()
+      .input("aid", sql.Int, assessmentId)
+      .input("sid", sql.Int, studentId)
+      .query(`SELECT 1 AS ok FROM e_assessment_exam_sessions
+              WHERE e_assessment_id = @aid AND student_id = @sid AND resit_allowed = 1 AND status = 'issued'`);
+    return r.recordset.length > 0;
+  } catch (e) {
+    if (e && (e.number === 207 || e.number === 208)) return false; // resit columns not migrated
+    throw e;
+  }
+};
+
 // History must never break the real action it describes.
 const safeRecord = async (pool, args) => { try { return await assignmentEngine.recordBatch(pool, args); } catch (e) { console.error("ASSIGNMENT HISTORY ERROR:", e.message); return null; } };
 const { sendPdfBuffer } = require("../utils/reportExport");
@@ -420,7 +437,8 @@ const getEAssessments = async (req, res) => {
               )
               OR ea.year_of_study = (SELECT yearOfStudy FROM Students WHERE id = @studentId)
             )
-        AND ${SQL_ACTIVE_OR_UPCOMING}
+        AND (${SQL_ACTIVE_OR_UPCOMING}
+             OR (ISNULL(mysess.resit_allowed, 0) = 1 AND mysess.status = 'issued'))
         AND (ISNULL(ea.restrict_students, 0) = 0
              OR EXISTS (SELECT 1 FROM e_assessment_allowed_students al
                         WHERE al.e_assessment_id = ea.id AND al.student_id = @studentId))
@@ -739,8 +757,14 @@ const examLogin = async (req, res) => {
     // can enter — approval status is no longer checked here. Strict
     // comparison on purpose: a NULL active_status is NOT treated as active,
     // matching the student list query in getEAssessments.
+    // Exception: a student who was granted a resit / replay of a closed paper.
+    let replayEntry = false;
     if (assessment.active_status !== "Active") {
-      return res.status(400).json({ success: false, message: "This assessment isn't active right now." });
+      try { replayEntry = await hasPendingResit(pool, assessment.id, student.id); }
+      catch (dbErr) { return respondDbBusy(res, dbErr); }
+      if (!replayEntry) {
+        return res.status(400).json({ success: false, message: "This assessment isn't active right now." });
+      }
     }
 
     // Desktop-only switch: reject phones/tablets before any token is issued.
@@ -754,7 +778,11 @@ const examLogin = async (req, res) => {
     // Trainee access list + open/close window (see utils/examAccess.js).
     // 400 (never 401/403) on purpose — see the note above this function.
     let accessCheck;
-    try { accessCheck = await checkStudentAccess(pool, assessment.id, student.id); }
+    try {
+      // A granted replay is allowed outside the paper's open/close window.
+      const pendingResit = replayEntry || await hasPendingResit(pool, assessment.id, student.id);
+      accessCheck = await checkStudentAccess(pool, assessment.id, student.id, { skipWindow: pendingResit });
+    }
     catch (dbErr) { return respondDbBusy(res, dbErr); }
     if (!accessCheck.allowed) {
       return res.status(400).json({ success: false, code: accessCheck.code, message: accessCheck.message });
@@ -1513,7 +1541,8 @@ const startExamSession = async (req, res) => {
     // (session active) keeps their own timer past the closing time.
     {
       const midExam = existing.recordset[0]?.status === "active";
-      const access = await checkStudentAccess(pool, e_assessment_id, student_id, { skipWindow: midExam });
+      const pendingReplay = !!existing.recordset[0]?.resit_allowed && existing.recordset[0]?.status === "issued";
+      const access = await checkStudentAccess(pool, e_assessment_id, student_id, { skipWindow: midExam || pendingReplay });
       if (!access.allowed) {
         return res.status(409).json({ code: access.code, message: access.message });
       }
@@ -1626,7 +1655,11 @@ const activateExamSession = async (req, res) => {
     if (!row.device_id) {
       // First activation: the access list / window may have changed since the
       // token was issued, so re-check before the clock starts.
-      const access = await checkStudentAccess(pool, row.e_assessment_id, student_id);
+      // An unlocked session (activated_at already set) is a student already
+      // mid-exam coming back, so — like start-exam does for an active session —
+      // the open/close window must not shut them out after the lock.
+      const resumingAfterUnlock = !!row.activated_at;
+      const access = await checkStudentAccess(pool, row.e_assessment_id, student_id, { skipWindow: resumingAfterUnlock || !!row.resit_allowed });
       if (!access.allowed) {
         return res.status(409).json({ code: access.code, message: access.message });
       }
@@ -1657,7 +1690,9 @@ const activateExamSession = async (req, res) => {
           active_assessment_id: otherLive.e_assessment_id,
         });
       }
-      // First activation — bind this device
+      // First activation — bind this device.
+      // activated_at is the original exam start: keep it on a resume after an
+      // unlock (COALESCE) so the session's clock is not reset.
       await pool.request()
         .input("id", sql.Int, row.id)
         .input("device_id", sql.NVarChar(200), device_id)
@@ -1665,9 +1700,19 @@ const activateExamSession = async (req, res) => {
         .query(`
           UPDATE e_assessment_exam_sessions
           SET device_id = @device_id, device_label = @device_label,
-              status = 'active', activated_at = GETDATE(), last_heartbeat = GETDATE()
+              status = 'active', activated_at = ISNULL(activated_at, GETDATE()), last_heartbeat = GETDATE()
           WHERE id = @id
         `);
+      // A newly bound device may have a different clock from the one that wrote
+      // the draft; forget the old client timestamp so its first sync is never
+      // rejected as "older than what the server holds" (answers entered after
+      // the unlock were being dropped, leaving only the pre-lock answers).
+      try {
+        await pool.request()
+          .input("aid", sql.Int, row.e_assessment_id)
+          .input("sid", sql.Int, student_id)
+          .query(`UPDATE e_assessment_drafts SET client_saved_at = NULL WHERE e_assessment_id = @aid AND student_id = @sid`);
+      } catch (_) { /* draft table/column optional — never block activation */ }
       return res.json({ success: true, status: "active" });
     }
 
@@ -1699,6 +1744,16 @@ const heartbeatExamSession = async (req, res) => {
     const pool = req.pool;
     const { token, device_id } = req.body;
     if (!token || !device_id) return res.status(400).json({ message: "token and device_id are required" });
+
+    // Fast path: the normal heartbeat (live session, bound device) is ONE
+    // statement instead of a SELECT then an UPDATE. With hundreds of students
+    // pinging every few seconds this halves the heartbeat load on the pool.
+    const fast = await pool.request()
+      .input("token", sql.Char(6), token)
+      .input("device", sql.NVarChar(200), device_id)
+      .query(`UPDATE e_assessment_exam_sessions SET last_heartbeat = GETDATE()
+              WHERE token = @token AND status = 'active' AND device_id = @device`);
+    if (fast.rowsAffected[0]) return res.json({ locked: false, ended: false });
 
     const result = await pool.request().input("token", sql.Char(6), token)
       .query(`SELECT * FROM e_assessment_exam_sessions WHERE token = @token`);
@@ -2212,8 +2267,8 @@ const getExamSessions = async (req, res) => {
              st.name AS student_name, st.studentClass AS student_class, st.username AS student_username,
              a.title AS assessment_title, a.subject AS subject_name,
              ISNULL(a.duration_minutes, 30) AS duration_minutes,
-             (SELECT COUNT(*) FROM e_assessment_violation_photos vp WHERE vp.session_id = es.id) AS photo_count,
-             (SELECT COUNT(*) FROM e_assessment_questions q WHERE q.e_assessment_id = es.e_assessment_id) AS total_questions,
+             ISNULL(vpc.n, 0) AS photo_count,
+             ISNULL(qc.n, 0) AS total_questions,
              sub.id AS submission_id, sub.submitted_at AS submitted_at,
              CASE WHEN sub.id IS NOT NULL THEN
                (SELECT COUNT(*) FROM e_assessment_answers ans
@@ -2232,6 +2287,9 @@ const getExamSessions = async (req, res) => {
       LEFT JOIN e_assessment_drafts d
              ON d.e_assessment_id = es.e_assessment_id AND d.student_id = es.student_id
             AND es.status IN ('active','locked')
+      -- aggregated once, instead of a correlated COUNT per session row (slow with many students)
+      LEFT JOIN (SELECT session_id, COUNT(*) AS n FROM e_assessment_violation_photos GROUP BY session_id) vpc ON vpc.session_id = es.id
+      LEFT JOIN (SELECT e_assessment_id, COUNT(*) AS n FROM e_assessment_questions GROUP BY e_assessment_id) qc ON qc.e_assessment_id = es.e_assessment_id
       WHERE (es.status IN ('locked','active','issued') OR (es.status = 'ended' AND sub.id IS NOT NULL))
         ${aid ? "AND es.e_assessment_id = @aid" : ""}
       ORDER BY CASE es.status WHEN 'locked' THEN 0 WHEN 'active' THEN 1 WHEN 'issued' THEN 2 ELSE 3 END,
@@ -3699,7 +3757,7 @@ const getSubmissionForMarking = async (req, res) => {
     const answersReq = pool.request().input("id", sql.Int, submissionId);
     if (isTeacherViewer) answersReq.input("teacherId", sql.Int, toInt(req.user.id));
     const answers = await answersReq.query(`
-      SELECT a.id, a.question_id, a.selected_answer, a.essay_answer, a.is_correct, a.marks_awarded, a.highlights, a.highlighted_html,
+      SELECT a.id, a.question_id, a.selected_answer, a.essay_answer, a.is_correct, a.marks_awarded, a.remarks, a.highlights, a.highlighted_html,
              q.question_text, q.correct_answer, q.marks AS max_marks, q.question_type
       FROM e_assessment_answers a
       INNER JOIN e_assessment_questions q ON q.id = a.question_id
@@ -3751,7 +3809,7 @@ const getAllSubmissionsForMarking = async (req, res) => {
       const answersReq = pool.request().input("submissionId", sql.Int, submission.id);
       if (isTeacher) answersReq.input("teacherId", sql.Int, toInt(req.user.id));
       const answersResult = await answersReq.query(`
-        SELECT a.id, a.submission_id, a.question_id, a.essay_answer, a.marks_awarded, a.highlights, a.highlighted_html,
+        SELECT a.id, a.submission_id, a.question_id, a.essay_answer, a.marks_awarded, a.remarks, a.highlights, a.highlighted_html,
        q.question_text, q.question_type, q.marks AS max_marks, q.marking_guide
 FROM e_assessment_answers a
 INNER JOIN e_assessment_questions q ON a.question_id = q.id

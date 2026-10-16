@@ -141,6 +141,11 @@ router.delete("/admin/delete-assignments", protect, requirePage("E-Assessments")
    ADMIN — SUBMISSIONS / ASSIGNMENT
 ========================================================================= */
 router.get("/submissions", protect, requirePage("E-Assessments"), getAllSubmissions);
+// Manual split marking: choose which teacher marks which questions of one assessment.
+const { getSplit, saveSplit, clearSplitRules } = require("../controllers/questionSplit.controller");
+router.get("/admin/assessments/:id/split", protect, requirePage("E-Assessments"), getSplit);
+router.post("/admin/assessments/:id/split", protect, requirePage("E-Assessments"), saveSplit);
+router.delete("/admin/assessments/:id/split", protect, requirePage("E-Assessments"), clearSplitRules);
 router.post("/admin/assign-submission", protect, requirePage("E-Assessments"), assignSubmission);
 router.post("/admin/bulk-assign-submissions", protect, requirePage("E-Assessments"), bulkAssignSubmissions);
 router.post("/admin/smart-distribute", protect, requirePage("E-Assessments"), smartDistribute);

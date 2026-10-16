@@ -189,6 +189,8 @@ async function persistAttempt(pool, { assessmentId, studentId, answers, auto = f
       `);
 
     await transaction.commit();
+    // Manual split marking: send this paper's answers to the teachers the admin named.
+    await require("./questionSplit").applyRulesToSubmission(pool, submissionId);
     return { ok: true, submissionId };
   } catch (err) {
     try { await transaction.rollback(); } catch (_) {}
@@ -225,7 +227,7 @@ async function finalizeExpiredAttempts(pool) {
       INNER JOIN e_assessments a ON a.id = es.e_assessment_id
       LEFT JOIN e_assessment_drafts d
         ON d.e_assessment_id = es.e_assessment_id AND d.student_id = es.student_id
-      WHERE es.status IN ('active','locked')
+      WHERE (es.status IN ('active','locked') OR es.status = 'issued')
         AND es.activated_at IS NOT NULL
         AND DATEADD(MINUTE, ISNULL(a.duration_minutes, 30) + @grace, ${clockStartSql("a", "es")}) < GETDATE()
     `);
@@ -242,7 +244,7 @@ async function finalizeExpiredAttempts(pool) {
         await pool.request().input("id", sql.Int, row.session_id).query(`
           UPDATE e_assessment_exam_sessions
           SET status = 'ended', ended_at = GETDATE(), auto_submitted = 1
-          WHERE id = @id AND status IN ('active','locked')
+          WHERE id = @id AND status IN ('active','locked','issued')
         `);
         continue;
       }
@@ -264,7 +266,7 @@ async function finalizeExpiredAttempts(pool) {
         console.log(`📥 Auto-submitted unfinished exam from autosave (assessment ${row.e_assessment_id}, student ${row.student_id}${row.session_status === "locked" ? ", device was LOCKED" : ""})`);
       } else {
         await pool.request().input("id", sql.Int, row.session_id).query(`
-          UPDATE e_assessment_exam_sessions SET status = 'ended', ended_at = GETDATE() WHERE id = @id AND status IN ('active','locked')
+          UPDATE e_assessment_exam_sessions SET status = 'ended', ended_at = GETDATE() WHERE id = @id AND status IN ('active','locked','issued')
         `);
       }
     } catch (err) {
