@@ -187,7 +187,7 @@ app.use("/api/e-assessments/violation-photo", express.json({ limit: "20mb" }));
 const defaultJson = express.json({ limit: "2mb" });
 const answersJson = express.json({ limit: "20mb" });
 app.use((req, res, next) => {
-  const isAnswerRoute = req.method === "POST" && /(^|\/)e-assessments\/(submit|\d+\/autosave)\/?$/.test(req.path);
+  const isAnswerRoute = req.method === "POST" && /(^|\/)e-assessments\/(submit|\d+\/autosave|save-marking(\/bulk)?)\/?$/.test(req.path);
   return (isAnswerRoute ? answersJson : defaultJson)(req, res, next);
 });
 app.use(express.urlencoded({ extended: true }));
