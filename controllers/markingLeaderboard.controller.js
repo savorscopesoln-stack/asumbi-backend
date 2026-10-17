@@ -42,16 +42,20 @@ const getMarkingLeaderboard = async (req, res) => {
     }
 
     const [scripts, answers, openRows, sessionRows] = await Promise.all([
+      // A whole script allocated to a teacher = one RESPONSE per essay question in it
+      // (13 questions x 30 students = 390 responses), not one item per script.
       bind(pool.request()).query(`
         SELECT aa.teacher_id, s.e_assessment_id,
-               COUNT(*) AS allocated,
-               SUM(CASE WHEN s.status IN ('marked','released') THEN 1 ELSE 0 END) AS marked,
-               SUM(CASE WHEN s.status IN ('marked','released') AND s.marking_completed_at IS NOT NULL THEN 1 ELSE 0 END) AS timed,
+               COUNT(an.id) AS allocated,
+               SUM(CASE WHEN an.marks_awarded IS NOT NULL OR s.status IN ('marked','released') THEN 1 ELSE 0 END) AS marked,
+               SUM(CASE WHEN (an.marks_awarded IS NOT NULL OR s.status IN ('marked','released')) AND an.marked_at IS NOT NULL THEN 1 ELSE 0 END) AS timed,
                MIN(aa.assigned_at) AS first_assigned,
-               MIN(s.marking_completed_at) AS first_marked_at,
-               MAX(s.marking_completed_at) AS last_marked_at
+               MIN(an.marked_at) AS first_marked_at,
+               MAX(an.marked_at) AS last_marked_at
         FROM e_assessment_submission_assignments aa
         INNER JOIN e_assessment_submissions s ON s.id = aa.submission_id
+        INNER JOIN e_assessment_answers an ON an.submission_id = s.id
+        INNER JOIN e_assessment_questions q ON q.id = an.question_id AND q.question_type = 'essay'
         WHERE 1 = 1 ${filter}
         GROUP BY aa.teacher_id, s.e_assessment_id
       `),
