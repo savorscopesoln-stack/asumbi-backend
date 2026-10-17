@@ -159,7 +159,7 @@ router.post("/", authorize("admin", "teacher", "sub_admin", "sub_admin_2"), asyn
     // the request since the DB write already succeeded.
     try {
       const io = req.app.get("io");
-      if (io) io.emit("notification:new", { recipients });
+      if (io) io.to(`tenant:${String(req.tenant || "default").toLowerCase()}`).emit("notification:new", { recipients });
     } catch (_) {}
 
     res.json({ message: `Notification sent to ${recipients.length} recipient(s)` });

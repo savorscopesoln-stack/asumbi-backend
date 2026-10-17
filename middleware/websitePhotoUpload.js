@@ -27,8 +27,8 @@ const multer = require("multer");
    video clip), since a single multer instance has one shared cap.
 ========================================================= */
 
-const WEBSITE_MEDIA_DIR = path.join(__dirname, "..", "uploads", "website");
-fs.mkdirSync(WEBSITE_MEDIA_DIR, { recursive: true });
+const UPLOAD_KIND = "website";
+const { uploadDir, uploadUrl, deleteUploadByUrl } = require("../utils/uploadPaths");
 
 const ALLOWED_IMAGE_MIME = new Set(["image/jpeg", "image/png", "image/webp"]);
 const ALLOWED_IMAGE_EXT = new Set([".jpg", ".jpeg", ".png", ".webp"]);
@@ -44,7 +44,7 @@ const ALLOWED_EXT = new Set([...ALLOWED_IMAGE_EXT, ...ALLOWED_VIDEO_EXT]);
 const MAX_UPLOAD_BYTES = 200 * 1024 * 1024;
 
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, WEBSITE_MEDIA_DIR),
+  destination: (req, file, cb) => cb(null, uploadDir(UPLOAD_KIND, req)),
   filename: (req, file, cb) => {
     const ext = path.extname(file.originalname).toLowerCase();
     const isVideo = ALLOWED_VIDEO_MIME.has(file.mimetype);
@@ -73,21 +73,12 @@ const websiteImageUpload = multer({
 // gallery item's video field); the public website prefixes it with the
 // backend's origin when rendering <img>/<video> src, since the website
 // and backend are separate deployments/domains.
-const websiteImageUrlFor = (filename) => `/uploads/website/${filename}`;
+const websiteImageUrlFor = (filename) => uploadUrl(UPLOAD_KIND, filename);
 
 // Best-effort delete of a previously stored file — used when an admin
 // replaces an image/video. Never throws; a missing/unlinkable file
 // just gets logged.
-const deleteWebsiteImageByUrl = (url) => {
-  if (!url || typeof url !== "string" || !url.startsWith("/uploads/website/")) return;
-  const filename = path.basename(url);
-  const filePath = path.join(WEBSITE_MEDIA_DIR, filename);
-  fs.unlink(filePath, (err) => {
-    if (err && err.code !== "ENOENT") {
-      console.error("WEBSITE MEDIA CLEANUP ERROR:", err.message);
-    }
-  });
-};
+const deleteWebsiteImageByUrl = (url) => deleteUploadByUrl(url, UPLOAD_KIND);
 
 // Promise wrapper so the route can handle a multer error as a normal
 // try/catch JSON 400 rather than needing separate error middleware.

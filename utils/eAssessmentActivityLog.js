@@ -323,7 +323,7 @@ function activityLogger(req, res, next) {
         const actorUsername = user?.username || auditActor?.username || (def.action === "exam_login" ? String(body.username || "").slice(0, 150) : null);
 
         if (def.dedupeMs) {
-          const key = [actorId || actorUsername, def.action, assessmentId, outcome].join("|");
+          const key = [req?.tenant || user?.tenant || "default", actorId || actorUsername, def.action, assessmentId, outcome].join("|");
           if (seenRecently(key, def.dedupeMs)) return;
         }
 

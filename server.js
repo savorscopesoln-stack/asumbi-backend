@@ -12,7 +12,8 @@ const jwt = require("jsonwebtoken");
 
 const path = require("path");
 
-const { poolPromise, sql, getPool, listTenantKeys } = require("./config/db");
+const { runWithTenant } = require("./utils/uploadPaths");
+const { poolPromise, sql, getPool, listTenantKeys, hasTenant } = require("./config/db");
 const { protect, authorize, adminOnly, requirePage } = require("./middleware/authMiddleware");
 const { ensureSchema } = require("./utils/ensureSchema");
 const { photoUrlFor, deletePhotoByUrl, runPhotoUpload } = require("./middleware/photoUpload");
@@ -161,8 +162,26 @@ const io = new Server(server, {
 
 app.set("io", io);
 
+/* Every realtime event is delivered only to sockets of the SAME school.
+   A socket proves its school with its login token — sent in the handshake
+   (auth.token) or later via the "auth" event — and joins room tenant:<key>.
+   Sockets with no valid token join nothing and receive no school events. */
+const tenantRoom = (tenant) => `tenant:${String(tenant || "default").toLowerCase()}`;
+app.set("tenantRoom", tenantRoom);
+const joinTenantRoom = (socket, token) => {
+  try {
+    const decoded = jwt.verify(String(token || ""), process.env.JWT_SECRET || "doravo_core_secret");
+    const t = decoded?.tenant || "default";
+    if (!hasTenant(t)) return;
+    for (const r of socket.rooms) if (String(r).startsWith("tenant:")) socket.leave(r);
+    socket.join(tenantRoom(t));
+  } catch { /* invalid token — stays in no tenant room */ }
+};
+
 io.on("connection", (socket) => {
   console.log("Client connected:", socket.id);
+  if (socket.handshake?.auth?.token) joinTenantRoom(socket, socket.handshake.auth.token);
+  socket.on("auth", (token) => joinTenantRoom(socket, token));
   socket.on("disconnect", () => {
     console.log("Client disconnected:", socket.id);
   });
@@ -205,7 +224,18 @@ const upload = multer({ storage: multer.memoryStorage() });
    Files land on disk via backend/middleware/photoUpload.js under
    backend/uploads/photos; served back out from here so a stored
    photoUrl like "/uploads/photos/xyz.jpg" resolves to a real image. */
-app.use("/uploads", express.static(path.join(__dirname, "uploads")));
+// New files live in uploads/<school>/<kind>/... (see utils/uploadPaths.js).
+// Old URLs without a school segment still resolve to the legacy shared
+// folders until scripts/migrateUploadsToTenantFolders.js has been run — then
+// set LEGACY_UPLOADS=off so those shared folders are no longer served.
+const LEGACY_UPLOAD_KINDS = new Set(["photos", "website", "website-files", "website-videos", "cover-pages", "question-images", "violation-photos"]);
+app.use("/uploads", (req, res, next) => {
+  if (String(process.env.LEGACY_UPLOADS || "").toLowerCase() === "off") {
+    const first = decodeURIComponent(req.path.split("/")[1] || "");
+    if (LEGACY_UPLOAD_KINDS.has(first)) return res.status(404).end();
+  }
+  next();
+}, express.static(path.join(__dirname, "uploads")));
 
 if (process.env.NODE_ENV !== "production") {
   app.use((req, res, next) => {
@@ -245,9 +275,18 @@ app.use(async (req, res, next) => {
   }
 
   try {
+    // A token that names a tenant whose DB isn't configured used to fall back
+    // to the default (Asumbi) DB — so a new school's edits were written to the
+    // WRONG database. Refuse instead of guessing.
+    if (tenant !== "default" && !hasTenant(tenant)) {
+      console.error(`TENANT NOT CONFIGURED: "${tenant}" is in the login token but has no DB config (check DB_TENANTS and DB_*_${String(tenant).toUpperCase()} in .env)`);
+      return res.status(503).json({ message: `This school's database ("${tenant}") is not configured on the server.` });
+    }
     req.tenant = tenant;
     req.pool = await getPool(tenant);
-    next();
+    // Everything downstream (uploads, helpers) can ask "which school is this
+    // request for?" without the request object — see utils/uploadPaths.js.
+    runWithTenant(tenant, next);
   } catch (err) {
     console.error("DB ERROR:", err.message);
     res.status(500).json({ message: "DB connection failed" });

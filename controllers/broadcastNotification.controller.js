@@ -194,7 +194,7 @@ const resolveRecipients = async (pool, { recipientType, recipientIds, studentCla
    updates its status/resultSummary/sentAt. Used both for "send now" and
    by the scheduler for rows whose scheduledFor time has arrived.
 ========================================================================= */
-const dispatchBroadcast = async (pool, io, row) => {
+const dispatchBroadcast = async (pool, io, row, tenantKey = "default") => {
   const channels = parseJsonSafe(row.channels, ["in_app"]);
   const recipientIds = parseJsonSafe(row.recipientIds, []);
 
@@ -292,7 +292,7 @@ const dispatchBroadcast = async (pool, io, row) => {
   // Best-effort realtime ping for in-app badges, same pattern as the
   // existing single-recipient notifications route.
   try {
-    if (io && channels.includes("in_app")) io.emit("notification:new", { recipients });
+    if (io && channels.includes("in_app")) io.to(`tenant:${String(tenantKey || "default").toLowerCase()}`).emit("notification:new", { recipients });
   } catch (_) {}
 
   return { ok: true, summary };
@@ -378,7 +378,7 @@ const createBroadcast = async (req, res) => {
     if (sendNow) {
       const io = req.app.get("io");
       try {
-        const { summary } = await dispatchBroadcast(pool, io, row);
+        const { summary } = await dispatchBroadcast(pool, io, row, req.tenant);
         return res.json({ message: "Notification sent", status: "sent", summary });
       } catch (dispatchErr) {
         // IMPORTANT: this is the fix for "Send now" leaving a row stuck

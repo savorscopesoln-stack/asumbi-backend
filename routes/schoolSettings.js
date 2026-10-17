@@ -23,6 +23,48 @@ const { listReportThemes, DEFAULT_THEME_KEY } = require("../utils/reportThemes")
    grantable "School Settings" page like any other sub-admin page.
 ========================================================= */
 
+/* ── Self-healing School Settings storage ─────────────────────────────
+   ensureSchema() runs once at boot and aborts at its first failure, and it
+   only inserts the id=1 row when it also CREATES the table. A new tenant DB
+   could therefore end up with no table, missing columns, or no id=1 row —
+   and then `UPDATE ... WHERE id = 1` silently changed 0 rows, so the saved
+   details never reached the tenant. Run this (once per tenant per process)
+   before every write so the table, columns and row always exist. */
+const ensuredTenants = new Set();
+async function ensureSchoolSettingsStorage(pool, sql, tenant) {
+  const key = tenant || "default";
+  if (ensuredTenants.has(key)) return;
+  await pool.request().query(`
+    IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='SchoolSettings' AND xtype='U')
+    CREATE TABLE SchoolSettings (
+      id INT PRIMARY KEY,
+      schoolName NVARCHAR(200) NOT NULL DEFAULT '',
+      shortName NVARCHAR(50) NOT NULL DEFAULT '',
+      motto NVARCHAR(300) NULL,
+      centreCode NVARCHAR(50) NULL,
+      address NVARCHAR(300) NULL,
+      phone NVARCHAR(100) NULL,
+      email NVARCHAR(150) NULL,
+      website NVARCHAR(200) NULL,
+      numberOfClasses INT NULL,
+      logoUrl NVARCHAR(500) NULL,
+      updatedAt DATETIME NOT NULL DEFAULT GETDATE(),
+      updatedBy INT NULL
+    );
+    IF NOT EXISTS (SELECT * FROM sys.columns WHERE Name = N'reportTheme' AND Object_ID = Object_ID(N'SchoolSettings'))
+      ALTER TABLE SchoolSettings ADD reportTheme NVARCHAR(30) NULL;
+    IF NOT EXISTS (SELECT * FROM sys.columns WHERE Name = N'stampUrl' AND Object_ID = Object_ID(N'SchoolSettings'))
+      ALTER TABLE SchoolSettings ADD stampUrl NVARCHAR(500) NULL;
+    IF NOT EXISTS (SELECT * FROM sys.columns WHERE Name = N'reportSubjects' AND Object_ID = Object_ID(N'SchoolSettings'))
+      ALTER TABLE SchoolSettings ADD reportSubjects NVARCHAR(MAX) NULL;
+  `);
+  await pool.request().query(`
+    IF NOT EXISTS (SELECT 1 FROM SchoolSettings WHERE id = 1)
+      INSERT INTO SchoolSettings (id, schoolName, shortName) VALUES (1, '', '');
+  `);
+  ensuredTenants.add(key);
+}
+
 module.exports = (poolPromise, sql) => {
   /* ================= GET (public) =================
      Returns { settings, officials } in one call so every consumer
@@ -135,7 +177,9 @@ module.exports = (poolPromise, sql) => {
       // same way as one that never touched this setting.
       const cleanReportSubjects = JSON.stringify(Array.isArray(reportSubjects) ? reportSubjects : []);
 
-      await pool.request()
+      await ensureSchoolSettingsStorage(pool, sql, req.tenant);
+
+      const writeResult = await pool.request()
         .input("schoolName", sql.NVarChar, schoolName)
         .input("shortName", sql.NVarChar, shortName || "")
         .input("motto", sql.NVarChar, motto || null)
@@ -170,6 +214,13 @@ module.exports = (poolPromise, sql) => {
           WHERE id = 1
         `);
 
+      // Never report success if nothing was actually written.
+      const rows = Array.isArray(writeResult.rowsAffected) ? writeResult.rowsAffected.reduce((a, b) => a + b, 0) : 1;
+      if (!rows) {
+        console.error(`SCHOOL SETTINGS UPDATE: 0 rows changed (tenant "${req.tenant}")`);
+        return res.status(500).json({ message: "School details were not saved to this school's database. Please try again." });
+      }
+
       const result = await pool.request().query(`SELECT TOP 1 * FROM SchoolSettings WHERE id = 1`);
       const savedSettings = result.recordset[0] || null;
       if (savedSettings) {
@@ -182,7 +233,7 @@ module.exports = (poolPromise, sql) => {
       }
       res.json({ success: true, settings: savedSettings });
     } catch (err) {
-      console.log("SCHOOL SETTINGS UPDATE ERROR:", err.message);
+      console.log(`SCHOOL SETTINGS UPDATE ERROR (tenant "${req.tenant}"):`, err.message);
       res.status(500).json({ message: "Failed to update school settings" });
     }
   });

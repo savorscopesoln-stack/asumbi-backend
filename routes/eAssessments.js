@@ -22,7 +22,7 @@ const {
 
   // exam session / device lock
   startExamSession, activateExamSession, heartbeatExamSession, endExamSession,
-  setDesktopOnly, setMusicPaper, setModelSheet, getAccessSettings, setAccessSettings, getStudentsActivation, setStudentsActivation, setSecuritySettings, setSebSettings, getSecuritySettings, getActivityLog,
+  setDesktopOnly, setMusicPaper, setModelSheet, getAccessSettings, setAccessSettings, getStudentsActivation, setStudentsActivation, setSecuritySettings, setSebSettings, getSebInfo, downloadSebConfig, getSecuritySettings, getActivityLog,
   getExamSessions, unlockExamSession, unlockExamSessionsBulk, getDeviceAccess, allowDevice, revokeDevice, downloadAttendancePdf, examSessionStatus, lockExamSession,
   autosaveExamAnswers, getExamDraft, grantResit, cancelResit, getUnsubmittedSessions,
 
@@ -243,6 +243,8 @@ router.post("/submissions/:id/request-remark", protect, authorize("student"), re
 // stay above the "/:id" route below so "/public/covers" isn't parsed
 // as an :id.
 router.get("/public/covers", getPublicAssessmentCovers);
+router.get("/public/:id/seb-info", getSebInfo);
+router.get("/public/:id/seb-config", downloadSebConfig);
 
 router.get("/", protect, getEAssessments);
 router.post("/", protect, authorize("teacher"), createEAssessment);

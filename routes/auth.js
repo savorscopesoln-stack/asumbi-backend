@@ -46,43 +46,64 @@ router.post("/login", async (req, res) => {
     let source = null;
     let tenant = null;
 
+    // The same username (e.g. "admin") can exist in several schools' databases.
+    // The old loop stopped at the FIRST tenant that had the username, so a
+    // second school's admin was checked against the wrong school's password
+    // (or, if the passwords happened to match, signed into the wrong school).
+    // Collect every tenant that has the username, then keep only the ones
+    // whose password actually matches.
+    const candidates = [];
+    const wantedTenant = String(req.body?.tenant || req.body?.school || "").trim().toLowerCase();
+
     for (const tenantKey of listTenantKeys()) {
+      if (wantedTenant && tenantKey !== wantedTenant) continue;
       const pool = await getPool(tenantKey);
+      let found = null;
 
       /* ================= USERS ================= */
       const userRes = await pool.request()
         .input("username", sql.NVarChar, username)
         .query("SELECT * FROM Users WHERE username = @username");
-
-      if (userRes.recordset.length > 0) {
-        user = userRes.recordset[0];
-        source = "Users";
-        tenant = tenantKey;
-        break;
-      }
+      if (userRes.recordset.length > 0) found = { user: userRes.recordset[0], source: "Users" };
 
       /* ================= STUDENTS ================= */
-      const studentRes = await pool.request()
-        .input("username", sql.NVarChar, username)
-        .query("SELECT * FROM Students WHERE username = @username");
-
-      if (studentRes.recordset.length > 0) {
-        user = studentRes.recordset[0];
-        source = "Students";
-        tenant = tenantKey;
-        break;
+      if (!found) {
+        const studentRes = await pool.request()
+          .input("username", sql.NVarChar, username)
+          .query("SELECT * FROM Students WHERE username = @username");
+        if (studentRes.recordset.length > 0) found = { user: studentRes.recordset[0], source: "Students" };
       }
 
       /* ================= TEACHERS ================= */
-      const teacherRes = await pool.request()
-        .input("staffId", sql.NVarChar, username)
-        .query("SELECT * FROM Teachers WHERE username = @staffId");
+      if (!found) {
+        const teacherRes = await pool.request()
+          .input("staffId", sql.NVarChar, username)
+          .query("SELECT * FROM Teachers WHERE username = @staffId");
+        if (teacherRes.recordset.length > 0) found = { user: teacherRes.recordset[0], source: "Teachers" };
+      }
 
-      if (teacherRes.recordset.length > 0) {
-        user = teacherRes.recordset[0];
-        source = "Teachers";
-        tenant = tenantKey;
-        break;
+      if (found) candidates.push({ ...found, tenant: tenantKey });
+    }
+
+    let precomputedMatch = null;
+    if (candidates.length === 1) {
+      ({ user, source, tenant } = candidates[0]);
+    } else if (candidates.length > 1) {
+      const matching = [];
+      for (const c of candidates) {
+        if (c.user.password && (await bcrypt.compare(password, c.user.password))) matching.push(c);
+      }
+      if (matching.length > 1) {
+        return res.status(409).json({
+          message: "This username and password exist in more than one school. Please contact support so the account can be told apart.",
+        });
+      }
+      if (matching.length === 1) {
+        ({ user, source, tenant } = matching[0]);
+        precomputedMatch = true;
+      } else {
+        // none match — behave like any wrong password, without hinting which school has the username
+        return res.status(401).json({ message: "Invalid username or password" });
       }
     }
 
@@ -102,7 +123,7 @@ router.post("/login", async (req, res) => {
       });
     }
 
-    const isMatch = await bcrypt.compare(password, user.password);
+    const isMatch = precomputedMatch === true ? true : await bcrypt.compare(password, user.password);
 
     if (!isMatch) {
       return res.status(401).json({

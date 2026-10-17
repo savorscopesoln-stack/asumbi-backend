@@ -179,8 +179,27 @@ const uniqueTenantKeys = [...new Set(tenantKeys)];
 
 const pools = {}; // tenantKey -> LazyPool
 
+const claimedDatabases = new Map(); // "server|port|database" -> tenant key that owns it
 for (const key of uniqueTenantKeys) {
   const cfg = buildConfig(key);
+  // A non-default tenant MUST name its own database. envFor() falls back to the
+  // plain DB_* values, so a tenant with no DB_NAME_<KEY> used to silently
+  // connect to the DEFAULT database and read/write another school's data.
+  if (key !== "default") {
+    const nameVar = `DB_NAME_${key.toUpperCase()}`;
+    if (!process.env[nameVar]) {
+      console.error(`❌ Tenant "${key}" has no ${nameVar}. Refusing to fall back to the default database. Skipping this tenant.`);
+      continue;
+    }
+  }
+  if (cfg.user && cfg.password && cfg.server && cfg.database) {
+    const dbId = `${String(cfg.server).toLowerCase()}|${cfg.port}|${String(cfg.database).toLowerCase()}`;
+    if (claimedDatabases.has(dbId)) {
+      console.error(`❌ Tenant "${key}" points at the same database as tenant "${claimedDatabases.get(dbId)}" (${cfg.database}). Two schools must never share a database. Skipping "${key}".`);
+      continue;
+    }
+    claimedDatabases.set(dbId, key);
+  }
   if (!cfg.user || !cfg.password || !cfg.server || !cfg.database) {
     const label = key === "default" ? "" : `_${key.toUpperCase()}`;
     console.error(
@@ -211,6 +230,11 @@ function getPool(tenantKey) {
   return pools[key] || pools.default;
 }
 
+/** True only when this exact tenant key has a working DB config. */
+function hasTenant(tenantKey) {
+  return Object.prototype.hasOwnProperty.call(pools, String(tenantKey || "default").toLowerCase());
+}
+
 /** All tenant keys that actually have a working DB config, "default" first. */
 function listTenantKeys() {
   return Object.keys(pools);
@@ -221,4 +245,5 @@ module.exports = {
   poolPromise: pools.default, // backward-compatible: existing single-tenant call sites are untouched
   getPool,
   listTenantKeys,
+  hasTenant,
 };

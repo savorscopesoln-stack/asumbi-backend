@@ -14,14 +14,14 @@ const multer = require("multer");
    server.js). Only image mimetypes are accepted, capped at 5MB.
 ========================================================= */
 
-const PHOTOS_DIR = path.join(__dirname, "..", "uploads", "photos");
-fs.mkdirSync(PHOTOS_DIR, { recursive: true });
+const UPLOAD_KIND = "photos";
+const { uploadDir, uploadUrl, deleteUploadByUrl } = require("../utils/uploadPaths");
 
 const ALLOWED_MIME = new Set(["image/jpeg", "image/png", "image/webp"]);
 const ALLOWED_EXT = new Set([".jpg", ".jpeg", ".png", ".webp"]);
 
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, PHOTOS_DIR),
+  destination: (req, file, cb) => cb(null, uploadDir(UPLOAD_KIND, req)),
   filename: (req, file, cb) => {
     const ext = path.extname(file.originalname).toLowerCase() || ".jpg";
     const safeExt = ALLOWED_EXT.has(ext) ? ext : ".jpg";
@@ -45,21 +45,12 @@ const photoUpload = multer({
 
 // Public URL path for a stored photo filename (stored in DB as this,
 // and prefixed with the backend origin on the frontend when rendered).
-const photoUrlFor = (filename) => `/uploads/photos/${filename}`;
+const photoUrlFor = (filename) => uploadUrl(UPLOAD_KIND, filename);
 
 // Best-effort delete of a previously stored photo — used when a photo
 // is replaced or when a registration fails after the file was written.
 // Never throws; a missing/unlinkable file just gets logged.
-const deletePhotoByUrl = (photoUrl) => {
-  if (!photoUrl) return;
-  const filename = path.basename(photoUrl);
-  const filePath = path.join(PHOTOS_DIR, filename);
-  fs.unlink(filePath, (err) => {
-    if (err && err.code !== "ENOENT") {
-      console.error("PHOTO CLEANUP ERROR:", err.message);
-    }
-  });
-};
+const deletePhotoByUrl = (url) => deleteUploadByUrl(url, UPLOAD_KIND);
 
 // Promise wrapper so routes that need the file *and* other validation
 // in one try/catch (e.g. registration, which requires the photo like
@@ -70,4 +61,4 @@ const runPhotoUpload = (req, res) =>
     photoUpload.single("photo")(req, res, (err) => (err ? reject(err) : resolve()));
   });
 
-module.exports = { photoUpload, photoUrlFor, deletePhotoByUrl, runPhotoUpload, PHOTOS_DIR };
+module.exports = { photoUpload, photoUrlFor, deletePhotoByUrl, runPhotoUpload, uploadDir: () => uploadDir(UPLOAD_KIND) };

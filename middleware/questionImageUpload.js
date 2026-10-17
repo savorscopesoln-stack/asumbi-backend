@@ -18,14 +18,14 @@ const multer = require("multer");
    scanned figure without letting one request balloon.
 ========================================================= */
 
-const QUESTION_IMAGES_DIR = path.join(__dirname, "..", "uploads", "question-images");
-fs.mkdirSync(QUESTION_IMAGES_DIR, { recursive: true });
+const UPLOAD_KIND = "question-images";
+const { uploadDir, uploadUrl, deleteUploadByUrl } = require("../utils/uploadPaths");
 
 const ALLOWED_MIME = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
 const ALLOWED_EXT = new Set([".jpg", ".jpeg", ".png", ".webp", ".gif"]);
 
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, QUESTION_IMAGES_DIR),
+  destination: (req, file, cb) => cb(null, uploadDir(UPLOAD_KIND, req)),
   filename: (req, file, cb) => {
     const ext = path.extname(file.originalname).toLowerCase();
     const safeExt = ALLOWED_EXT.has(ext) ? ext : ".jpg";
@@ -47,19 +47,10 @@ const questionImageUpload = multer({
   limits: { fileSize: 8 * 1024 * 1024, files: 6 },
 });
 
-const questionImageUrlFor = (filename) => `/uploads/question-images/${filename}`;
+const questionImageUrlFor = (filename) => uploadUrl(UPLOAD_KIND, filename);
 
 // Best-effort delete of a previously stored question image.
-const deleteQuestionImageByUrl = (url) => {
-  if (!url || typeof url !== "string" || !url.startsWith("/uploads/question-images/")) return;
-  const filename = path.basename(url);
-  const filePath = path.join(QUESTION_IMAGES_DIR, filename);
-  fs.unlink(filePath, (err) => {
-    if (err && err.code !== "ENOENT") {
-      console.error("QUESTION IMAGE CLEANUP ERROR:", err.message);
-    }
-  });
-};
+const deleteQuestionImageByUrl = (url) => deleteUploadByUrl(url, UPLOAD_KIND);
 
 const runQuestionImageUpload = (req, res) =>
   new Promise((resolve, reject) => {
@@ -67,7 +58,7 @@ const runQuestionImageUpload = (req, res) =>
   });
 
 module.exports = {
-  QUESTION_IMAGES_DIR,
+  questionImagesDir: (req) => uploadDir(UPLOAD_KIND, req),
   questionImageUrlFor,
   deleteQuestionImageByUrl,
   runQuestionImageUpload,

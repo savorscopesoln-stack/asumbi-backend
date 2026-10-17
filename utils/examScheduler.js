@@ -161,7 +161,7 @@ async function activateDueSessions(pool, tenantKey, io) {
       });
 
       if (io) {
-        io.emit("main-exam:subject-activated", {
+        io.to(`tenant:${String(tenantKey || "default").toLowerCase()}`).emit("main-exam:subject-activated", {
           mainExaminationId: row.main_examination_id,
           subjectSessionId: row.id,
           subject: row.subject,
@@ -211,7 +211,7 @@ async function endDueSessions(pool, tenantKey, io) {
       });
 
       if (io) {
-        io.emit("main-exam:subject-ended", {
+        io.to(`tenant:${String(tenantKey || "default").toLowerCase()}`).emit("main-exam:subject-ended", {
           mainExaminationId: row.main_examination_id,
           subjectSessionId: row.id,
           subject: row.subject,

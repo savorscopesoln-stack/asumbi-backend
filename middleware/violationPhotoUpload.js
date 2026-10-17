@@ -20,8 +20,8 @@ const path = require("path");
    listing is disabled by Express's static middleware by default.
 ========================================================= */
 
-const VIOLATION_PHOTOS_DIR = path.join(__dirname, "..", "uploads", "violation-photos");
-fs.mkdirSync(VIOLATION_PHOTOS_DIR, { recursive: true });
+const UPLOAD_KIND = "violation-photos";
+const { uploadDir, uploadUrl, deleteUploadByUrl } = require("../utils/uploadPaths");
 
 const DATA_URL_RE = /^data:image\/(jpeg|jpg|png|webp);base64,([A-Za-z0-9+/=]+)$/;
 
@@ -45,10 +45,10 @@ const saveViolationPhoto = (dataUrl) => {
   }
 
   const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}.${ext}`;
-  fs.writeFileSync(path.join(VIOLATION_PHOTOS_DIR, filename), buffer);
+  fs.writeFileSync(path.join(uploadDir(UPLOAD_KIND), filename), buffer);
   return filename;
 };
 
-const violationPhotoUrlFor = (filename) => `/uploads/violation-photos/${filename}`;
+const violationPhotoUrlFor = (filename) => uploadUrl(UPLOAD_KIND, filename);
 
-module.exports = { saveViolationPhoto, violationPhotoUrlFor, VIOLATION_PHOTOS_DIR };
+module.exports = { saveViolationPhoto, violationPhotoUrlFor };

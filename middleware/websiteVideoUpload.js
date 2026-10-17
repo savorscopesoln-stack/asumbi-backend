@@ -19,14 +19,14 @@ const multer = require("multer");
    a short 1-2 minute campus-tour clip easily runs tens of MB.
 ========================================================= */
 
-const WEBSITE_VIDEOS_DIR = path.join(__dirname, "..", "uploads", "website-videos");
-fs.mkdirSync(WEBSITE_VIDEOS_DIR, { recursive: true });
+const UPLOAD_KIND = "website-videos";
+const { uploadDir, uploadUrl, deleteUploadByUrl } = require("../utils/uploadPaths");
 
 const ALLOWED_MIME = new Set(["video/mp4", "video/webm", "video/ogg", "video/quicktime"]);
 const ALLOWED_EXT = new Set([".mp4", ".webm", ".ogg", ".ogv", ".mov"]);
 
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, WEBSITE_VIDEOS_DIR),
+  destination: (req, file, cb) => cb(null, uploadDir(UPLOAD_KIND, req)),
   filename: (req, file, cb) => {
     const ext = path.extname(file.originalname).toLowerCase();
     const safeExt = ALLOWED_EXT.has(ext) ? ext : ".mp4";
@@ -52,21 +52,12 @@ const websiteVideoUpload = multer({
 // section's content_json (e.g. a gallery item's `video` field); the
 // public website prefixes it with the backend's origin when
 // rendering <video src>, same as image fields.
-const websiteVideoUrlFor = (filename) => `/uploads/website-videos/${filename}`;
+const websiteVideoUrlFor = (filename) => uploadUrl(UPLOAD_KIND, filename);
 
 // Best-effort delete of a previously stored video — used when an
 // admin replaces/removes it. Never throws; a missing/unlinkable
 // file just gets logged.
-const deleteWebsiteVideoByUrl = (url) => {
-  if (!url || typeof url !== "string" || !url.startsWith("/uploads/website-videos/")) return;
-  const filename = path.basename(url);
-  const filePath = path.join(WEBSITE_VIDEOS_DIR, filename);
-  fs.unlink(filePath, (err) => {
-    if (err && err.code !== "ENOENT") {
-      console.error("WEBSITE VIDEO CLEANUP ERROR:", err.message);
-    }
-  });
-};
+const deleteWebsiteVideoByUrl = (url) => deleteUploadByUrl(url, UPLOAD_KIND);
 
 // Promise wrapper so the route can handle a multer error as a normal
 // try/catch JSON 400 rather than needing separate error middleware.

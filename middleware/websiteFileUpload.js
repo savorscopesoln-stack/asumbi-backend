@@ -18,8 +18,8 @@ const multer = require("multer");
    handbooks can run several MB, but still bounded.
 ========================================================= */
 
-const WEBSITE_FILES_DIR = path.join(__dirname, "..", "uploads", "website-files");
-fs.mkdirSync(WEBSITE_FILES_DIR, { recursive: true });
+const UPLOAD_KIND = "website-files";
+const { uploadDir, uploadUrl, deleteUploadByUrl } = require("../utils/uploadPaths");
 
 const ALLOWED_MIME = new Set([
   "application/pdf",
@@ -31,7 +31,7 @@ const ALLOWED_MIME = new Set([
 const ALLOWED_EXT = new Set([".pdf", ".doc", ".docx", ".xls", ".xlsx"]);
 
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, WEBSITE_FILES_DIR),
+  destination: (req, file, cb) => cb(null, uploadDir(UPLOAD_KIND, req)),
   filename: (req, file, cb) => {
     const ext = path.extname(file.originalname).toLowerCase();
     const safeExt = ALLOWED_EXT.has(ext) ? ext : ".pdf";
@@ -56,20 +56,11 @@ const websiteFileUpload = multer({
 // Public URL path for a stored document filename. Stored as-is in
 // the "downloads" section's content_json; the public website
 // prefixes it with the backend's origin, same as image fields.
-const websiteFileUrlFor = (filename) => `/uploads/website-files/${filename}`;
+const websiteFileUrlFor = (filename) => uploadUrl(UPLOAD_KIND, filename);
 
 // Best-effort delete of a previously uploaded document — used when
 // an admin replaces/removes a download. Never throws.
-const deleteWebsiteFileByUrl = (url) => {
-  if (!url || typeof url !== "string" || !url.startsWith("/uploads/website-files/")) return;
-  const filename = path.basename(url);
-  const filePath = path.join(WEBSITE_FILES_DIR, filename);
-  fs.unlink(filePath, (err) => {
-    if (err && err.code !== "ENOENT") {
-      console.error("WEBSITE FILE CLEANUP ERROR:", err.message);
-    }
-  });
-};
+const deleteWebsiteFileByUrl = (url) => deleteUploadByUrl(url, UPLOAD_KIND);
 
 const runWebsiteFileUpload = (req, res) =>
   new Promise((resolve, reject) => {

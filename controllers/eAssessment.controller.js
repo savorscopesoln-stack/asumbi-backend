@@ -8,7 +8,7 @@ const { PDFDocument } = require("pdf-lib");
 const { notifyUsers, notifyOne } = require("../utils/notify");
 const { withTransientRetry, isTransientDbError } = require("../utils/transientDbRetry");
 const { coverPageUrlFor, deleteCoverPageByUrl } = require("../middleware/coverPageUpload");
-const { QUESTION_IMAGES_DIR, questionImageUrlFor, deleteQuestionImageByUrl } = require("../middleware/questionImageUpload");
+const { questionImagesDir, questionImageUrlFor, deleteQuestionImageByUrl } = require("../middleware/questionImageUpload");
 const { saveViolationPhoto, violationPhotoUrlFor } = require("../middleware/violationPhotoUpload");
 const { getPool, listTenantKeys } = require("../config/db");
 const { persistAttempt, FINALIZE_GRACE_MINUTES } = require("../utils/examAttempts");
@@ -1216,7 +1216,7 @@ const parseQuestionsDocx = async (req, res) => {
       return res.status(permission.status).json({ message: permission.message });
     }
 
-    fs.mkdirSync(QUESTION_IMAGES_DIR, { recursive: true });
+    const QUESTION_IMAGES_DIR = questionImagesDir(req);
     const extByType = {
       "image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg",
       "image/gif": ".gif", "image/bmp": ".bmp", "image/webp": ".webp",
@@ -3155,6 +3155,100 @@ const setDesktopOnly = async (req, res) => {
 
 
 /* =========================================================================
+   SAFE EXAM BROWSER — auto-launch support (public, no login: a student hits
+   these before signing in).
+     GET /e-assessments/public/:id/seb-info    -> { require_seb }
+     GET /e-assessments/public/:id/seb-config  -> .seb file. Opening it makes
+        the INSTALLED Safe Exam Browser start and load this exam's page.
+   The config is deterministic (no timestamps) so its SEB Config Key stays
+   stable; it holds nothing secret — just the exam's start URL.
+========================================================================= */
+const zlib = require("zlib");
+
+const findAssessmentAnyTenant = async (id) => {
+  for (const tenantKey of listTenantKeys()) {
+    try {
+      const pool = await getPool(tenantKey);
+      const r = await pool.request().input("id", sql.Int, id)
+        .query("SELECT id, title, ISNULL(require_seb,0) AS require_seb FROM e_assessments WHERE id = @id");
+      if (r.recordset[0]) return r.recordset[0];
+    } catch (e) { /* try next tenant */ }
+  }
+  return null;
+};
+
+const getSebInfo = async (req, res) => {
+  try {
+    const id = toInt(req.params.id);
+    if (!id) return res.status(400).json({ message: "Invalid assessment ID" });
+    const a = await findAssessmentAnyTenant(id);
+    res.set("Cache-Control", "no-store");
+    return res.json({ require_seb: !!(a && a.require_seb) });
+  } catch (err) {
+    console.error("GET SEB INFO ERROR:", err.message);
+    return res.json({ require_seb: false });
+  }
+};
+
+const xmlEsc = (v) => String(v).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+const downloadSebConfig = async (req, res) => {
+  try {
+    const id = toInt(req.params.id);
+    if (!id) return res.status(400).json({ message: "Invalid assessment ID" });
+    const a = await findAssessmentAnyTenant(id);
+    if (!a) return res.status(404).json({ message: "Assessment not found" });
+
+    // Student site origin: ?origin= is honoured only if it is in FRONTEND_URL.
+    const allowed = String(process.env.FRONTEND_URL || "http://localhost:5173")
+      .split(",").map((o) => o.trim().replace(/\/+$/, "")).filter(Boolean);
+    const asked = String(req.query.origin || "").trim().replace(/\/+$/, "");
+    const origin = allowed.includes(asked) ? asked : allowed[0];
+    const startURL = `${origin}/take-assessment/${id}`;
+
+    const bool = (k, v) => `<key>${k}</key><${v ? "true" : "false"}/>`;
+    const plist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>startURL</key><string>${xmlEsc(startURL)}</string>
+<key>sendBrowserExamKey</key><true/>
+<key>examSessionClearCookiesOnStart</key><true/>
+<key>allowQuit</key><true/>
+<key>quitURL</key><string>${xmlEsc(origin)}/take-assessment</string>
+<key>quitURLConfirm</key><false/>
+<key>URLFilterEnable</key><false/>
+<key>enableURLFilter</key><false/>
+${bool("allowSpellCheck", false)}
+${bool("enableClipboard", false)}
+${bool("allowCopy", false)}
+${bool("allowPaste", false)}
+${bool("enableRightMouse", false)}
+${bool("enablePrintScreen", false)}
+${bool("allowScreenSharing", false)}
+${bool("allowVirtualMachine", false)}
+${bool("showTaskBar", true)}
+${bool("showReloadButton", false)}
+${bool("browserWindowAllowReload", false)}
+<key>mainBrowserWindowWidth</key><string>100%</string>
+<key>mainBrowserWindowHeight</key><string>100%</string>
+<key>browserViewMode</key><integer>1</integer>
+</dict></plist>`;
+
+    // .seb = gzip( "plnd" + plist )  (plnd = plain, unencrypted data)
+    const body = zlib.gzipSync(Buffer.from("plnd" + plist, "utf8"), { mtime: 0 });
+    res.set({
+      "Content-Type": "application/seb",
+      "Content-Disposition": `attachment; filename="exam-${id}.seb"`,
+      "Cache-Control": "no-store",
+    });
+    return res.send(body);
+  } catch (err) {
+    console.error("SEB CONFIG ERROR:", err.message);
+    return res.status(500).json({ message: "Could not build the SEB file" });
+  }
+};
+
+/* =========================================================================
    SAFE EXAM BROWSER switch + allowed keys (see utils/sebRestriction.js)
    Body: { enabled?: boolean, keys?: string }  — keys = one Config Key /
    Browser Exam Key (64 hex chars) per line; "" clears them.
@@ -4892,6 +4986,8 @@ module.exports = {
   setAccessSettings,
   setSecuritySettings,
   setSebSettings,
+  getSebInfo,
+  downloadSebConfig,
   getSecuritySettings,
   getActivityLog,
   // core

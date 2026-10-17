@@ -27,7 +27,7 @@ const startNotificationScheduler = (getPool, listTenantKeys, io, dispatchBroadca
 
         for (const row of due.recordset || []) {
           try {
-            await dispatchBroadcast(pool, io, row);
+            await dispatchBroadcast(pool, io, row, tenantKey);
             console.log(`📣 Scheduled notification #${row.id} dispatched (tenant "${tenantKey}")`);
           } catch (err) {
             console.error(`⚠️ Scheduled notification #${row.id} failed (tenant "${tenantKey}"):`, err.message);
