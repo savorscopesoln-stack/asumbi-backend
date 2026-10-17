@@ -32,6 +32,7 @@ const {
   topUpAiMarkingWallet,
   reverseAiMarkingEntry,
 } = require("../controllers/aiMarkingFinance.controller");
+const { getTrial, setTrial, clearTrial } = require("../controllers/financeTrial.controller");
 const analytics = require("../controllers/aiMarkingAnalytics.controller");
 const { finance: aiFinanceLimit } = require("../middleware/aiMarkingRateLimit");
 
@@ -85,6 +86,11 @@ router.get("/institutions/:tenantKey/ai-marking/pricing", listAiMarkingPricing);
 router.post("/institutions/:tenantKey/ai-marking/pricing", setAiMarkingPricing);
 router.post("/institutions/:tenantKey/ai-marking/topup", topUpAiMarkingWallet);
 router.post("/institutions/:tenantKey/ai-marking/ledger/:ledgerId/reverse", reverseAiMarkingEntry);
+
+/* Trial period — shows as a live countdown on the institution's own side. */
+router.get("/institutions/:tenantKey/trial", getTrial);
+router.post("/institutions/:tenantKey/trial", setTrial);
+router.delete("/institutions/:tenantKey/trial", clearTrial);
 
 router.post("/mfa/enroll", enrollMfa);
 router.post("/mfa/confirm", confirmMfa);

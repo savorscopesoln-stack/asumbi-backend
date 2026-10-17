@@ -19,6 +19,8 @@ require("./regression.test.js");
 require("./walletLedger.test.js");
 require("./walletController.test.js");
 require("./financeInvoicing.test.js");
+require("./tenantControl.test.js");
+require("./customInvoice.test.js");
 require("./aiMarkingLedger.test.js");
 require("./aiMarkingFinance.test.js");
 require("./aiMarkingSchemaFile.test.js");

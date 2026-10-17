@@ -7,7 +7,7 @@ router.get("/", async (req, res) => {
 
     // USERS COUNT
     const users = await pool.request()
-      .query("SELECT COUNT(*) AS count FROM Users");
+      .query("SELECT COUNT(*) AS count FROM Users WHERE ISNULL(isMaster, 0) = 0");
 
     // STUDENTS COUNT
     const students = await pool.request()
@@ -38,6 +38,7 @@ router.get("/", async (req, res) => {
       .query(`
         SELECT role, COUNT(*) AS count
         FROM Users
+        WHERE ISNULL(isMaster, 0) = 0
         GROUP BY role
       `);
 

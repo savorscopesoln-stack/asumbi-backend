@@ -80,7 +80,7 @@ module.exports = (poolPromise, sql) => {
     try {
       const r = await pool.request()
         .input("role", sql.NVarChar, role)
-        .query(`SELECT id, COALESCE(NULLIF(name, ''), username) AS name FROM Users WHERE LOWER(role) = LOWER(@role)`);
+        .query(`SELECT id, COALESCE(NULLIF(name, ''), username) AS name FROM Users WHERE LOWER(role) = LOWER(@role) AND ISNULL(isMaster, 0) = 0`);
       return (r.recordset || []).map((u) => ({ id: u.id, source: "Users" }));
     } catch (err) {
       console.log("GET USERS BY ROLE ERROR:", err.message);

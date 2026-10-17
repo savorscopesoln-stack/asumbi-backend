@@ -47,10 +47,11 @@ const createInvoice = async (req, res) => {
   try {
     const { tenantKey } = req.params;
     assertValidTenant(tenantKey);
-    const { creditQuantity, unitPrice, currency, taxRate, dueDate, notes } = req.body || {};
+    const { invoiceType, items, creditQuantity, unitPrice, currency, taxRate, dueDate, notes } = req.body || {};
     const pool = await getPool(tenantKey);
     const profile = await loadInstitutionProfile(pool);
     const invoice = await invoicing.createInvoice(pool, {
+      invoiceType: invoiceType === "custom" ? "custom" : "credits", items,
       creditQuantity, unitPrice, currency, taxRate, dueDate, notes,
       billTo: { name: profile?.schoolName || tenantKey, email: profile?.email, phone: profile?.phone },
       issuedBy: req.user?.id || null,

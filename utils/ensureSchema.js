@@ -2714,6 +2714,34 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       ON finance_invoices(invoice_number) WHERE invoice_number IS NOT NULL
     `);
 
+    /* ---------------- finance_invoices: "other charges" invoices ----------------
+       An invoice is either 'credits' (exam credits: quantity x unit price, the
+       original shape) or 'custom' (anything else Finance charges for: the
+       lines are typed in by Finance and stored as JSON in items_json).
+       Custom invoices carry credit_quantity = 0 and unit_price = their
+       subtotal, so every existing report/total keeps working. The old
+       "quantity > 0" CHECK is replaced by one that allows 0 for custom. */
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='finance_invoices' AND xtype='U')
+      AND NOT EXISTS (SELECT * FROM sys.columns WHERE Name = N'invoice_type' AND Object_ID = Object_ID(N'finance_invoices'))
+      ALTER TABLE finance_invoices ADD invoice_type NVARCHAR(20) NOT NULL CONSTRAINT DF_finance_invoices_type DEFAULT 'credits'
+    `);
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='finance_invoices' AND xtype='U')
+      AND NOT EXISTS (SELECT * FROM sys.columns WHERE Name = N'items_json' AND Object_ID = Object_ID(N'finance_invoices'))
+      ALTER TABLE finance_invoices ADD items_json NVARCHAR(MAX) NULL
+    `);
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sys.check_constraints WHERE name = N'CK_finance_invoices_quantity')
+      ALTER TABLE finance_invoices DROP CONSTRAINT CK_finance_invoices_quantity
+    `);
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='finance_invoices' AND xtype='U')
+      AND NOT EXISTS (SELECT * FROM sys.check_constraints WHERE name = N'CK_finance_invoices_quantity_v2')
+      ALTER TABLE finance_invoices ADD CONSTRAINT CK_finance_invoices_quantity_v2
+        CHECK (credit_quantity > 0 OR (invoice_type = 'custom' AND credit_quantity = 0))
+    `);
+
     /* ---------------- finance_receipts ----------------
        One receipt per confirmed payment (unique index on
        institution_payment_id makes generation idempotent — a retry or

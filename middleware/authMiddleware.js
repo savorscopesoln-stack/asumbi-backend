@@ -2,6 +2,39 @@ const jwt = require("jsonwebtoken");
 require("dotenv").config();
 
 /* =========================================================
+   TRIAL EXPIRY GATE
+   When an institution's trial period (set by Doravo Finance) has ended, its
+   staff can still read and sign out, but every change (POST/PUT/PATCH/DELETE)
+   is refused with code TRIAL_EXPIRED; the frontend greys the screen out.
+   Never blocked: Finance accounts, the master admin, auth, the finance and
+   tenant-license endpoints, and students/exam sessions (so a paper in
+   progress is never lost when the trial ends mid-exam). Fails OPEN — if the
+   license can't be read, the request goes through.
+========================================================= */
+const TRIAL_EXEMPT_PREFIXES = ["/api/auth", "/api/finance", "/api/tenant"];
+const trialGate = async (req, res, next) => {
+  try {
+    if (["GET", "HEAD", "OPTIONS"].includes(req.method)) return next();
+    const role = req.user.role;
+    if (role === "finance" || role === "student" || req.user.isMaster || req.user.examOnly) return next();
+    const url = req.originalUrl.split("?")[0];
+    if (TRIAL_EXEMPT_PREFIXES.some((p) => url === p || url.startsWith(p + "/"))) return next();
+    if (!req.pool) return next();
+    const { isTrialExpired } = require("../utils/tenantLicense");
+    if (await isTrialExpired(req.pool, req.user.tenant)) {
+      return res.status(403).json({
+        success: false,
+        code: "TRIAL_EXPIRED",
+        message: "Your trial period has ended. Please contact Doravo to continue.",
+      });
+    }
+  } catch (err) {
+    console.error("TRIAL GATE ERROR (allowing request):", err.message);
+  }
+  next();
+};
+
+/* =========================================================
    PROTECT MIDDLEWARE
 ========================================================= */
 const protect = (req, res, next) => {
@@ -95,6 +128,7 @@ const protect = (req, res, next) => {
         `undefined`, so a student could never actually start an exam
         even after a correct exam-password login.
       */
+      isMaster: !!decoded?.isMaster, // the protected platform account (utils/masterAdmin.js)
       examOnly: !!decoded?.examOnly,
       examAssessmentId: decoded?.examAssessmentId ?? null,
     };
@@ -146,7 +180,7 @@ const protect = (req, res, next) => {
       });
     }
 
-    next();
+    return trialGate(req, res, next);
   } catch (err) {
     console.log("❌ JWT ERROR:", err.message);
 

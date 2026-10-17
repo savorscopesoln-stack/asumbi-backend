@@ -37,9 +37,10 @@ router.get("/", async (req, res) => {
       query = `
         SELECT id, username, email, role
         FROM Users
-        WHERE username LIKE @q
+        WHERE ISNULL(isMaster, 0) = 0
+        AND (username LIKE @q
         OR email LIKE @q
-        OR role LIKE @q
+        OR role LIKE @q)
       `;
     }
 

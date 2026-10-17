@@ -59,7 +59,7 @@ async function safeRollback(transaction) {
 const INVOICE_COLUMNS = `
   id, invoice_number, credit_quantity, unit_price, currency, subtotal, tax_rate, tax_amount,
   total_amount, status, issue_date, due_date, notes, bill_to_name, bill_to_email, bill_to_phone,
-  institution_payment_id, paid_at, voided_at, void_reason, issued_by
+  institution_payment_id, paid_at, voided_at, void_reason, issued_by, invoice_type, items_json
 `;
 
 async function getInvoice(pool, invoiceId) {
@@ -105,6 +105,37 @@ async function listReceipts(pool) {
 
 /* ---------------- create invoice ---------------- */
 
+const MAX_CUSTOM_ITEMS = 20;
+
+/* Validates and prices the lines of an "other charges" invoice.
+   items: [{ description, quantity, unitPrice }] -> normalised lines + subtotal. */
+function buildCustomItems(items) {
+  if (!Array.isArray(items) || items.length === 0) {
+    throw new InvoiceError("Add at least one item to charge for", "ITEMS_REQUIRED");
+  }
+  if (items.length > MAX_CUSTOM_ITEMS) {
+    throw new InvoiceError(`An invoice can have at most ${MAX_CUSTOM_ITEMS} items`, "TOO_MANY_ITEMS");
+  }
+  let subtotal = 0;
+  const lines = items.map((raw, i) => {
+    const description = String(raw?.description ?? "").trim();
+    if (!description) throw new InvoiceError(`Item ${i + 1}: say what you are charging for`, "ITEM_DESCRIPTION_REQUIRED");
+    if (description.length > 200) throw new InvoiceError(`Item ${i + 1}: description is too long (max 200 characters)`, "ITEM_DESCRIPTION_TOO_LONG");
+    const quantity = Number(raw?.quantity);
+    if (!Number.isFinite(quantity) || quantity <= 0 || quantity > 1000000 || money(quantity) !== quantity) {
+      throw new InvoiceError(`Item ${i + 1}: quantity must be greater than zero (up to 2 decimals)`, "INVALID_QUANTITY");
+    }
+    const unitPrice = Number(raw?.unitPrice);
+    if (!Number.isFinite(unitPrice) || unitPrice <= 0) {
+      throw new InvoiceError(`Item ${i + 1}: unit price must be greater than zero`, "INVALID_UNIT_PRICE");
+    }
+    const amount = money(quantity * unitPrice);
+    subtotal = money(subtotal + amount);
+    return { description, quantity, unit_price: money(unitPrice), amount };
+  });
+  return { lines, subtotal };
+}
+
 /**
  * @param {object} args
  * @param {number} args.creditQuantity  positive integer
@@ -113,18 +144,34 @@ async function listReceipts(pool) {
  * @param {number} [args.taxRate]       percent, 0-100, default 0
  * @param {string|null} [args.dueDate]  YYYY-MM-DD
  * @param {object} [args.billTo]        { name, email, phone } snapshot of the institution
+ * @param {string} [args.invoiceType]   "credits" (default) or "custom" (other charges)
+ * @param {Array}  [args.items]         custom only: [{ description, quantity, unitPrice }]
  */
 async function createInvoice(pool, {
+  invoiceType = "credits", items = null,
   creditQuantity, unitPrice, currency = "KES", taxRate = 0, dueDate = null,
   notes = null, billTo = {}, issuedBy = null, actorRole = null,
 }) {
-  const quantity = Number(creditQuantity);
-  if (!Number.isInteger(quantity) || quantity <= 0) {
-    throw new InvoiceError("Credit quantity must be a positive whole number", "INVALID_QUANTITY");
+  const isCustom = invoiceType === "custom";
+  if (invoiceType !== "credits" && !isCustom) {
+    throw new InvoiceError("Invoice type must be 'credits' or 'custom'", "INVALID_TYPE");
   }
-  const price = Number(unitPrice);
-  if (!Number.isFinite(price) || price <= 0) {
-    throw new InvoiceError("Unit price must be greater than zero", "INVALID_UNIT_PRICE");
+  let quantity = 0, price = 0, subtotal = 0, itemsJson = null;
+  if (isCustom) {
+    const built = buildCustomItems(items);
+    subtotal = built.subtotal;
+    price = subtotal; // single aggregate "unit price" keeps the amount CHECK + reports valid
+    itemsJson = JSON.stringify(built.lines);
+  } else {
+    quantity = Number(creditQuantity);
+    if (!Number.isInteger(quantity) || quantity <= 0) {
+      throw new InvoiceError("Credit quantity must be a positive whole number", "INVALID_QUANTITY");
+    }
+    price = Number(unitPrice);
+    if (!Number.isFinite(price) || price <= 0) {
+      throw new InvoiceError("Unit price must be greater than zero", "INVALID_UNIT_PRICE");
+    }
+    subtotal = money(quantity * price);
   }
   const rate = Number(taxRate ?? 0);
   if (!Number.isFinite(rate) || rate < 0 || rate > 100) {
@@ -142,7 +189,6 @@ async function createInvoice(pool, {
     due = String(dueDate);
   }
 
-  const subtotal = money(quantity * price);
   const taxAmount = money((subtotal * rate) / 100);
   const total = money(subtotal + taxAmount);
 
@@ -164,14 +210,16 @@ async function createInvoice(pool, {
       .input("billEmail", sql.NVarChar(200), billTo.email || null)
       .input("billPhone", sql.NVarChar(50), billTo.phone || null)
       .input("issuedBy", sql.Int, issuedBy)
+      .input("invoiceType", sql.NVarChar(20), isCustom ? "custom" : "credits")
+      .input("itemsJson", sql.NVarChar(sql.MAX), itemsJson)
       .query(`
         INSERT INTO finance_invoices
           (credit_quantity, unit_price, currency, subtotal, tax_rate, tax_amount, total_amount,
-           status, due_date, notes, bill_to_name, bill_to_email, bill_to_phone, issued_by)
+           status, due_date, notes, bill_to_name, bill_to_email, bill_to_phone, issued_by, invoice_type, items_json)
         OUTPUT INSERTED.id, INSERTED.issue_date
         VALUES
           (@quantity, @unitPrice, @currency, @subtotal, @taxRate, @taxAmount, @total,
-           'issued', @dueDate, @notes, @billName, @billEmail, @billPhone, @issuedBy)
+           'issued', @dueDate, @notes, @billName, @billEmail, @billPhone, @issuedBy, @invoiceType, @itemsJson)
       `);
     invoiceId = inserted.recordset[0].id;
     const invoiceNumber = formatDocNumber("INV", invoiceId, inserted.recordset[0].issue_date ? new Date(inserted.recordset[0].issue_date) : new Date());
@@ -191,7 +239,9 @@ async function createInvoice(pool, {
     actorId: issuedBy, actorRole,
     details: {
       invoice_id: invoiceId, invoice_number: invoice?.invoice_number,
-      credit_quantity: quantity, unit_price: money(price), total_amount: total, currency: cur,
+      invoice_type: isCustom ? "custom" : "credits",
+      ...(isCustom ? { items: JSON.parse(itemsJson) } : { credit_quantity: quantity, unit_price: money(price) }),
+      total_amount: total, currency: cur,
     },
   });
   return invoice;
@@ -453,4 +503,5 @@ module.exports = {
   listReceipts,
   ensureReceiptForPayment,
   formatDocNumber,
+  buildCustomItems,
 };

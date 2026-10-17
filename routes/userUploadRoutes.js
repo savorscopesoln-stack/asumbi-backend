@@ -14,6 +14,7 @@ router.get("/", async (req, res) => {
         username,
         role
       FROM Users
+      WHERE ISNULL(isMaster, 0) = 0
     `);
 
     res.json(result.recordset);

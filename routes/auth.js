@@ -195,6 +195,7 @@ router.post("/login", async (req, res) => {
         tenant,
         mustChangePassword,
         profileIncomplete,
+        isMaster: !!user.isMaster,
       },
       process.env.JWT_SECRET || "doravo_core_secret",
       { expiresIn: "1d" }
@@ -215,6 +216,7 @@ router.post("/login", async (req, res) => {
         photoUrl: user.photoUrl || null,
         mustChangePassword,
         profileIncomplete,
+        isMaster: !!user.isMaster,
       }
     });
 

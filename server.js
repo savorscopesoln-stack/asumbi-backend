@@ -31,7 +31,14 @@ const { photoUrlFor, deletePhotoByUrl, runPhotoUpload } = require("./middleware/
 // others or crash boot.
 const schemaReadyPromises = listTenantKeys().map((tenantKey) =>
   getPool(tenantKey)
-    .then((pool) => ensureSchema(pool, sql, tenantKey))
+    .then(async (pool) => {
+      await ensureSchema(pool, sql, tenantKey);
+      // Run even if an earlier schema step logged a failure above — the user
+      // listings below filter on Users.isMaster, so that column must exist.
+      // Trial table (set by Doravo Finance) + protected master admin account/trigger; neither throws.
+      await require("./utils/tenantLicense").ensureTenantLicenseSchema(pool);
+      await require("./utils/masterAdmin").ensureMasterAdmin(pool, sql, tenantKey);
+    })
     .catch((err) =>
       console.error(`Schema ensure skipped (tenant "${tenantKey}"):`, err.message)
     )
@@ -299,6 +306,7 @@ app.use("/api/attendance", protect, attendanceRoutes);
 app.use("/api/e-assessments/ai-marking", require("./routes/aiMarkingTeacher"));
 app.use("/api/e-assessments", eAssessmentRoutes); // already protects internally
 app.use("/api/main-exams", mainExamsRoutes); // already protects internally (protect + requirePage("E-Assessments"))
+app.use("/api/tenant", require("./routes/tenantLicense")); // trial countdown (read-only; protects internally)
 app.use("/api/finance", financeRoutes); // already protects internally (protect + financeOnly — strict, no admin bypass, see middleware/financeAuth.js)
 app.use("/api/ai-marking-analytics", require("./routes/aiMarkingAnalytics")); // Phase 10, read-only; protects internally (protect + exact role check)
 app.use("/api/wallet", walletRoutes); // already protects internally (protect + requirePage("Wallet"))
@@ -480,7 +488,8 @@ const RECORD_SENSITIVE_COLUMN_PATTERN = /password|secret|token|apikey|api_key/i;
 
 // Tables the data manager will never expose, even to an admin —
 // pure internal bookkeeping.
-const RECORD_TABLE_BLOCKLIST = new Set(["sysdiagrams"]);
+// tenant_license holds the trial period Doravo Finance sets — a school's own admins must not be able to edit it.
+const RECORD_TABLE_BLOCKLIST = new Set(["sysdiagrams", "tenant_license"]);
 
 const TEXT_COLUMN_TYPES = new Set(["char", "varchar", "nchar", "nvarchar", "text", "ntext"]);
 
@@ -642,6 +651,8 @@ app.get("/api/records", protect, adminOnly, async (req, res) => {
 
     const dbRequest = pool.request();
     let query = `SELECT ${columns.map((c) => `[${c}]`).join(", ")} FROM [${table}]`;
+    // the protected master admin account is never shown to tenant admins
+    const hideMaster = table === "Users" && columns.includes("isMaster");
 
     const search = (req.query.search || req.query.q || "").trim();
     if (search) {
@@ -651,9 +662,10 @@ app.get("/api/records", protect, adminOnly, async (req, res) => {
       );
       if (textCols.length) {
         dbRequest.input("search", sql.NVarChar, `%${search}%`);
-        query += ` WHERE ` + textCols.map((c) => `[${c.name}] LIKE @search`).join(" OR ");
+        query += ` WHERE (` + textCols.map((c) => `[${c.name}] LIKE @search`).join(" OR ") + `)`;
       }
     }
+    if (hideMaster) query += query.includes(" WHERE ") ? ` AND ISNULL([isMaster], 0) = 0` : ` WHERE ISNULL([isMaster], 0) = 0`;
 
     query += ` ORDER BY [${orderCol}]`;
 
@@ -876,7 +888,7 @@ app.get("/api/stats", protect, async (req, res) => {
 
     const students = await pool.request().query(`SELECT COUNT(*) c FROM Students`);
     const teachers = await pool.request().query(`SELECT COUNT(*) c FROM Teachers`);
-    const users = await pool.request().query(`SELECT COUNT(*) c FROM Users`);
+    const users = await pool.request().query(`SELECT COUNT(*) c FROM Users WHERE ISNULL(isMaster, 0) = 0`);
     const active = await pool.request().query(`SELECT COUNT(*) c FROM Students WHERE status='active'`);
     const grads = await pool.request().query(`SELECT COUNT(*) c FROM Graduations`);
 
@@ -1793,7 +1805,7 @@ app.get("/api/users", protect, requirePage("Users"), async (req, res) => {
   try {
     const pool = req.pool;
     const result = await pool.request().query(`
-      SELECT id, username, email, role, permissions FROM Users
+      SELECT id, username, email, role, permissions FROM Users WHERE ISNULL(isMaster, 0) = 0
     `);
 
     const rows = (result.recordset || []).map((row) => {

@@ -257,16 +257,43 @@ function buildInvoicePdf(invoice, { issuer = getIssuerProfile(), paidWith = null
     doc.text("UNIT PRICE", colPrice, y + 9, { width: width * 0.14, align: "right", characterSpacing: 0.6, lineBreak: false });
     doc.text("AMOUNT", colAmt, y + 9, { width: width * 0.18 - 12, align: "right", characterSpacing: 0.6, lineBreak: false });
 
-    const rowY = y + 38;
-    doc.font("Helvetica-Bold").fontSize(10.5).fillColor(COLOR.text)
-      .text("Doravo examination credits", left + 12, rowY, { width: width * 0.48 });
-    doc.font("Helvetica").fontSize(8.5).fillColor(COLOR.muted)
-      .text("One credit funds one student for one complete Main Examination.", left + 12, doc.y + 2, { width: width * 0.46 });
-    const rowEnd = doc.y;
-    doc.font("Helvetica").fontSize(10.5).fillColor(COLOR.text);
-    doc.text(String(invoice.credit_quantity), colQty, rowY, { width: width * 0.12, align: "right", lineBreak: false });
-    doc.text(fmt(invoice.unit_price), colPrice, rowY, { width: width * 0.14, align: "right", lineBreak: false });
-    doc.font("Helvetica-Bold").text(fmt(invoice.subtotal), colAmt, rowY, { width: width * 0.18 - 12, align: "right", lineBreak: false });
+    // "other charges" invoices list the lines Finance typed in; credit invoices keep the single credits row
+    let lines = null;
+    if (invoice.invoice_type === "custom") {
+      try { lines = JSON.parse(invoice.items_json || "[]"); } catch { lines = null; }
+    }
+    let rowEnd;
+    if (lines && lines.length) {
+      let rowY = y + 38;
+      rowEnd = rowY;
+      lines.forEach((ln, i) => {
+        const descH = doc.font("Helvetica-Bold").fontSize(10.5).heightOfString(String(ln.description), { width: width * 0.48 });
+        // a long list continues on a fresh page rather than running into the footer
+        if (rowY + descH > doc.page.height - 190) { doc.addPage(); rowY = doc.page.margins.top; }
+        if (i % 2 === 1) doc.rect(left, rowY - 6, width, descH + 12).fillColor(COLOR.tint).fill();
+        doc.font("Helvetica-Bold").fontSize(10.5).fillColor(COLOR.text)
+          .text(String(ln.description), left + 12, rowY, { width: width * 0.48 });
+        doc.font("Helvetica").fontSize(10.5).fillColor(COLOR.text);
+        doc.text(String(ln.quantity), colQty, rowY, { width: width * 0.12, align: "right", lineBreak: false });
+        doc.text(fmt(ln.unit_price), colPrice, rowY, { width: width * 0.14, align: "right", lineBreak: false });
+        doc.font("Helvetica-Bold").text(fmt(ln.amount), colAmt, rowY, { width: width * 0.18 - 12, align: "right", lineBreak: false });
+        rowY += descH + 14;
+        rowEnd = rowY - 14;
+      });
+    } else {
+      const rowY = y + 38;
+      doc.font("Helvetica-Bold").fontSize(10.5).fillColor(COLOR.text)
+        .text("Doravo examination credits", left + 12, rowY, { width: width * 0.48 });
+      doc.font("Helvetica").fontSize(8.5).fillColor(COLOR.muted)
+        .text("One credit funds one student for one complete Main Examination.", left + 12, doc.y + 2, { width: width * 0.46 });
+      rowEnd = doc.y;
+      doc.font("Helvetica").fontSize(10.5).fillColor(COLOR.text);
+      doc.text(String(invoice.credit_quantity), colQty, rowY, { width: width * 0.12, align: "right", lineBreak: false });
+      doc.text(fmt(invoice.unit_price), colPrice, rowY, { width: width * 0.14, align: "right", lineBreak: false });
+      doc.font("Helvetica-Bold").text(fmt(invoice.subtotal), colAmt, rowY, { width: width * 0.18 - 12, align: "right", lineBreak: false });
+
+
+    }
 
     y = rowEnd + 12;
     doc.moveTo(left, y).lineTo(right, y).lineWidth(0.8).strokeColor(COLOR.line).stroke();
@@ -365,7 +392,14 @@ function buildReceiptPdf(receipt, { issuer = getIssuerProfile(), invoice = null 
     ];
     if (receipt.invoice_number) rows.push(["Applied to invoice", receipt.invoice_number]);
     if (invoice) {
-      rows.push(["Credits purchased", `${invoice.credit_quantity} @ ${fmtMoney(invoice.currency, invoice.unit_price)}`]);
+      if (invoice.invoice_type === "custom") {
+        let ls = [];
+        try { ls = JSON.parse(invoice.items_json || "[]"); } catch { ls = []; }
+        const summary = ls.map((l) => l.description).join("; ");
+        rows.push(["For", summary.length > 90 ? `${summary.slice(0, 87)}...` : summary || "Services"]);
+      } else {
+        rows.push(["Credits purchased", `${invoice.credit_quantity} @ ${fmtMoney(invoice.currency, invoice.unit_price)}`]);
+      }
       rows.push(["Invoice total", fmtMoney(invoice.currency, invoice.total_amount)]);
       if (money2(receipt.amount) > money2(invoice.total_amount)) {
         rows.push(["Overpayment", `${fmtMoney(cur, money2(receipt.amount) - money2(invoice.total_amount))} (carried as credit on account)`]);

@@ -10,6 +10,7 @@ const {
 const { recordPayment } = require("../services/invoicing.service");
 const { logFinanceAudit } = require("../utils/financeAuditLog");
 const { generateSecret, verifyToken, otpauthUri } = require("../utils/totp");
+const { getTrialStatus } = require("../utils/tenantLicense");
 
 /* =========================================================================
    DORAVO FINANCE CONTROLLER
@@ -74,6 +75,7 @@ const listInstitutions = async (req, res) => {
             reservedCredits: wallet?.reserved_credits ?? 0,
             totalPurchased: wallet?.total_purchased ?? 0,
             totalAllocated: wallet?.total_allocated ?? 0,
+            trial: await getTrialStatus(pool).catch(() => null),
           };
         } catch (err) {
           // One tenant's DB being unreachable must never hide every
