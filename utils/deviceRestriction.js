@@ -314,4 +314,6 @@ module.exports = {
   invalidateDesktopOnlyCache,
   invalidateDeviceAccessCache,
   deviceKeyFor,
+  // shared with utils/sebRestriction.js (same Device Locks list / allow-list)
+  isDeviceAllowed, recordRejection, resolveStudentId,
 };

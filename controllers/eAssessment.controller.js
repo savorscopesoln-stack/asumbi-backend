@@ -902,7 +902,7 @@ const examLogin = async (req, res) => {
     if (deviceCheck.blocked) return sendBlocked(res, deviceCheck.device);
 
     // Safe Exam Browser switch: refuse to issue a token to any other browser.
-    const sebCheck = await checkSeb(req, pool, tenant, assessment.id);
+    const sebCheck = await checkSeb(req, pool, tenant, assessment.id, { username });
     if (sebCheck.blocked) return sendSebBlocked(res);
 
     // Trainee access list + open/close window (see utils/examAccess.js).
@@ -3555,7 +3555,7 @@ const getDeviceAccess = async (req, res) => {
       SELECT TOP 500 d.id, d.e_assessment_id, d.student_id, d.device_key, d.platform, d.user_agent, d.ip, d.reason,
              d.attempts, d.first_seen, d.last_seen, d.status, d.allowed_at,
              st.name AS student_name, st.username AS student_username, st.studentClass AS student_class,
-             a.title AS assessment_title, ISNULL(a.desktop_only, 0) AS desktop_only,
+             a.title AS assessment_title, ISNULL(a.desktop_only, 0) AS desktop_only, ISNULL(a.require_seb, 0) AS require_seb,
              us.name AS allowed_by_name
       FROM e_assessment_device_access d
       LEFT JOIN Students st ON st.id = d.student_id

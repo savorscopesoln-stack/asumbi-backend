@@ -34,6 +34,7 @@
 ========================================================================= */
 const crypto = require("crypto");
 const sql = require("mssql");
+const { deviceKeyFor, isDeviceAllowed, recordRejection, resolveStudentId } = require("./deviceRestriction");
 
 const SEB_REQUIRED_CODE = "SEB_REQUIRED";
 const SEB_REQUIRED_MESSAGE =
@@ -118,19 +119,41 @@ async function loadSebConfig(pool, tenant, assessmentId) {
   return value;
 }
 
-/** Returns { blocked: false } or { blocked: true, reason }. */
-async function checkSeb(req, pool, tenant, assessmentId) {
+/* A non-SEB browser that was refused is written to the same Device Locks list as
+   rejected phones (platform "noseb"). When an admin presses Allow on that row,
+   THIS student on THIS device may take THIS exam in a normal browser. The row's
+   device_key is prefixed "seb:" so it never collides with, or accidentally
+   unlocks, a Desktop-only row for the same device. */
+async function sebExemption(req, pool, tenant, assessmentId, opts, reason) {
+  try {
+    const studentId = await resolveStudentId(pool, req, opts && opts.username);
+    if (!studentId) return false; // unknown student: nothing to record or allow
+    const deviceKey = "seb:" + deviceKeyFor(req);
+    if (await isDeviceAllowed(pool, tenant, assessmentId, studentId, deviceKey)) return true;
+    recordRejection(pool, tenant, assessmentId, studentId, deviceKey, { platform: "noseb", reason: "Not using Safe Exam Browser" + (reason ? ` (${reason})` : "") }, req); // fire-and-forget
+  } catch (err) {
+    console.error("SEB EXEMPTION CHECK ERROR:", err.message);
+  }
+  return false;
+}
+
+/** Returns { blocked: false } or { blocked: true, reason }. opts.username: for exam-login (no token yet). */
+async function checkSeb(req, pool, tenant, assessmentId, opts = {}) {
   if (!assessmentId) return { blocked: false };
   const cfg = await loadSebConfig(pool, tenant, assessmentId);
   if (!cfg.required) return { blocked: false };
 
   if (cfg.keys.length) {
     if (hasValidSebHash(req, cfg.keys)) return { blocked: false, mode: "key" };
-    return { blocked: true, reason: "SEB key hash missing or not matching" };
+    const reason = "SEB key hash missing or not matching";
+    if (await sebExemption(req, pool, tenant, assessmentId, opts, reason)) return { blocked: false, mode: "admin-allowed" };
+    return { blocked: true, reason };
   }
   // No key saved yet: weak User-Agent check only.
   if (looksLikeSeb(req)) return { blocked: false, mode: "user-agent" };
-  return { blocked: true, reason: "Not Safe Exam Browser (no key saved; User-Agent check)" };
+  const reason = "Not Safe Exam Browser (no key saved; User-Agent check)";
+  if (await sebExemption(req, pool, tenant, assessmentId, opts, reason)) return { blocked: false, mode: "admin-allowed" };
+  return { blocked: true, reason };
 }
 
 function sendSebBlocked(res) {
