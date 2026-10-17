@@ -281,6 +281,25 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       ALTER TABLE e_assessments ADD music_paper BIT NOT NULL CONSTRAINT DF_e_assessments_music_paper DEFAULT 0
     `);
 
+    /* ---------------- music paper: marker annotations + model answer ----------
+       e_assessment_answers.music_annotations: JSON array of transparent PNG
+         overlays (the marker's red pen / ticks / crosses / notes), one per
+         drawing sheet in the student's answer. Kept SEPARATE from essay_answer
+         so the student's original drawing is never altered.
+       e_assessment_questions.model_answer_sheet: the question setter's model
+         answer drawing (same <img data-music-sheet> format as an answer), shown
+         beside the student's sheet when marking and on the marked paper. */
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='e_assessment_answers' AND xtype='U')
+      AND NOT EXISTS (SELECT * FROM sys.columns WHERE Name = N'music_annotations' AND Object_ID = Object_ID(N'e_assessment_answers'))
+      ALTER TABLE e_assessment_answers ADD music_annotations NVARCHAR(MAX) NULL
+    `);
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='e_assessment_questions' AND xtype='U')
+      AND NOT EXISTS (SELECT * FROM sys.columns WHERE Name = N'model_answer_sheet' AND Object_ID = Object_ID(N'e_assessment_questions'))
+      ALTER TABLE e_assessment_questions ADD model_answer_sheet NVARCHAR(MAX) NULL
+    `);
+
     /* ---------------- e_assessments.exam_password ----------------
        Lets a student join a single assessment via the standalone
        /take-assessment/:id page (no portal account login) using
@@ -322,6 +341,42 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       )
       ALTER TABLE e_assessment_answers ADD highlighted_html NVARCHAR(MAX) NULL
     `);
+
+    /* ---------------- marking stats (leaderboard) + query indexes ----------------
+       Who marked what, and WHEN, so the Marking leaderboard can show progress,
+       speed and who finished first. All nullable: rows marked before this
+       existed simply have no timestamp and are counted without a speed. */
+    for (const [tbl, col, ddl] of [
+      ["e_assessment_answers", "marked_by", "INT NULL"],
+      ["e_assessment_answers", "marked_at", "DATETIME NULL"],
+      ["e_assessment_submissions", "marking_completed_at", "DATETIME NULL"],
+      ["e_assessment_submissions", "marking_completed_by", "INT NULL"],
+    ]) {
+      await pool.request().query(`
+        IF EXISTS (SELECT * FROM sysobjects WHERE name='${tbl}' AND xtype='U')
+        AND NOT EXISTS (SELECT * FROM sys.columns WHERE Name = N'${col}' AND Object_ID = Object_ID(N'${tbl}'))
+        ALTER TABLE ${tbl} ADD ${col} ${ddl}
+      `);
+    }
+    // Indexes the Device Locks / Marking queries rely on. Created here (not only
+    // in a hand-run migration) so a database that never had the migration applied
+    // doesn't time out. Each is guarded, and a failure never blocks startup.
+    for (const [name, tbl, def] of [
+      ["IX_ea_violation_photos_session", "e_assessment_violation_photos", "(session_id)"],
+      ["IX_ea_answers_submission_cover", "e_assessment_answers", "(submission_id) INCLUDE (question_id, selected_answer, marks_awarded)"],
+      ["IX_ea_sessions_status_assessment", "e_assessment_exam_sessions", "(status, e_assessment_id) INCLUDE (student_id, last_heartbeat, ended_at, issued_at)"],
+      ["IX_ea_sub_assign_teacher", "e_assessment_submission_assignments", "(teacher_id) INCLUDE (submission_id, assigned_at)"],
+    ]) {
+      try {
+        await pool.request().query(`
+          IF EXISTS (SELECT * FROM sysobjects WHERE name='${tbl}' AND xtype='U')
+          AND NOT EXISTS (SELECT * FROM sys.indexes WHERE name = N'${name}' AND object_id = Object_ID(N'${tbl}'))
+          CREATE NONCLUSTERED INDEX ${name} ON ${tbl} ${def}
+        `);
+      } catch (e) {
+        console.warn(`[ensureSchema] index ${name} skipped:`, e.message);
+      }
+    }
 
     /* ---------------- exam autosave + resit support ----------------
        e_assessment_drafts: the student's answers, saved to the DB every

@@ -1329,6 +1329,21 @@ const parseQuestionsDocx = async (req, res) => {
   }
 };
 
+/* ---- music paper helpers: marker overlays + model answer sheet ---------- */
+const PNG_DATA_URL_RE = /^data:image\/png;base64,[A-Za-z0-9+/=]+$/;
+const MAX_SHEET_CHARS = 1_500_000;
+const MAX_SHEETS = 3;
+// Keep only well-formed PNG data URLs (never trust the client), max 3, each size-capped.
+const cleanPngList = (list) => (Array.isArray(list) ? list : [])
+  .map((v) => (typeof v === "string" ? v : v?.png))
+  .filter((v) => typeof v === "string" && v.length <= MAX_SHEET_CHARS && PNG_DATA_URL_RE.test(v))
+  .slice(0, MAX_SHEETS);
+const parseMusicAnnotations = (raw) => {
+  if (!raw) return [];
+  try { const a = JSON.parse(raw); return Array.isArray(a) ? a.map((v) => (typeof v === "string" && PNG_DATA_URL_RE.test(v) ? v : "")) : []; }
+  catch { return []; }
+};
+
 const getAssessmentQuestions = async (req, res) => {
   try {
     const pool = req.pool;
@@ -1338,12 +1353,14 @@ const getAssessmentQuestions = async (req, res) => {
       .input("assessmentId", sql.Int, assessmentId)
       .query(`
         SELECT q.id, q.question_text, q.marks, q.correct_answer, q.marking_guide,
-               q.question_type, o.option_label, o.option_text
+               q.question_type, q.model_answer_sheet, o.option_label, o.option_text
         FROM e_assessment_questions q
         LEFT JOIN e_assessment_options o ON q.id = o.question_id
         WHERE q.e_assessment_id = @assessmentId
         ORDER BY q.id
       `);
+    // The model answer is for staff only — never sent to a student sitting the exam.
+    const isStaffViewer = req.user?.role && req.user.role !== "student" && !req.user?.examOnly;
 
     const imageResult = await pool.request()
       .input("assessmentId", sql.Int, assessmentId)
@@ -1369,6 +1386,7 @@ const getAssessmentQuestions = async (req, res) => {
           correct_answer: row.correct_answer,
           marking_guide: row.marking_guide,
           question_type: row.question_type || "mcq",
+          ...(isStaffViewer ? { model_answer_sheet: row.model_answer_sheet || null } : {}),
           options: [],
           images: imagesByQuestion[row.id] || [],
         };
@@ -2275,13 +2293,18 @@ const describeExamSession = (r) => {
 // Admin: every exam session (not started / active / locked / submitted) with its
 // step and progress, so the screen can group them, count them, search them and
 // export each group.
-const getExamSessions = async (req, res) => {
-  try {
-    const pool = req.pool;
-    const aid = toInt(req.query.assessmentId);
-    const request = pool.request();
-    if (aid) request.input("aid", sql.Int, aid);
-    const result = await request.query(`
+// Short-lived cache + in-flight de-duplication. The Device Locks tab polls this
+// endpoint, and the page also fires it on load; when the query was slow each
+// poll started ANOTHER copy while the first was still running, the copies
+// competed for the same connections, and everything snowballed into the 45s
+// ETIMEOUT. Now identical requests inside a few seconds share one query.
+const EXAM_SESSIONS_TTL_MS = 5000;
+const examSessionsCache = new Map(); // key -> { at, promise }
+
+const queryExamSessions = async (pool, aid) => {
+  const request = pool.request();
+  if (aid) request.input("aid", sql.Int, aid);
+  const result = await request.query(`
       SELECT es.id, es.e_assessment_id, es.student_id, es.token, es.status, es.device_id, es.device_label,
              es.issued_at, es.activated_at, es.last_heartbeat, es.locked_at, es.lock_reason, es.ended_at,
              es.auto_submitted, es.resit_allowed, es.attempt_no,
@@ -2291,10 +2314,12 @@ const getExamSessions = async (req, res) => {
              ISNULL(vpc.n, 0) AS photo_count,
              ISNULL(qc.n, 0) AS total_questions,
              sub.id AS submission_id, sub.submitted_at AS submitted_at,
-             CASE WHEN sub.id IS NOT NULL THEN
+             -- only finished sessions need the submitted-answer count, and DATALENGTH
+             -- avoids converting every essay to NVARCHAR(MAX) just to measure it
+             CASE WHEN es.status = 'ended' AND sub.id IS NOT NULL THEN
                (SELECT COUNT(*) FROM e_assessment_answers ans
                  WHERE ans.submission_id = sub.id
-                   AND (ISNULL(ans.selected_answer, '') <> '' OR LEN(ISNULL(CAST(ans.essay_answer AS NVARCHAR(MAX)), '')) > 0))
+                   AND (ISNULL(ans.selected_answer, '') <> '' OR DATALENGTH(ans.essay_answer) > 0))
              END AS submitted_answer_count,
              CASE WHEN es.status IN ('active','locked') AND es.activated_at IS NOT NULL
                   THEN ${secondsLeftSql("a", "es")} END AS seconds_left,
@@ -2316,7 +2341,23 @@ const getExamSessions = async (req, res) => {
       ORDER BY CASE es.status WHEN 'locked' THEN 0 WHEN 'active' THEN 1 WHEN 'issued' THEN 2 ELSE 3 END,
                ISNULL(es.last_heartbeat, ISNULL(es.ended_at, es.issued_at)) DESC
     `);
-    res.json((result.recordset || []).map(describeExamSession));
+  return (result.recordset || []).map(describeExamSession);
+};
+
+const getExamSessions = async (req, res) => {
+  try {
+    const aid = toInt(req.query.assessmentId);
+    const key = `${req.dbTenant || "default"}:${aid || 0}`;
+    const hit = examSessionsCache.get(key);
+    let promise;
+    if (hit && Date.now() - hit.at < EXAM_SESSIONS_TTL_MS) {
+      promise = hit.promise; // fresh result, or the same query still running
+    } else {
+      promise = queryExamSessions(req.pool, aid);
+      examSessionsCache.set(key, { at: Date.now(), promise });
+      promise.catch(() => { if (examSessionsCache.get(key)?.promise === promise) examSessionsCache.delete(key); });
+    }
+    res.json(await promise);
   } catch (err) {
     console.error("GET EXAM SESSIONS ERROR:", err);
     res.status(500).json([]);
@@ -2702,7 +2743,7 @@ const getStudentResult = async (req, res) => {
         SELECT q.id, q.question_text, q.marks AS max_marks, q.correct_answer, q.question_type,
                o.option_label, o.option_text,
                ans.selected_answer, ans.essay_answer, ans.is_correct, ans.marks_awarded, ans.remarks,
-               ans.highlights, ans.highlighted_html
+               ans.highlights, ans.highlighted_html, ans.music_annotations, q.model_answer_sheet
         FROM e_assessment_questions q
         LEFT JOIN e_assessment_options o ON q.id = o.question_id
         LEFT JOIN e_assessment_answers ans ON ans.question_id = q.id AND ans.submission_id = @submissionId
@@ -2744,6 +2785,10 @@ const getStudentResult = async (req, res) => {
           // sanitises the HTML before rendering it.
           highlights: parseStoredHighlights(row.highlights),
           highlighted_html: row.highlighted_html || null,
+          // Music paper: the marker's overlays on the student's drawing, and the
+          // model answer — this endpoint only runs once marks are released.
+          music_annotations: parseMusicAnnotations(row.music_annotations),
+          model_answer_sheet: row.model_answer_sheet || null,
           ai_points: null,
           options: [],
           images: imagesByQuestion[row.id] || [],
@@ -3821,8 +3866,8 @@ const getSubmissionForMarking = async (req, res) => {
     const answersReq = pool.request().input("id", sql.Int, submissionId);
     if (isTeacherViewer) answersReq.input("teacherId", sql.Int, toInt(req.user.id));
     const answers = await answersReq.query(`
-      SELECT a.id, a.question_id, a.selected_answer, a.essay_answer, a.is_correct, a.marks_awarded, a.remarks, a.highlights, a.highlighted_html,
-             q.question_text, q.correct_answer, q.marks AS max_marks, q.question_type
+      SELECT a.id, a.question_id, a.selected_answer, a.essay_answer, a.is_correct, a.marks_awarded, a.remarks, a.highlights, a.highlighted_html, a.music_annotations,
+             q.question_text, q.correct_answer, q.marks AS max_marks, q.question_type, q.model_answer_sheet
       FROM e_assessment_answers a
       INNER JOIN e_assessment_questions q ON q.id = a.question_id
       ${isTeacherViewer ? "LEFT JOIN e_assessment_answer_assignments ax ON ax.answer_id = a.id" : ""}
@@ -3836,7 +3881,7 @@ const getSubmissionForMarking = async (req, res) => {
       ? (await loadStudentEvidence(pool, subRow.e_assessment_id, [subRow.student_id]))[subRow.student_id] || null
       : null;
 
-    res.json({ submission: subRow, answers: answers.recordset || [], evidence });
+    res.json({ submission: subRow, answers: (answers.recordset || []).map((r) => ({ ...r, music_annotations: parseMusicAnnotations(r.music_annotations) })), evidence });
   } catch (err) {
     console.error("MARKING FETCH ERROR:", err);
     res.status(500).json({ message: err.message });
@@ -3873,8 +3918,8 @@ const getAllSubmissionsForMarking = async (req, res) => {
       const answersReq = pool.request().input("submissionId", sql.Int, submission.id);
       if (isTeacher) answersReq.input("teacherId", sql.Int, toInt(req.user.id));
       const answersResult = await answersReq.query(`
-        SELECT a.id, a.submission_id, a.question_id, a.essay_answer, a.marks_awarded, a.remarks, a.highlights, a.highlighted_html,
-       q.question_text, q.question_type, q.marks AS max_marks, q.marking_guide
+        SELECT a.id, a.submission_id, a.question_id, a.essay_answer, a.marks_awarded, a.remarks, a.highlights, a.highlighted_html, a.music_annotations,
+       q.question_text, q.question_type, q.marks AS max_marks, q.marking_guide, q.model_answer_sheet
 FROM e_assessment_answers a
 INNER JOIN e_assessment_questions q ON a.question_id = q.id
 ${isTeacher ? "LEFT JOIN e_assessment_answer_assignments ax ON ax.answer_id = a.id" : ""}
@@ -3883,7 +3928,7 @@ ${isTeacher ? "AND " + TEACHER_ANSWER_VISIBLE : ""}
       `);
       finalData.push({
         submission,
-        answers: answersResult.recordset,
+        answers: answersResult.recordset.map((r) => ({ ...r, music_annotations: parseMusicAnnotations(r.music_annotations) })),
         evidence: evidenceByStudent[submission.student_id] || { name: null, profile_photo_url: null, photos: [] },
       });
     }
@@ -3894,10 +3939,37 @@ ${isTeacher ? "AND " + TEACHER_ANSWER_VISIBLE : ""}
   }
 };
 
+/* PUT /questions/:questionId/model-sheet  { sheets: [png|{png}] }
+   The question setter's model-answer drawing for a music-paper essay question.
+   Stored in the same <img data-music-sheet> format a student's answer uses. */
+const setModelSheet = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const questionId = toInt(req.params.questionId);
+    if (!questionId) return res.status(400).json({ success: false, message: "Invalid question ID" });
+    const parent = await pool.request().input("id", sql.Int, questionId)
+      .query(`SELECT e_assessment_id FROM e_assessment_questions WHERE id = @id`);
+    if (!parent.recordset.length) return res.status(404).json({ success: false, message: "Question not found" });
+    const permission = await canManageAssessmentQuestions(pool, req, parent.recordset[0].e_assessment_id);
+    if (!permission.ok) return res.status(permission.status).json({ success: false, message: permission.message });
+
+    const sheets = cleanPngList(req.body?.sheets);
+    const html = sheets.map((png) => `<p><img data-music-sheet="1" data-tpl="treble" src="${png}" alt="Model answer"></p>`).join("");
+    await pool.request()
+      .input("id", sql.Int, questionId)
+      .input("v", sql.NVarChar(sql.MAX), html || null)
+      .query(`UPDATE e_assessment_questions SET model_answer_sheet = @v WHERE id = @id`);
+    res.json({ success: true, model_answer_sheet: html || null });
+  } catch (err) {
+    console.error("SET MODEL SHEET ERROR:", err);
+    res.status(500).json({ success: false, message: "Failed to save the model answer" });
+  }
+};
+
 const saveMarking = async (req, res) => {
   try {
     const pool = req.pool;
-    const { scores, remarks, highlights, essayHTML } = req.body;
+    const { scores, remarks, highlights, essayHTML, musicAnnotations } = req.body;
     if (!scores || typeof scores !== "object" || !Object.keys(scores).length) {
       return res.status(400).json({ success: false, message: "No scores provided" });
     }
@@ -3920,20 +3992,48 @@ const saveMarking = async (req, res) => {
       // that were all removed again before saving).
       const markedHtml = hlList.length ? (essayHTML?.[answerId] || null) : null;
 
-      await pool.request()
+      const mkReq = () => pool.request()
         .input("answerId", sql.Int, answerId)
         .input("mark", sql.Int, mark)
         .input("remarks", sql.NVarChar(sql.MAX), remarks?.[answerId] || "")
         .input("highlights", sql.NVarChar(sql.MAX), hlJson)
         .input("highlightedHtml", sql.NVarChar(sql.MAX), markedHtml)
-        .query(`
+        .input("markerId", sql.Int, toInt(req.user?.id) || null);
+      try {
+        // marked_at keeps the FIRST time the answer was marked (the leaderboard
+        // measures how fast work gets done, not when it was last tweaked).
+        await mkReq().query(`
           UPDATE e_assessment_answers
           SET marks_awarded = @mark,
               remarks = @remarks,
               highlights = @highlights,
-              highlighted_html = @highlightedHtml
+              highlighted_html = @highlightedHtml,
+              marked_by = @markerId,
+              marked_at = ISNULL(marked_at, GETDATE())
           WHERE id = @answerId
         `);
+      } catch (e) {
+        if (!/invalid column name/i.test(String(e.message))) throw e;
+        await mkReq().query(`
+          UPDATE e_assessment_answers
+          SET marks_awarded = @mark, remarks = @remarks,
+              highlights = @highlights, highlighted_html = @highlightedHtml
+          WHERE id = @answerId
+        `);
+      }
+
+      // Music paper: marker overlays. Only written when the client sent this
+      // answer's key (so marking screens that don't know about drawings never
+      // wipe them). Overlays are positional: index i = i-th drawing sheet, ""
+      // = not annotated. All-empty clears the column.
+      if (musicAnnotations && Object.prototype.hasOwnProperty.call(musicAnnotations, answerId)) {
+        const raw = Array.isArray(musicAnnotations[answerId]) ? musicAnnotations[answerId].slice(0, MAX_SHEETS) : [];
+        const list = raw.map((v) => (typeof v === "string" && v.length <= MAX_SHEET_CHARS && PNG_DATA_URL_RE.test(v) ? v : ""));
+        await pool.request()
+          .input("answerId", sql.Int, answerId)
+          .input("ann", sql.NVarChar(sql.MAX), list.some(Boolean) ? JSON.stringify(list) : null)
+          .query(`UPDATE e_assessment_answers SET music_annotations = @ann WHERE id = @answerId`);
+      }
     }
 
     const idList = answerIds.join(",");
@@ -3992,13 +4092,25 @@ const saveMarking = async (req, res) => {
       const isFullyMarked = unmarkedEssays.recordset[0].cnt === 0;
 
       if (isFullyMarked) {
-        await pool.request()
+        const doneReq = () => pool.request()
           .input("submission_id", sql.Int, submissionId).input("score", sql.Int, totalScore)
-          .query(`
+          .input("markerId", sql.Int, toInt(req.user?.id) || null);
+        try {
+          await doneReq().query(`
+            UPDATE e_assessment_submissions
+            SET score = @score, status = 'marked', remark_completed = 1, remark_requested = 0, remark_status = 'completed',
+                marking_completed_at = ISNULL(marking_completed_at, GETDATE()),
+                marking_completed_by = ISNULL(marking_completed_by, @markerId)
+            WHERE id = @submission_id
+          `);
+        } catch (e) {
+          if (!/invalid column name/i.test(String(e.message))) throw e;
+          await doneReq().query(`
             UPDATE e_assessment_submissions
             SET score = @score, status = 'marked', remark_completed = 1, remark_requested = 0, remark_status = 'completed'
             WHERE id = @submission_id
           `);
+        }
       } else {
         await pool.request()
           .input("submission_id", sql.Int, submissionId).input("score", sql.Int, totalScore)
@@ -4754,6 +4866,7 @@ const updateGradingSystem = async (req, res) => {
 module.exports = {
   setDesktopOnly,
   setMusicPaper,
+  setModelSheet,
   getAccessSettings, getStudentsActivation, setStudentsActivation,
   setAccessSettings,
   setSecuritySettings,
