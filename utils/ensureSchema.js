@@ -264,6 +264,15 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       ALTER TABLE e_assessments ADD seb_keys NVARCHAR(MAX) NULL
     `);
 
+    /* ---------------- e_assessments.seb_quit_password ----------------
+       Password that SEB asks for when a student presses Quit. Only its SHA-256
+       goes into the generated .seb file; never sent to students. */
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='e_assessments' AND xtype='U')
+      AND NOT EXISTS (SELECT * FROM sys.columns WHERE Name = N'seb_quit_password' AND Object_ID = Object_ID(N'e_assessments'))
+      ALTER TABLE e_assessments ADD seb_quit_password NVARCHAR(100) NULL
+    `);
+
     /* ---------------- e_assessment_seb_configs ----------------
        Optional admin-uploaded .seb file per assessment (kept out of
        e_assessments so SELECT ea.* never drags the binary into list queries). */

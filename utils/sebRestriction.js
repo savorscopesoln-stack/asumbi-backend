@@ -145,9 +145,12 @@ async function checkSeb(req, pool, tenant, assessmentId, opts = {}) {
 
   if (cfg.keys.length) {
     if (hasValidSebHash(req, cfg.keys)) return { blocked: false, mode: "key" };
-    const reason = "SEB key hash missing or not matching";
+    // SEB itself is running (User-Agent says so) but its key hash does not match: it was
+    // started from an OLD / different .seb file or has saved settings of its own.
+    const stale = looksLikeSeb(req);
+    const reason = stale ? "SEB is running with an old or different configuration (key hash not matching)" : "SEB key hash missing or not matching";
     if (await sebExemption(req, pool, tenant, assessmentId, opts, reason)) return { blocked: false, mode: "admin-allowed" };
-    return { blocked: true, reason };
+    return { blocked: true, reason, stale };
   }
   // No key saved yet: weak User-Agent check only.
   if (looksLikeSeb(req)) return { blocked: false, mode: "user-agent" };
@@ -156,12 +159,16 @@ async function checkSeb(req, pool, tenant, assessmentId, opts = {}) {
   return { blocked: true, reason };
 }
 
-function sendSebBlocked(res) {
+const SEB_STALE_MESSAGE =
+  "Safe Exam Browser is open, but with an old or different exam file. Quit Safe Exam Browser completely (Cmd+Q), delete any older exam .seb files, download the exam file again and open it.";
+
+function sendSebBlocked(res, stale = false) {
   return res.status(403).json({
     success: false,
     code: SEB_REQUIRED_CODE,
     sebRequired: true,
-    message: SEB_REQUIRED_MESSAGE,
+    sebStale: !!stale,
+    message: stale ? SEB_STALE_MESSAGE : SEB_REQUIRED_MESSAGE,
   });
 }
 
@@ -176,7 +183,7 @@ async function enforceSeb(req, res, next) {
       toInt(req.body?.assessmentId) ||
       toInt(req.user?.examAssessmentId);
     const result = await checkSeb(req, req.pool, req.user?.tenant, assessmentId);
-    if (result.blocked) return sendSebBlocked(res);
+    if (result.blocked) return sendSebBlocked(res, result.stale);
     return next();
   } catch (err) {
     console.error("ENFORCE SEB ERROR:", err);

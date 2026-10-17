@@ -368,7 +368,7 @@ const deleteCoverPage = async (req, res) => {
 const STAFF_ROLES = ["admin", "sub_admin", "sub_admin_2", "module_admin", "teacher"];
 const redactForRole = (row, role) => {
   if (STAFF_ROLES.includes(role)) return row;
-  const { exam_password, seb_keys, seb_config_name, ...rest } = row; // never send secrets to students
+  const { exam_password, seb_keys, seb_config_name, seb_quit_password, ...rest } = row; // never send secrets to students
   return rest;
 };
 
@@ -905,7 +905,7 @@ const examLogin = async (req, res) => {
 
     // Safe Exam Browser switch: refuse to issue a token to any other browser.
     const sebCheck = await checkSeb(req, pool, tenant, assessment.id, { username });
-    if (sebCheck.blocked) return sendSebBlocked(res);
+    if (sebCheck.blocked) return sendSebBlocked(res, sebCheck.stale);
 
     // Trainee access list + open/close window (see utils/examAccess.js).
     // 400 (never 401/403) on purpose — see the note above this function.
@@ -3291,7 +3291,7 @@ const findAssessmentAnyTenant = async (id) => {
       const pool = await getPool(tenantKey);
       const r = await pool.request().input("id", sql.Int, id)
         .query(`SELECT a.id, a.title, ISNULL(a.require_seb,0) AS require_seb,
-                 c.file_name AS seb_config_name, c.data AS seb_config
+                 a.seb_quit_password, c.file_name AS seb_config_name, c.data AS seb_config
                  FROM e_assessments a
                  LEFT JOIN e_assessment_seb_configs c ON c.assessment_id = a.id
                  WHERE a.id = @id`);
@@ -3388,17 +3388,25 @@ const downloadSebConfig = async (req, res) => {
     const startURL = `${origin}/take-assessment/${id}`;
 
     const bool = (k, v) => `<key>${k}</key><${v ? "true" : "false"}/>`;
+    // Quit password set on the assessment (admin screen). SEB wants the SHA-256 hex of it.
+    const quitPw = String(a.seb_quit_password || "");
+    const quitHash = quitPw ? require("crypto").createHash("sha256").update(quitPw, "utf8").digest("hex") : "";
     const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>startURL</key><string>${xmlEsc(startURL)}</string>
 <key>sendBrowserExamKey</key><true/>
-<key>examSessionClearCookiesOnStart</key><true/>
-<key>allowQuit</key><true/>
+<!-- start from a clean browser session every time: no cookies/cache from an earlier run -->
+${bool("examSessionClearCookiesOnStart", true)}
+${bool("examSessionClearCookiesOnEnd", true)}
+${bool("allowPreferencesWindow", false)}
+<!-- quit: the button is shown, protected by the assessment's quit password -->
+${bool("allowQuit", true)}
+${quitHash ? `<key>hashedQuitPassword</key><string>${quitHash}</string>` : ""}
 <key>quitURL</key><string>${xmlEsc(origin)}/take-assessment</string>
-<key>quitURLConfirm</key><false/>
-<key>URLFilterEnable</key><false/>
-<key>enableURLFilter</key><false/>
+${bool("quitURLConfirm", false)}
+${bool("URLFilterEnable", false)}
+${bool("enableURLFilter", false)}
 ${bool("allowSpellCheck", false)}
 ${bool("enableClipboard", false)}
 ${bool("allowCopy", false)}
@@ -3407,12 +3415,22 @@ ${bool("enableRightMouse", false)}
 ${bool("enablePrintScreen", false)}
 ${bool("allowScreenSharing", false)}
 ${bool("allowVirtualMachine", false)}
-${bool("showTaskBar", true)}
-${bool("showReloadButton", false)}
-${bool("browserWindowAllowReload", false)}
+<!-- completely fullscreen -->
+<key>browserViewMode</key><integer>1</integer>
 <key>mainBrowserWindowWidth</key><string>100%</string>
 <key>mainBrowserWindowHeight</key><string>100%</string>
-<key>browserViewMode</key><integer>1</integer>
+${bool("showMenuBar", false)}
+${bool("enableBrowserWindowToolbar", false)}
+${bool("hideBrowserWindowToolbar", true)}
+${bool("showNavigationButtons", false)}
+<!-- the only controls on the bar: network (Wi-Fi), battery, refresh and quit -->
+${bool("showTaskBar", true)}
+<key>taskBarHeight</key><integer>40</integer>
+${bool("allowWlan", true)}
+${bool("showReloadButton", true)}
+${bool("browserWindowAllowReload", true)}
+${bool("showTime", false)}
+${bool("showInputLanguage", false)}
 </dict></plist>`;
 
     // .seb = gzip( "plnd" + gzip(plist) )  — TWO gzip layers (see utils/sebConfigFile.js).
@@ -3504,7 +3522,14 @@ const setSebSettings = async (req, res) => {
 
     const hasEnabled = typeof req.body?.enabled === "boolean";
     const hasKeys = typeof req.body?.keys === "string";
-    if (!hasEnabled && !hasKeys) return res.status(400).json({ message: "Send `enabled` (true/false) and/or `keys` (text)" });
+    const hasQuit = typeof req.body?.quitPassword === "string";
+    if (!hasEnabled && !hasKeys && !hasQuit) return res.status(400).json({ message: "Send `enabled` (true/false), `keys` (text) and/or `quitPassword` (text)" });
+    let quitValue = null;
+    if (hasQuit) {
+      quitValue = req.body.quitPassword.trim();
+      if (quitValue.length > 100) return res.status(400).json({ message: "The quit password can be at most 100 characters." });
+      if (!quitValue) quitValue = null; // empty clears it
+    }
 
     let keysValue = null;
     if (hasKeys) {
@@ -3521,10 +3546,12 @@ const setSebSettings = async (req, res) => {
     if (hasEnabled) { sets.push("require_seb = @en"); request.input("en", sql.Bit, req.body.enabled ? 1 : 0); }
     if (hasKeys) { sets.push("seb_keys = @keys"); request.input("keys", sql.NVarChar(sql.MAX), keysValue); }
 
+    if (hasQuit) { sets.push("seb_quit_password = @quit"); request.input("quit", sql.NVarChar(100), quitValue); }
+
     const r = await request.query(
       `UPDATE e_assessments SET ${sets.join(", ")} WHERE id = @id;
        SELECT @@ROWCOUNT AS n;
-       SELECT ISNULL(require_seb, 0) AS require_seb, seb_keys FROM e_assessments WHERE id = @id;`
+       SELECT ISNULL(require_seb, 0) AS require_seb, seb_keys, seb_quit_password FROM e_assessments WHERE id = @id;`
     );
     if (!r.recordsets[0][0]?.n) return res.status(404).json({ message: "Assessment not found" });
 
@@ -3534,7 +3561,10 @@ const setSebSettings = async (req, res) => {
       success: true,
       require_seb: !!row.require_seb,
       seb_keys: row.seb_keys || "",
-      message: row.require_seb
+      seb_quit_password: row.seb_quit_password || "",
+      message: hasQuit && !hasEnabled && !hasKeys
+        ? (row.seb_quit_password ? "Quit password saved. Students need to download the exam file again for it to apply." : "Quit password removed.")
+        : row.require_seb
         ? (row.seb_keys ? "Safe Exam Browser is REQUIRED — only SEB with a matching key can take this exam." : "Safe Exam Browser is REQUIRED, but no key is saved yet — only a basic check is applied. Add a Config Key for real protection.")
         : "Safe Exam Browser is not required for this assessment.",
     });

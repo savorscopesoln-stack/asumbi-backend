@@ -91,3 +91,14 @@ test("middleware: staff untouched, student blocked with 403 SEB_REQUIRED", async
   const res = mkRes(); await seb.enforceSeb(stu, res, () => called++);
   assert.strictEqual(called, 1); assert.strictEqual(res.code, 403); assert.strictEqual(res.body.code, "SEB_REQUIRED");
 });
+
+test("SEB running with a wrong key hash is reported as a stale configuration", async () => {
+  const req = mkReq({ headers: { "user-agent": "Mozilla/5.0 SEB/3.2.4", "x-safeexambrowser-requesthash": "f".repeat(64) } });
+  const r = await seb.checkSeb(req, mkPool({ require_seb: 1, seb_keys: KEY }), tenant(), 5);
+  assert.strictEqual(r.blocked, true); assert.strictEqual(r.stale, true);
+});
+
+test("a normal browser with no SEB headers is blocked but NOT stale", async () => {
+  const r = await seb.checkSeb(mkReq(), mkPool({ require_seb: 1, seb_keys: KEY }), tenant(), 5);
+  assert.strictEqual(r.blocked, true); assert.ok(!r.stale);
+});
