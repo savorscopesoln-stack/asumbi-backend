@@ -24,10 +24,9 @@
 
    CONFIG (backend env)
    ─────────────────────────────────────────────────────────
-   WEBAUTHN_RP_ID    your registrable domain, e.g. doravocore.co.ke. One passkey then
-                     works on www.doravocore.co.ke AND doravocore.co.ke. If unset, the
-                     hostname of the page the user is on is used (www and non-www would
-                     then be separate passkeys).
+   (built in)        doravocore.co.ke and doravo.co.ke (each with its www.) are always
+                     allowed - no env needed. Each domain has its own passkey.
+   WEBAUTHN_RP_ID    OPTIONAL extra registrable domains, comma separated.
    WEBAUTHN_ORIGINS  extra allowed site origins (comma separated). FRONTEND_URL and
                      SEB_ALLOWED_ORIGINS and anything under WEBAUTHN_RP_ID are allowed too.
    WEBAUTHN_RP_NAME  name shown in the device prompt (default "Doravo Core").
@@ -78,20 +77,32 @@ const listFrom = (v) =>
     .map((t) => { t = t.trim().replace(/\/+$/, ""); try { return /^https?:\/\//i.test(t) ? new URL(t).origin : ""; } catch { return ""; } })
     .filter(Boolean);
 
+/* Built-in production domains. A passkey is locked to ONE registrable domain (its RP ID), so each
+   domain gets its own RP ID: doravocore.co.ke covers doravocore.co.ke + www., doravo.co.ke covers
+   doravo.co.ke + www. WEBAUTHN_RP_ID may add more (comma separated). A passkey made on one domain
+   cannot be used on the other - the user simply turns it on once per domain. */
+const BUILTIN_RP_DOMAINS = ["doravocore.co.ke", "doravo.co.ke"];
+
 function resolveRp(req) {
   const origin = String(req.headers.origin || "").trim().replace(/\/+$/, "");
-  let host = "";
-  try { host = new URL(origin).hostname.toLowerCase(); } catch { return null; }
-  const configuredRp = String(process.env.WEBAUTHN_RP_ID || "").trim().toLowerCase();
-  const allowed = [
-    ...listFrom(process.env.FRONTEND_URL), ...listFrom(process.env.WEBAUTHN_ORIGINS), ...listFrom(process.env.SEB_ALLOWED_ORIGINS),
-  ];
-  const underRp = configuredRp && new URL(origin).protocol === "https:" && (host === configuredRp || host.endsWith("." + configuredRp));
-  if (!allowed.includes(origin) && !underRp) {
-    console.warn(`PASSKEY: origin "${origin}" is not allowed. Add it to WEBAUTHN_ORIGINS or set WEBAUTHN_RP_ID.`);
-    return null;
-  }
-  return { origin, rpID: configuredRp || host, rpName: process.env.WEBAUTHN_RP_NAME || "Doravo Core" };
+  let host = "", protocol = "";
+  try { const u = new URL(origin); host = u.hostname.toLowerCase(); protocol = u.protocol; } catch { return null; }
+  const rpDomains = [...new Set([
+    ...BUILTIN_RP_DOMAINS,
+    ...String(process.env.WEBAUTHN_RP_ID || "").split(/[\s,;]+/).map((d) => d.trim().toLowerCase()).filter(Boolean),
+  ])];
+  const rpName = process.env.WEBAUTHN_RP_NAME || "Doravo Core";
+
+  // 1) https page on one of our registrable domains (or a subdomain of it)
+  const domain = rpDomains.find((d) => host === d || host.endsWith("." + d));
+  if (domain && protocol === "https:") return { origin, rpID: domain, rpName };
+
+  // 2) explicitly allowed origins (e.g. localhost dev, Vercel preview): RP ID = that page's host
+  const allowed = [...listFrom(process.env.FRONTEND_URL), ...listFrom(process.env.WEBAUTHN_ORIGINS), ...listFrom(process.env.SEB_ALLOWED_ORIGINS)];
+  if (allowed.includes(origin)) return { origin, rpID: host, rpName };
+
+  console.warn(`PASSKEY: origin "${origin}" is not allowed. Add it to WEBAUTHN_ORIGINS.`);
+  return null;
 }
 
 const signChallenge = (payload) => jwt.sign(payload, SECRET(), { expiresIn: "5m" });
