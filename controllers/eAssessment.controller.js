@@ -69,6 +69,7 @@ const hasPendingResit = async (pool, assessmentId, studentId) => {
 // History must never break the real action it describes.
 const safeRecord = async (pool, args) => { try { return await assignmentEngine.recordBatch(pool, args); } catch (e) { console.error("ASSIGNMENT HISTORY ERROR:", e.message); return null; } };
 const { sendPdfBuffer } = require("../utils/reportExport");
+const { buildSebFile, inspectSebFile, MAX_SEB_BYTES } = require("../utils/sebConfigFile");
 const { checkSeb, sendSebBlocked, parseKeys: parseSebKeys, invalidateSebCache } = require("../utils/sebRestriction");
 const { checkStudentAccess, getPermittedStudents, toWallClock, isActiveStudent } = require("../utils/examAccess");
 const { checkDesktopOnly, sendBlocked, invalidateDesktopOnlyCache, invalidateDeviceAccessCache } = require("../utils/deviceRestriction");
@@ -367,7 +368,7 @@ const deleteCoverPage = async (req, res) => {
 const STAFF_ROLES = ["admin", "sub_admin", "sub_admin_2", "module_admin", "teacher"];
 const redactForRole = (row, role) => {
   if (STAFF_ROLES.includes(role)) return row;
-  const { exam_password, seb_keys, ...rest } = row; // never send secrets to students
+  const { exam_password, seb_keys, seb_config_name, ...rest } = row; // never send secrets to students
   return rest;
 };
 
@@ -409,7 +410,8 @@ const getEAssessments = async (req, res) => {
         ${isTeacher ? "CASE WHEN ea.teacher_id = @teacherId THEN 0 ELSE 1 END" : "0"} AS assigned_only,
         (SELECT COUNT(*) FROM e_assessment_questions eq WHERE eq.e_assessment_id = ea.id) AS question_count,
         (SELECT COUNT(*) FROM e_assessment_submissions es WHERE es.e_assessment_id = ea.id) AS submission_count,
-        (SELECT COUNT(*) FROM e_assessment_allowed_students al2 WHERE al2.e_assessment_id = ea.id) AS allowed_count
+        (SELECT COUNT(*) FROM e_assessment_allowed_students al2 WHERE al2.e_assessment_id = ea.id) AS allowed_count,
+        (SELECT TOP 1 sc.file_name FROM e_assessment_seb_configs sc WHERE sc.assessment_id = ea.id) AS seb_config_name
         ${isStudent ? `,
         sub.id AS my_submission_id, sub.status AS my_submission_status,
         sub.score AS my_score, sub.submitted_at AS my_submitted_at,
@@ -3288,7 +3290,11 @@ const findAssessmentAnyTenant = async (id) => {
     try {
       const pool = await getPool(tenantKey);
       const r = await pool.request().input("id", sql.Int, id)
-        .query("SELECT id, title, ISNULL(require_seb,0) AS require_seb FROM e_assessments WHERE id = @id");
+        .query(`SELECT a.id, a.title, ISNULL(a.require_seb,0) AS require_seb,
+                 c.file_name AS seb_config_name, c.data AS seb_config
+                 FROM e_assessments a
+                 LEFT JOIN e_assessment_seb_configs c ON c.assessment_id = a.id
+                 WHERE a.id = @id`);
       if (r.recordset[0]) return r.recordset[0];
     } catch (e) { /* try next tenant */ }
   }
@@ -3301,7 +3307,7 @@ const getSebInfo = async (req, res) => {
     if (!id) return res.status(400).json({ message: "Invalid assessment ID" });
     const a = await findAssessmentAnyTenant(id);
     res.set("Cache-Control", "no-store");
-    return res.json({ require_seb: !!(a && a.require_seb) });
+    return res.json({ require_seb: !!(a && a.require_seb), custom_config: !!(a && a.seb_config_name) });
   } catch (err) {
     console.error("GET SEB INFO ERROR:", err.message);
     return res.json({ require_seb: false });
@@ -3316,6 +3322,17 @@ const downloadSebConfig = async (req, res) => {
     if (!id) return res.status(400).json({ message: "Invalid assessment ID" });
     const a = await findAssessmentAnyTenant(id);
     if (!a) return res.status(404).json({ message: "Assessment not found" });
+
+    // An admin-uploaded configuration (SEB Config Tool file) replaces the generated one.
+    if (a.seb_config && a.seb_config.length) {
+      res.set({
+        "Content-Type": "application/seb",
+        "Content-Disposition": `attachment; filename="exam-${id}.seb"`,
+        "Cache-Control": "no-store",
+        "X-Seb-Source": "uploaded",
+      });
+      return res.send(Buffer.from(a.seb_config));
+    }
 
     // Student site origin: ?origin= is honoured only if it is in FRONTEND_URL.
     // The exam link is used AS IS (e.g. https://www.doravocore.co.ke/take-assessment/5077).
@@ -3398,8 +3415,9 @@ ${bool("browserWindowAllowReload", false)}
 <key>browserViewMode</key><integer>1</integer>
 </dict></plist>`;
 
-    // .seb = gzip( "plnd" + plist )  (plnd = plain, unencrypted data)
-    const body = zlib.gzipSync(Buffer.from("plnd" + plist, "utf8"), { mtime: 0 });
+    // .seb = gzip( "plnd" + gzip(plist) )  — TWO gzip layers (see utils/sebConfigFile.js).
+    // A single layer made SEB for macOS crash on open (nil plist data -> uncaught NSException).
+    const body = buildSebFile(plist);
     res.set({
       "Content-Type": "application/seb",
       "Content-Disposition": `attachment; filename="exam-${id}.seb"`,
@@ -3410,6 +3428,66 @@ ${bool("browserWindowAllowReload", false)}
   } catch (err) {
     console.error("SEB CONFIG ERROR:", err.message);
     return res.status(500).json({ message: "Could not build the SEB file" });
+  }
+};
+
+/* =========================================================================
+   SAFE EXAM BROWSER — uploaded configuration
+     PUT    /e-assessments/admin/:id/seb-config   { file_name, data_base64 }
+     DELETE /e-assessments/admin/:id/seb-config
+   The uploaded .seb (made in the SEB Config Tool) is stored with the
+   assessment and handed to students instead of the generated file.
+   Remember to paste that file's Config Key into "SEB keys" so the server can
+   verify requests really come from SEB started with it.
+========================================================================= */
+const uploadSebConfig = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const id = toInt(req.params.id);
+    if (!id) return res.status(400).json({ message: "Invalid assessment ID" });
+    const b64 = String(req.body?.data_base64 || "").replace(/^data:[^,]*,/, "");
+    if (!b64) return res.status(400).json({ message: "No file received." });
+    const buf = Buffer.from(b64, "base64");
+    if (buf.length > MAX_SEB_BYTES) return res.status(400).json({ message: "The file is too large to be a SEB configuration (limit 1 MB)." });
+    const info = inspectSebFile(buf);
+    if (!info.ok) return res.status(400).json({ message: info.message });
+    const name = String(req.body?.file_name || "config.seb").replace(/[^\w.\- ]+/g, "_").slice(0, 200) || "config.seb";
+
+    const exists = await pool.request().input("id", sql.Int, id).query("SELECT 1 AS ok FROM e_assessments WHERE id = @id");
+    if (!exists.recordset[0]) return res.status(404).json({ message: "Assessment not found" });
+
+    await pool.request()
+      .input("id", sql.Int, id)
+      .input("name", sql.NVarChar(255), name)
+      .input("data", sql.VarBinary(sql.MAX), buf)
+      .query(`
+        IF EXISTS (SELECT 1 FROM e_assessment_seb_configs WHERE assessment_id = @id)
+          UPDATE e_assessment_seb_configs SET file_name = @name, data = @data, uploaded_at = GETDATE() WHERE assessment_id = @id
+        ELSE
+          INSERT INTO e_assessment_seb_configs (assessment_id, file_name, data) VALUES (@id, @name, @data)
+      `);
+
+    let warning = "";
+    if (info.kind === "plain" && info.startURL && !/\/take-assessment\/\d+/.test(info.startURL)) {
+      warning = `The file's Start URL (${info.startURL}) is not this exam's page (…/take-assessment/${id}). Students would open the wrong page.`;
+    }
+    res.json({ success: true, seb_config_name: name, kind: info.kind, start_url: info.startURL || "", warning,
+      message: "Configuration saved. Students will now download this file." });
+  } catch (err) {
+    console.error("UPLOAD SEB CONFIG ERROR:", err);
+    res.status(500).json({ message: "Failed to save the SEB configuration" });
+  }
+};
+
+const deleteSebConfig = async (req, res) => {
+  try {
+    const id = toInt(req.params.id);
+    if (!id) return res.status(400).json({ message: "Invalid assessment ID" });
+    await req.pool.request().input("id", sql.Int, id).query("DELETE FROM e_assessment_seb_configs WHERE assessment_id = @id");
+    res.json({ success: true, message: "Uploaded configuration removed. The automatic file will be used." });
+  } catch (err) {
+    console.error("DELETE SEB CONFIG ERROR:", err);
+    res.status(500).json({ message: "Failed to remove the SEB configuration" });
   }
 };
 
@@ -5151,6 +5229,8 @@ module.exports = {
   setAccessSettings,
   setSecuritySettings,
   setSebSettings,
+  uploadSebConfig,
+  deleteSebConfig,
   getSebInfo,
   downloadSebConfig,
   getSecuritySettings,

@@ -478,6 +478,12 @@ router.put("/admin/reset-password", protect, requirePage("Password Reset"), asyn
       .input("password", sql.NVarChar, hashed)
       .query(`UPDATE ${table} SET password = @password, mustChangePassword = 1 WHERE id = @id`);
 
+    // A reset means the account may be compromised: forget its fingerprint/face devices too.
+    try {
+      await pool.request().input("s", sql.NVarChar(20), source).input("a", sql.Int, id)
+        .query("IF EXISTS (SELECT * FROM sysobjects WHERE name='UserPasskeys' AND xtype='U') DELETE FROM UserPasskeys WHERE source=@s AND accountId=@a");
+    } catch (e) { console.error("PASSKEY CLEAR ON RESET ERROR:", e.message); }
+
     return res.json({
       message: "Password reset to default",
       username: account.username,

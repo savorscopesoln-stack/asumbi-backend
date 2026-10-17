@@ -264,6 +264,19 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       ALTER TABLE e_assessments ADD seb_keys NVARCHAR(MAX) NULL
     `);
 
+    /* ---------------- e_assessment_seb_configs ----------------
+       Optional admin-uploaded .seb file per assessment (kept out of
+       e_assessments so SELECT ea.* never drags the binary into list queries). */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='e_assessment_seb_configs' AND xtype='U')
+      CREATE TABLE e_assessment_seb_configs (
+        assessment_id INT NOT NULL PRIMARY KEY,
+        file_name NVARCHAR(255) NOT NULL,
+        data VARBINARY(MAX) NOT NULL,
+        uploaded_at DATETIME NOT NULL DEFAULT GETDATE()
+      )
+    `);
+
     /* ---------------- e_assessments.music_paper ----------------
        Marks an assessment as a Music paper (or any paper whose answers need
        drawing: staves, notes, rests, diagrams). When 1, the student exam page

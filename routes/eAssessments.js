@@ -23,7 +23,7 @@ const {
 
   // exam session / device lock
   startExamSession, activateExamSession, heartbeatExamSession, endExamSession,
-  setDesktopOnly, setMusicPaper, setModelSheet, getAccessSettings, setAccessSettings, getStudentsActivation, setStudentsActivation, setSecuritySettings, setSebSettings, getSebInfo, downloadSebConfig, getSecuritySettings, getActivityLog,
+  setDesktopOnly, setMusicPaper, setModelSheet, getAccessSettings, setAccessSettings, getStudentsActivation, setStudentsActivation, setSecuritySettings, setSebSettings, uploadSebConfig, deleteSebConfig, getSebInfo, downloadSebConfig, getSecuritySettings, getActivityLog,
   getExamSessions, unlockExamSession, unlockExamSessionsBulk, getDeviceAccess, allowDevice, revokeDevice, downloadAttendancePdf, examSessionStatus, lockExamSession,
   autosaveExamAnswers, getExamDraft, grantResit, cancelResit, getUnsubmittedSessions,
 
@@ -133,6 +133,8 @@ router.get("/admin/students-activation", protect, requirePage("E-Assessments"), 
 router.put("/admin/students-activation/status", protect, requirePage("E-Assessments"), setStudentsActivation);
 router.put("/admin/:id/security", protect, requirePage("E-Assessments"), setSecuritySettings);
 router.put("/admin/:id/seb", protect, requirePage("E-Assessments"), setSebSettings);
+router.put("/admin/:id/seb-config", protect, requirePage("E-Assessments"), uploadSebConfig);
+router.delete("/admin/:id/seb-config", protect, requirePage("E-Assessments"), deleteSebConfig);
 router.get("/admin/device-access", protect, requirePage("E-Assessments"), getDeviceAccess);
 router.put("/admin/device-access/:id/allow", protect, requirePage("E-Assessments"), allowDevice);
 router.put("/admin/device-access/:id/revoke", protect, requirePage("E-Assessments"), revokeDevice);

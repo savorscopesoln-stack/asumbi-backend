@@ -322,6 +322,8 @@ app.get("/", (req, res) => {
 /* =========================================================
    ROUTERS (each of these owns its own /api/* subtree)
 ========================================================= */
+// Passkeys (fingerprint / face / device-PIN sign-in) — mounted before the general /api/auth router.
+app.use("/api/auth/passkey", require("./routes/passkey"));
 app.use("/api/auth", authRoutes);
 app.use("/api/assessments", protect, assessmentsRoutes);
 app.use("/api/practicum", protect, practicumRoutes);

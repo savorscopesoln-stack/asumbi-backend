@@ -88,6 +88,8 @@ const ROUTE_ACTIONS = {
   "PUT /admin/students-activation/status": { action: "set_student_status",       kind: "none" },
   "PUT /admin/:id/security":             { action: "set_security_settings",   kind: "assessment" },
   "PUT /admin/:id/seb":                  { action: "set_seb_settings",        kind: "assessment" },
+  "PUT /admin/:id/seb-config":           { action: "set_seb_settings",        kind: "assessment" },
+  "DELETE /admin/:id/seb-config":        { action: "set_seb_settings",        kind: "assessment" },
   "GET /admin/:id/attendance-pdf":      { action: "download_attendance_pdf", kind: "assessment" },
   "PUT /admin/device-access/:id/allow":  { action: "allow_device",            kind: "device_access" },
   "PUT /admin/device-access/:id/revoke": { action: "revoke_device",           kind: "device_access" },

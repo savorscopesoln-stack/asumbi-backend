@@ -26,6 +26,7 @@ require("./aiMarkingFinance.test.js");
 require("./aiMarkingSchemaFile.test.js");
 require("./aiMarkingTeacher.test.js");
 require("./deviceAccess.test.js");
+require("./sebConfigFile.test.js");
 require("./examAccess.test.js");
 require("./examClock.test.js");
 require("./sebRestriction.test.js");
