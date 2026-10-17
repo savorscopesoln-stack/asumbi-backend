@@ -14,6 +14,7 @@ const path = require("path");
 
 const { runWithTenant } = require("./utils/uploadPaths");
 const { poolPromise, sql, getPool, listTenantKeys, hasTenant } = require("./config/db");
+const { resolveTenantKey } = require("./config/tenants");
 const { protect, authorize, adminOnly, requirePage } = require("./middleware/authMiddleware");
 const { ensureSchema } = require("./utils/ensureSchema");
 const { photoUrlFor, deletePhotoByUrl, runPhotoUpload } = require("./middleware/photoUpload");
@@ -258,7 +259,11 @@ if (process.env.NODE_ENV !== "production") {
    NOT rejected here; that's still `protect`'s job on the actual
    route. This middleware only needs a best-effort tenant hint. */
 app.use(async (req, res, next) => {
+  // No/invalid token (login page, public school-settings, website): use the
+  // X-Db-Tenant header / Origin / Host maps (DB_TENANT_*_MAP) instead of always
+  // falling back to the default (Asumbi) database. A valid token overrides this.
   let tenant = "default";
+  try { tenant = resolveTenantKey(req) || "default"; } catch { tenant = "default"; }
 
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.startsWith("Bearer ")) {
@@ -269,7 +274,7 @@ app.use(async (req, res, next) => {
       );
       if (decoded && decoded.tenant) tenant = decoded.tenant;
     } catch {
-      // Invalid/expired — leave tenant as "default" and let `protect`
+      // Invalid/expired — keep the header/origin/host guess and let `protect`
       // reject the request on the route itself.
     }
   }

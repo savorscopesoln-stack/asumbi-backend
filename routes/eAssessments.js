@@ -19,6 +19,7 @@ const {
 
   // standalone exam-password login (no portal account session)
   examLogin,
+  identifyStudentForExams,
 
   // exam session / device lock
   startExamSession, activateExamSession, heartbeatExamSession, endExamSession,
@@ -243,6 +244,27 @@ router.post("/submissions/:id/request-remark", protect, authorize("student"), re
 // stay above the "/:id" route below so "/public/covers" isn't parsed
 // as an :id.
 router.get("/public/covers", getPublicAssessmentCovers);
+
+// Step 1 of the picker. Built for a whole school behind ONE public IP (400+
+// students): the limit is per username (stops guessing/hammering one account),
+// plus a very high per-IP ceiling that only a flood would reach.
+const identifyHits = new Map();
+const hit = (key, max, windowMs, now) => {
+  const rec = identifyHits.get(key) || { n: 0, reset: now + windowMs };
+  if (now > rec.reset) { rec.n = 0; rec.reset = now + windowMs; }
+  rec.n += 1;
+  identifyHits.set(key, rec);
+  return rec.n > max;
+};
+const identifyLimiter = (req, res, next) => {
+  const now = Date.now();
+  const u = String(req.body?.username || "").trim().toLowerCase().slice(0, 60);
+  if (identifyHits.size > 20000) { for (const [k, v] of identifyHits) if (now > v.reset) identifyHits.delete(k); }
+  const tooMany = hit(`u:${u}`, 40, 10 * 60 * 1000, now) || hit(`ip:${req.ip || "x"}`, 6000, 10 * 60 * 1000, now);
+  if (tooMany) return res.status(429).json({ success: false, message: "Too many attempts. Please wait a minute and try again." });
+  next();
+};
+router.post("/public/identify", identifyLimiter, identifyStudentForExams);
 router.get("/public/:id/seb-info", getSebInfo);
 router.get("/public/:id/seb-config", downloadSebConfig);
 

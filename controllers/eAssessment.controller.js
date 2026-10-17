@@ -525,6 +525,124 @@ const getPublicAssessmentCovers = async (req, res) => {
   }
 };
 
+/* =========================================================================
+   STUDENT IDENTIFY (public) — step 1 of the /take-assessment picker.
+   POST /e-assessments/public/identify   { username }   (username = the
+   student's assessment number)
+
+   Finds the student (searching every tenant DB, same as exam-login), and
+   reports their name, school and whether their account is active. If it is,
+   it also returns ONLY the active assessments THIS student may sit (class /
+   year match, trainee access list, open/close window, deactivation), plus any
+   closed paper they were granted a resit for. No passwords, questions or
+   other sensitive fields are returned, and entering the exam still needs the
+   exam password via /exam-login.
+========================================================================= */
+// Short in-memory cache (15s) so refreshes / double-clicks / the 60s background
+// poll of one student don't each hit the database. Only successful lookups cached.
+const identifyCache = new Map();
+const IDENTIFY_TTL_MS = 15000;
+
+const identifyStudentForExams = async (req, res) => {
+  try {
+    const username = String(req.body?.username || "").trim();
+    if (!username || username.length > 60) {
+      return res.status(400).json({ success: false, message: "Enter your assessment number." });
+    }
+    const cacheKey = username.toLowerCase();
+    const cached = identifyCache.get(cacheKey);
+    if (cached && Date.now() - cached.at < IDENTIFY_TTL_MS) {
+      res.set("Cache-Control", "no-store");
+      return res.json(cached.body);
+    }
+
+    let pool = null;
+    let tenant = null;
+    let student = null;
+    for (const tenantKey of listTenantKeys()) {
+      let candidatePool;
+      try {
+        candidatePool = await getPool(tenantKey);
+        const r = await withTransientRetry(
+          () => candidatePool.request()
+            .input("username", sql.NVarChar, username)
+            .query(`SELECT TOP 1 id, username, name, status, studentClass, yearOfStudy FROM Students WHERE username = @username`),
+          { label: `identify:fetch-student:${tenantKey}` }
+        );
+        if (r.recordset.length) { pool = candidatePool; tenant = tenantKey; student = r.recordset[0]; break; }
+      } catch (dbErr) {
+        if (isTransientDbError && isTransientDbError(dbErr)) return respondDbBusy(res, dbErr);
+        /* try next tenant */
+      }
+    }
+
+    res.set("Cache-Control", "no-store");
+    if (!student) {
+      return res.status(404).json({ success: false, code: "NOT_FOUND", message: "We couldn't find that assessment number. Check it and try again." });
+    }
+
+    let schoolName = "";
+    try {
+      const sr = await pool.request().query(`SELECT TOP 1 schoolName FROM SchoolSettings WHERE id = 1`);
+      schoolName = sr.recordset[0]?.schoolName || "";
+    } catch (e) { /* school settings optional */ }
+
+    const identity = { username: student.username, name: student.name || "", school: schoolName, class: student.studentClass || "" };
+
+    if (!isActiveStudent(student.status)) {
+      return res.json({
+        success: true, active: false, student: identity, assessments: [],
+        message: "Your account isn't active, so you can't sit for assessments. Please contact the school office.",
+      });
+    }
+
+    const result = await pool.request()
+      .input("cls", sql.NVarChar, student.studentClass || "")
+      .input("yr", sql.NVarChar, student.yearOfStudy == null ? "" : String(student.yearOfStudy))
+      .input("sid", sql.Int, student.id)
+      .query(`
+        SELECT TOP 100 ea.id, ea.title, ea.subject, ea.duration_minutes,
+          ea.cover_page_url, ISNULL(ea.require_seb, 0) AS require_seb,
+          CASE WHEN ea.available_until IS NULL THEN NULL
+               ELSE DATEDIFF(SECOND, GETDATE(), ea.available_until) END AS seconds_until_end,
+          CASE WHEN ${SQL_IS_ACTIVE} THEN 0 ELSE 1 END AS is_resit
+        FROM e_assessments ea
+        WHERE (
+            ${SQL_IS_ACTIVE}
+            OR EXISTS (SELECT 1 FROM e_assessment_exam_sessions es
+                       WHERE es.e_assessment_id = ea.id AND es.student_id = @sid
+                         AND es.resit_allowed = 1 AND es.status = 'issued')
+          )
+          AND (
+            (ea.class_id IS NULL AND ea.year_of_study IS NULL)
+            OR ea.class_id IN (SELECT c.id FROM Classes c WHERE c.name = @cls)
+            OR (ea.year_of_study IS NOT NULL AND CAST(ea.year_of_study AS NVARCHAR(20)) = @yr)
+            OR EXISTS (SELECT 1 FROM e_assessment_allowed_students al
+                       WHERE al.e_assessment_id = ea.id AND al.student_id = @sid)
+          )
+        ORDER BY ea.id DESC
+      `);
+
+    const assessments = [];
+    for (const row of result.recordset || []) {
+      let allowed = true;
+      try {
+        const check = await checkStudentAccess(pool, row.id, student.id, { skipWindow: !!row.is_resit });
+        allowed = !!check.allowed;
+      } catch (e) { allowed = true; } // a hiccup must not hide an exam; exam-login re-checks anyway
+      if (allowed) assessments.push({ ...row, require_seb: !!row.require_seb });
+    }
+
+    const body = { success: true, active: true, student: identity, assessments };
+    if (identifyCache.size > 5000) identifyCache.clear();
+    identifyCache.set(cacheKey, { at: Date.now(), body });
+    return res.json(body);
+  } catch (err) {
+    console.error("IDENTIFY STUDENT ERROR:", err);
+    return res.status(500).json({ success: false, message: "Something went wrong. Please try again." });
+  }
+};
+
 const getEAssessmentById = async (req, res) => {
   try {
     const pool = req.pool;
@@ -3200,10 +3318,17 @@ const downloadSebConfig = async (req, res) => {
     if (!a) return res.status(404).json({ message: "Assessment not found" });
 
     // Student site origin: ?origin= is honoured only if it is in FRONTEND_URL.
+    // The exam link is used AS IS (e.g. https://www.doravocore.co.ke/take-assessment/5077):
+    // the asked origin is accepted when it matches an allowed one, ignoring
+    // only a leading "www." and http/https, so www / non-www never silently
+    // falls back to a different host.
     const allowed = String(process.env.FRONTEND_URL || "http://localhost:5173")
       .split(",").map((o) => o.trim().replace(/\/+$/, "")).filter(Boolean);
     const asked = String(req.query.origin || "").trim().replace(/\/+$/, "");
-    const origin = allowed.includes(asked) ? asked : allowed[0];
+    const norm = (o) => o.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "");
+    const origin = allowed.includes(asked)
+      ? asked
+      : (asked && /^https?:\/\//i.test(asked) && allowed.some((o) => norm(o) === norm(asked)) ? asked : allowed[0]);
     const startURL = `${origin}/take-assessment/${id}`;
 
     const bool = (k, v) => `<key>${k}</key><${v ? "true" : "false"}/>`;
@@ -4997,6 +5122,7 @@ module.exports = {
 
   // public (no-auth) cover-page preview for the /take-assessment picker
   getPublicAssessmentCovers,
+  identifyStudentForExams,
 
   // cover page (per-exam PDF)
   uploadCoverPage, deleteCoverPage,
