@@ -258,11 +258,18 @@ function drawPdfHeader(doc, institution, { examinationName, academicYear, report
   const topY = doc.y;
   doc.fontSize(13).font("Helvetica-Bold").text(institution.schoolName || "Institution", textX, topY, { width: textWidth, align: "center" });
   if (institution.address) {
-    doc.fontSize(8).font("Helvetica").fillColor("#555").text(institution.address, { width: textWidth, align: "center" });
+    doc.fontSize(8).font("Helvetica").fillColor("#555").text(institution.address, textX, doc.y, { width: textWidth, align: "center" });
+  }
+  const contact = [institution.phone && `Tel: ${institution.phone}`, institution.email && `Email: ${institution.email}`, institution.website].filter(Boolean).join("  |  ");
+  if (contact) {
+    doc.fontSize(8).font("Helvetica").fillColor("#555").text(contact, textX, doc.y, { width: textWidth, align: "center" });
   }
   doc.fillColor("#000");
+  // clear the logo's bottom edge so the exam name never draws over it
+  if (institution.logoDiskPath) doc.y = Math.max(doc.y, topY + 44);
+  doc.x = startX;
   doc.moveDown(0.4);
-  doc.fontSize(11).font("Helvetica-Bold").text(examinationName || "", { align: "center" });
+  doc.fontSize(11).font("Helvetica-Bold").text(examinationName || "", startX, doc.y, { width: doc.page.width - doc.page.margins.left - doc.page.margins.right, align: "center" });
   if (academicYear) doc.fontSize(9).font("Helvetica").text(`Academic Year: ${academicYear}`, { align: "center" });
   doc.moveDown(0.6);
   doc.fontSize(12).font("Helvetica-Bold").text(reportTitle, { align: "center" });
@@ -394,12 +401,18 @@ function addPageNumbers(doc) {
   const range = doc.bufferedPageRange();
   for (let i = range.start; i < range.start + range.count; i++) {
     doc.switchToPage(i);
+    // The footer sits inside the bottom margin. Without zeroing it, pdfkit sees
+    // text below the page's content area and appends a BLANK page for every
+    // footer written — i.e. one extra empty page per real page.
+    const savedBottom = doc.page.margins.bottom;
+    doc.page.margins.bottom = 0;
     doc.fontSize(7).fillColor("#888").text(
       `Page ${i + 1} of ${range.count}`,
       doc.page.margins.left,
-      doc.page.height - doc.page.margins.bottom + 6,
-      { width: doc.page.width - doc.page.margins.left - doc.page.margins.right, align: "center" }
+      doc.page.height - savedBottom + 6,
+      { width: doc.page.width - doc.page.margins.left - doc.page.margins.right, align: "center", lineBreak: false }
     );
+    doc.page.margins.bottom = savedBottom;
   }
   doc.fillColor("#000");
 }
