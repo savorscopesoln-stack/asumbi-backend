@@ -15,26 +15,11 @@
    left out of speed figures instead of being guessed.
 ========================================================================= */
 const { sql } = require("../config/db");
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
->>>>>>> 24026f891fd15230ada7b8077750e39f50a0f297
->>>>>>> 57d8939c8b51b9aec372b01e6772b4ee8ccfb731
 const { backfillMarkersFromSessions } = require("../utils/markingBackfill");
 
 // Sessions change while teachers work, so re-credit them regularly, but not on every request.
 const BACKFILL_EVERY_MS = 60000;
 const lastBackfill = new Map(); // tenant -> timestamp
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-=======
-=======
->>>>>>> 1535e4c73fc63f1a2c5d914a1047febc9540573c
->>>>>>> 24026f891fd15230ada7b8077750e39f50a0f297
->>>>>>> 57d8939c8b51b9aec372b01e6772b4ee8ccfb731
 
 const toInt = (v) => {
   const n = parseInt(v, 10);
@@ -49,13 +34,6 @@ const getMarkingLeaderboard = async (req, res) => {
     const filter = aid ? "AND s.e_assessment_id = @aid" : "";
     const bind = (r) => (aid ? r.input("aid", sql.Int, aid) : r);
 
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
->>>>>>> 24026f891fd15230ada7b8077750e39f50a0f297
->>>>>>> 57d8939c8b51b9aec372b01e6772b4ee8ccfb731
     // Credit work recorded only in the teachers' marking sessions (marked before tracking existed).
     const tkey = req.dbTenant || "default";
     if (Date.now() - (lastBackfill.get(tkey) || 0) > BACKFILL_EVERY_MS) {
@@ -64,15 +42,6 @@ const getMarkingLeaderboard = async (req, res) => {
     }
 
     const [scripts, answers, openRows, sessionRows] = await Promise.all([
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-=======
-=======
-    const [scripts, answers] = await Promise.all([
->>>>>>> 1535e4c73fc63f1a2c5d914a1047febc9540573c
->>>>>>> 24026f891fd15230ada7b8077750e39f50a0f297
->>>>>>> 57d8939c8b51b9aec372b01e6772b4ee8ccfb731
       bind(pool.request()).query(`
         SELECT aa.teacher_id, s.e_assessment_id,
                COUNT(*) AS allocated,
@@ -100,13 +69,6 @@ const getMarkingLeaderboard = async (req, res) => {
         WHERE 1 = 1 ${filter}
         GROUP BY ax.teacher_id, s.e_assessment_id
       `),
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
->>>>>>> 24026f891fd15230ada7b8077750e39f50a0f297
->>>>>>> 57d8939c8b51b9aec372b01e6772b4ee8ccfb731
       // every answer a teacher is recorded as having marked, assigned to them or not
       bind(pool.request()).query(`
         SELECT an.marked_by AS teacher_id, s.e_assessment_id,
@@ -124,14 +86,6 @@ const getMarkingLeaderboard = async (req, res) => {
         FROM e_assessment_marking_sessions
         WHERE 1 = 1 ${aid ? "AND e_assessment_id = @aid" : ""}
       `).catch(() => ({ recordset: [] })),
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-=======
-=======
->>>>>>> 1535e4c73fc63f1a2c5d914a1047febc9540573c
->>>>>>> 24026f891fd15230ada7b8077750e39f50a0f297
->>>>>>> 57d8939c8b51b9aec372b01e6772b4ee8ccfb731
     ]);
 
     // ---- merge both shapes into one row per (teacher, assessment) ----
@@ -159,13 +113,6 @@ const getMarkingLeaderboard = async (req, res) => {
     fold(scripts, "script");
     fold(answers, "answer");
 
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
->>>>>>> 24026f891fd15230ada7b8077750e39f50a0f297
->>>>>>> 57d8939c8b51b9aec372b01e6772b4ee8ccfb731
     // Teachers who marked work that was never assigned to them (e.g. an assessment owner
     // marking everything): "open" work. Their marked answers count even with no allocation.
     for (const r of openRows.recordset) {
@@ -202,14 +149,6 @@ const getMarkingLeaderboard = async (req, res) => {
       } catch { /* leave the pool size unknown */ }
     }
 
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-=======
-=======
->>>>>>> 1535e4c73fc63f1a2c5d914a1047febc9540573c
->>>>>>> 24026f891fd15230ada7b8077750e39f50a0f297
->>>>>>> 57d8939c8b51b9aec372b01e6772b4ee8ccfb731
     const teacherIds = [...new Set([...cells.values()].map((c) => c.teacher_id))];
     const assessmentIds = [...new Set([...cells.values()].map((c) => c.e_assessment_id))];
     const names = new Map();
@@ -229,13 +168,6 @@ const getMarkingLeaderboard = async (req, res) => {
       c.teacher_name = names.get(c.teacher_id) || `Teacher #${c.teacher_id}`;
       c.assessment_title = titles.get(c.e_assessment_id)?.title || `Assessment #${c.e_assessment_id}`;
       c.subject = titles.get(c.e_assessment_id)?.subject || null;
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
->>>>>>> 24026f891fd15230ada7b8077750e39f50a0f297
->>>>>>> 57d8939c8b51b9aec372b01e6772b4ee8ccfb731
       if (c.open) {
         // no fixed allocation: show what they marked, against the shared pool still left
         const left = poolLeft.get(c.e_assessment_id);
@@ -268,24 +200,6 @@ const getMarkingLeaderboard = async (req, res) => {
         }
       }
       if (ses && !c.last_marked_at) c.last_marked_at = ses.updatedAt; // last activity, even without per-answer times
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-=======
-=======
-      c.remaining = Math.max(0, c.allocated - c.marked);
-      c.percent = c.allocated ? Math.round((c.marked / c.allocated) * 100) : 0;
-      c.finished = c.allocated > 0 && c.marked >= c.allocated;
-      // finished_at only means something once every allocated item has a timestamp
-      c.finished_at = c.finished && c.timed >= c.allocated ? c.last_marked_at : null;
-      const span = c.timed >= 2 && c.first_marked_at && c.last_marked_at ? ms(c.last_marked_at) - ms(c.first_marked_at) : 0;
-      c.items_per_hour = span > 0 ? Math.round(((c.timed - 1) / (span / 3600000)) * 10) / 10 : null;
-      c.avg_minutes_per_item = span > 0 ? Math.round((span / 60000 / (c.timed - 1)) * 10) / 10 : null;
-      c.turnaround_minutes = c.finished_at && c.first_assigned
-        ? Math.max(0, Math.round((ms(c.finished_at) - ms(c.first_assigned)) / 60000)) : null;
->>>>>>> 1535e4c73fc63f1a2c5d914a1047febc9540573c
->>>>>>> 24026f891fd15230ada7b8077750e39f50a0f297
->>>>>>> 57d8939c8b51b9aec372b01e6772b4ee8ccfb731
       if (!perAssessment.has(c.e_assessment_id)) perAssessment.set(c.e_assessment_id, []);
       perAssessment.get(c.e_assessment_id).push(c);
     }
@@ -294,13 +208,6 @@ const getMarkingLeaderboard = async (req, res) => {
     const assessments = [];
     for (const [id, list] of perAssessment) {
       const finishers = list.filter((c) => c.finished_at).sort((a, b) => ms(a.finished_at) - ms(b.finished_at));
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
->>>>>>> 24026f891fd15230ada7b8077750e39f50a0f297
->>>>>>> 57d8939c8b51b9aec372b01e6772b4ee8ccfb731
       const rest = list.filter((c) => !c.finished_at).sort((a, b) => (b.percent ?? -1) - (a.percent ?? -1) || b.marked - a.marked);
       [...finishers, ...rest].forEach((c, i) => { c.rank = i + 1; });
       finishers.forEach((c, i) => { c.finish_place = i + 1; });
@@ -311,19 +218,6 @@ const getMarkingLeaderboard = async (req, res) => {
       const pooled = list.some((c) => c.open) ? (poolLeft.get(id) || 0) : 0;
       const totalAllocated = assignedAlloc + openMarked + pooled; // open work counts the shared pool still left
       const totalMarked = assignedMarked + openMarked;
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-=======
-=======
-      const rest = list.filter((c) => !c.finished_at).sort((a, b) => b.percent - a.percent || b.marked - a.marked);
-      [...finishers, ...rest].forEach((c, i) => { c.rank = i + 1; });
-      finishers.forEach((c, i) => { c.finish_place = i + 1; });
-      const totalAllocated = list.reduce((n, c) => n + c.allocated, 0);
-      const totalMarked = list.reduce((n, c) => n + c.marked, 0);
->>>>>>> 1535e4c73fc63f1a2c5d914a1047febc9540573c
->>>>>>> 24026f891fd15230ada7b8077750e39f50a0f297
->>>>>>> 57d8939c8b51b9aec372b01e6772b4ee8ccfb731
       assessments.push({
         e_assessment_id: id,
         title: titles.get(id)?.title || `Assessment #${id}`,
@@ -331,18 +225,7 @@ const getMarkingLeaderboard = async (req, res) => {
         allocated: totalAllocated,
         marked: totalMarked,
         percent: totalAllocated ? Math.round((totalMarked / totalAllocated) * 100) : 0,
-<<<<<<< HEAD
         has_open_pool: list.some((c) => c.open),
-=======
-<<<<<<< HEAD
-        has_open_pool: list.some((c) => c.open),
-=======
-<<<<<<< HEAD
-        has_open_pool: list.some((c) => c.open),
-=======
->>>>>>> 1535e4c73fc63f1a2c5d914a1047febc9540573c
->>>>>>> 24026f891fd15230ada7b8077750e39f50a0f297
->>>>>>> 57d8939c8b51b9aec372b01e6772b4ee8ccfb731
         first_finisher: finishers[0]
           ? { teacher_id: finishers[0].teacher_id, teacher_name: finishers[0].teacher_name, finished_at: finishers[0].finished_at }
           : null,
@@ -356,116 +239,38 @@ const getMarkingLeaderboard = async (req, res) => {
     for (const c of cells.values()) {
       const t = byTeacher.get(c.teacher_id) || {
         teacher_id: c.teacher_id, teacher_name: c.teacher_name,
-<<<<<<< HEAD
         assessments: 0, allocated: 0, marked: 0, assigned_marked: 0, open_marked: 0, timed: 0,
-=======
-<<<<<<< HEAD
-        assessments: 0, allocated: 0, marked: 0, assigned_marked: 0, open_marked: 0, timed: 0,
-=======
-<<<<<<< HEAD
-        assessments: 0, allocated: 0, marked: 0, assigned_marked: 0, open_marked: 0, timed: 0,
-=======
-        assessments: 0, allocated: 0, marked: 0, timed: 0,
->>>>>>> 1535e4c73fc63f1a2c5d914a1047febc9540573c
->>>>>>> 24026f891fd15230ada7b8077750e39f50a0f297
->>>>>>> 57d8939c8b51b9aec372b01e6772b4ee8ccfb731
         wins: 0, podiums: 0, finished_assessments: 0,
         speed_weight: 0, speed_sum: 0, last_activity: null,
       };
       t.assessments += 1;
-<<<<<<< HEAD
       t.allocated += c.allocated || 0;
       t.marked += c.marked;
       if (c.open) t.open_marked += c.marked; else t.assigned_marked += c.marked;
-=======
-<<<<<<< HEAD
-      t.allocated += c.allocated || 0;
-      t.marked += c.marked;
-      if (c.open) t.open_marked += c.marked; else t.assigned_marked += c.marked;
-=======
-<<<<<<< HEAD
-      t.allocated += c.allocated || 0;
-      t.marked += c.marked;
-      if (c.open) t.open_marked += c.marked; else t.assigned_marked += c.marked;
-=======
-      t.allocated += c.allocated;
-      t.marked += c.marked;
->>>>>>> 1535e4c73fc63f1a2c5d914a1047febc9540573c
->>>>>>> 24026f891fd15230ada7b8077750e39f50a0f297
->>>>>>> 57d8939c8b51b9aec372b01e6772b4ee8ccfb731
       t.timed += c.timed;
       if (c.finished) t.finished_assessments += 1;
       if (c.finish_place === 1) t.wins += 1;
       if (c.finish_place && c.finish_place <= 3) t.podiums += 1;
-<<<<<<< HEAD
       if (c.items_per_hour != null) { const w = c.timed || c.marked; t.speed_sum += c.items_per_hour * w; t.speed_weight += w; }
-=======
-<<<<<<< HEAD
-      if (c.items_per_hour != null) { const w = c.timed || c.marked; t.speed_sum += c.items_per_hour * w; t.speed_weight += w; }
-=======
-<<<<<<< HEAD
-      if (c.items_per_hour != null) { const w = c.timed || c.marked; t.speed_sum += c.items_per_hour * w; t.speed_weight += w; }
-=======
-      if (c.items_per_hour != null) { t.speed_sum += c.items_per_hour * c.timed; t.speed_weight += c.timed; }
->>>>>>> 1535e4c73fc63f1a2c5d914a1047febc9540573c
->>>>>>> 24026f891fd15230ada7b8077750e39f50a0f297
->>>>>>> 57d8939c8b51b9aec372b01e6772b4ee8ccfb731
       if (c.last_marked_at && (!t.last_activity || ms(c.last_marked_at) > ms(t.last_activity))) t.last_activity = c.last_marked_at;
       byTeacher.set(c.teacher_id, t);
     }
     const teachers = [...byTeacher.values()].map((t) => ({
       teacher_id: t.teacher_id, teacher_name: t.teacher_name, assessments: t.assessments,
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
->>>>>>> 24026f891fd15230ada7b8077750e39f50a0f297
->>>>>>> 57d8939c8b51b9aec372b01e6772b4ee8ccfb731
       allocated: t.allocated, marked: t.marked, open_marked: t.open_marked,
       remaining: Math.max(0, t.allocated - t.assigned_marked),
       // progress only exists against a fixed allocation; open marking has no "100%"
       percent: t.allocated ? Math.round((t.assigned_marked / t.allocated) * 100) : null,
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-=======
-=======
-      allocated: t.allocated, marked: t.marked, remaining: Math.max(0, t.allocated - t.marked),
-      percent: t.allocated ? Math.round((t.marked / t.allocated) * 100) : 0,
->>>>>>> 1535e4c73fc63f1a2c5d914a1047febc9540573c
->>>>>>> 24026f891fd15230ada7b8077750e39f50a0f297
->>>>>>> 57d8939c8b51b9aec372b01e6772b4ee8ccfb731
       finished_assessments: t.finished_assessments, wins: t.wins, podiums: t.podiums,
       items_per_hour: t.speed_weight ? Math.round((t.speed_sum / t.speed_weight) * 10) / 10 : null,
       last_activity: t.last_activity,
     }));
     // default order: most progress, then most first-place finishes, then most marked
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
->>>>>>> 24026f891fd15230ada7b8077750e39f50a0f297
->>>>>>> 57d8939c8b51b9aec372b01e6772b4ee8ccfb731
     teachers.sort((a, b) => (b.percent ?? -1) - (a.percent ?? -1) || b.wins - a.wins || b.marked - a.marked || a.teacher_name.localeCompare(b.teacher_name));
     teachers.forEach((t, i) => { t.rank = i + 1; });
 
     const allocated = assessments.reduce((n, a) => n + a.allocated, 0);
     const marked = assessments.reduce((n, a) => n + a.marked, 0);
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-=======
-=======
-    teachers.sort((a, b) => b.percent - a.percent || b.wins - a.wins || b.marked - a.marked || a.teacher_name.localeCompare(b.teacher_name));
-    teachers.forEach((t, i) => { t.rank = i + 1; });
-
-    const allocated = teachers.reduce((n, t) => n + t.allocated, 0);
-    const marked = teachers.reduce((n, t) => n + t.marked, 0);
->>>>>>> 1535e4c73fc63f1a2c5d914a1047febc9540573c
->>>>>>> 24026f891fd15230ada7b8077750e39f50a0f297
->>>>>>> 57d8939c8b51b9aec372b01e6772b4ee8ccfb731
     res.json({
       generated_at: new Date().toISOString(),
       me: toInt(req.user?.id),
