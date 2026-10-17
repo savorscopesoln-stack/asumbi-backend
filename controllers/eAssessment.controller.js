@@ -3318,17 +3318,56 @@ const downloadSebConfig = async (req, res) => {
     if (!a) return res.status(404).json({ message: "Assessment not found" });
 
     // Student site origin: ?origin= is honoured only if it is in FRONTEND_URL.
-    // The exam link is used AS IS (e.g. https://www.doravocore.co.ke/take-assessment/5077):
-    // the asked origin is accepted when it matches an allowed one, ignoring
-    // only a leading "www." and http/https, so www / non-www never silently
-    // falls back to a different host.
-    const allowed = String(process.env.FRONTEND_URL || "http://localhost:5173")
-      .split(",").map((o) => o.trim().replace(/\/+$/, "")).filter(Boolean);
-    const asked = String(req.query.origin || "").trim().replace(/\/+$/, "");
+    // The exam link is used AS IS (e.g. https://www.doravocore.co.ke/take-assessment/5077).
+    // The origin the student is on (?origin=) is accepted when it is:
+    //   - listed in FRONTEND_URL or SEB_ALLOWED_ORIGINS (comma separated), or
+    //   - the host of a DB_TENANT_ORIGIN_MAP entry, or
+    //   - on the same registered domain as THIS API (api.doravocore.co.ke -> doravocore.co.ke
+    //     and www.doravocore.co.ke), except shared hosts like vercel.app / onrender.com.
+    // Anything else falls back to the first configured origin (never to a stranger's site,
+    // since a .seb file sends students' browsers to its startURL).
+    // Tolerant of messy env values: separators can be commas, spaces, semicolons or
+    // newlines, and two addresses pasted together with no separator
+    // ("https://a.co.kehttps://b.co.ke") are pulled apart. Anything that is not a
+    // real http(s) address is dropped (a bad one used to end up in the .seb file and
+    // SEB then showed "DNS_PROBE_FINISHED_NXDOMAIN ... typo in doravo.co.kehttps").
+    const splitList = (v) => String(v || "")
+      .split(/[\s,;]+/)
+      .flatMap((t) => t.split(/(?=https?:\/\/)/i))
+      .map((t) => {
+        t = t.trim().replace(/\/+$/, "");
+        if (!/^https?:\/\//i.test(t)) return t; // e.g. map entries like "origin:tenant" are handled by the caller
+        try { return new URL(t).origin; } catch { return ""; }
+      })
+      .filter(Boolean);
+    const allowed = [...splitList(process.env.FRONTEND_URL || "http://localhost:5173"), ...splitList(process.env.SEB_ALLOWED_ORIGINS)];
+    for (const pair of String(process.env.DB_TENANT_ORIGIN_MAP || "").split(",")) {
+      const t = pair.trim();
+      const i = t.lastIndexOf(":");
+      const o = (i > 7 ? t.slice(0, i) : t).trim().replace(/\/+$/, "");
+      try { if (/^https?:\/\//i.test(o)) allowed.push(new URL(o).origin); } catch { /* ignore */ }
+    }
+    let asked = String(req.query.origin || "").trim().replace(/\/+$/, "");
+    try { asked = /^https?:\/\//i.test(asked) ? new URL(asked).origin : ""; } catch { asked = ""; }
     const norm = (o) => o.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "");
-    const origin = allowed.includes(asked)
-      ? asked
-      : (asked && /^https?:\/\//i.test(asked) && allowed.some((o) => norm(o) === norm(asked)) ? asked : allowed[0]);
+    const SHARED_HOSTS = /(^|\.)(vercel\.app|onrender\.com|railway\.app|herokuapp\.com|netlify\.app|azurewebsites\.net|fly\.dev|github\.io|localhost)$/i;
+    const sameParentAsApi = (o) => {
+      try {
+        const host = new URL(o).hostname.toLowerCase();
+        const apiHost = String(req.get("x-forwarded-host") || req.get("host") || "").split(",")[0].split(":")[0].toLowerCase();
+        const labels = apiHost.split(".");
+        if (labels.length < 3 || SHARED_HOSTS.test(apiHost)) return false;
+        const parent = labels.slice(1).join(".");
+        return host === parent || host.endsWith("." + parent);
+      } catch { return false; }
+    };
+    let origin;
+    if (allowed.includes(asked)) origin = asked;
+    else if (asked && /^https?:\/\//i.test(asked) && (allowed.some((o) => norm(o) === norm(asked)) || sameParentAsApi(asked))) origin = asked;
+    else {
+      origin = allowed[0];
+      if (asked) console.warn(`SEB CONFIG: origin "${asked}" is not allowed; using "${origin}". Add it to FRONTEND_URL or SEB_ALLOWED_ORIGINS.`);
+    }
     const startURL = `${origin}/take-assessment/${id}`;
 
     const bool = (k, v) => `<key>${k}</key><${v ? "true" : "false"}/>`;
@@ -3365,6 +3404,7 @@ ${bool("browserWindowAllowReload", false)}
       "Content-Type": "application/seb",
       "Content-Disposition": `attachment; filename="exam-${id}.seb"`,
       "Cache-Control": "no-store",
+      "X-Seb-Start-Url": startURL, // handy for checking which link the file opens
     });
     return res.send(body);
   } catch (err) {
