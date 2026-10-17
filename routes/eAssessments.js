@@ -1,4 +1,5 @@
 const express = require("express");
+const { getMarkingLeaderboard } = require("../controllers/markingLeaderboard.controller");
 const router = express.Router();
 
 const {
@@ -21,7 +22,7 @@ const {
 
   // exam session / device lock
   startExamSession, activateExamSession, heartbeatExamSession, endExamSession,
-  setDesktopOnly, setMusicPaper, getAccessSettings, setAccessSettings, getStudentsActivation, setStudentsActivation, setSecuritySettings, setSebSettings, getSecuritySettings, getActivityLog,
+  setDesktopOnly, setMusicPaper, setModelSheet, getAccessSettings, setAccessSettings, getStudentsActivation, setStudentsActivation, setSecuritySettings, setSebSettings, getSecuritySettings, getActivityLog,
   getExamSessions, unlockExamSession, unlockExamSessionsBulk, getDeviceAccess, allowDevice, revokeDevice, downloadAttendancePdf, examSessionStatus, lockExamSession,
   autosaveExamAnswers, getExamDraft, grantResit, cancelResit, getUnsubmittedSessions,
 
@@ -157,6 +158,8 @@ router.post("/admin/assignment-batches/:id/undo", protect, requirePage("E-Assess
 /* =========================================================================
    ADMIN — REMARK REQUESTS
 ========================================================================= */
+// Marking leaderboard: visible to every teacher as well as admins (everyone sees the same race)
+router.get("/marking-leaderboard", protect, authorize("teacher", "admin", "sub_admin", "sub_admin_2"), getMarkingLeaderboard);
 router.get("/admin/remark-requests", protect, requirePage("E-Assessments"), getRemarkRequests);
 router.put("/admin/remark-requests/:id/review", protect, requirePage("E-Assessments"), reviewRemarkRequest);
 
@@ -259,6 +262,7 @@ router.put("/:id", protect, authorize("teacher"), updateEAssessment);
 ========================================================================= */
 router.post("/:id/questions", protect, authorize("teacher", "admin", "sub_admin", "sub_admin_2"), addEAssessmentQuestion);
 router.get("/:id/questions", protect, enforceExamClient, getAssessmentQuestions);
+router.put("/questions/:questionId/model-sheet", protect, authorize("teacher", "admin", "sub_admin", "sub_admin_2", "module_admin"), setModelSheet);
 router.put("/questions/:questionId", protect, authorize("teacher", "admin", "sub_admin", "sub_admin_2"), updateQuestion);
 router.delete("/questions/:questionId", protect, authorize("teacher", "admin", "sub_admin", "sub_admin_2"), deleteQuestion);
 
