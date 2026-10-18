@@ -303,6 +303,21 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       ALTER TABLE e_assessments ADD music_paper BIT NOT NULL CONSTRAINT DF_e_assessments_music_paper DEFAULT 0
     `);
 
+    /* ---------------- e_assessments.art_paper ----------------
+       Art & Craft paper: same mechanism as music_paper (drawing pad on essay
+       questions, drawing stored as a PNG inside the answer, red-pen marking
+       on top). Set automatically when the subject looks like Art / Craft at
+       creation and switchable by the teacher/admin at any time. Defaults to
+       0 so nothing changes for existing assessments. */
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='e_assessments' AND xtype='U')
+      AND NOT EXISTS (
+        SELECT * FROM sys.columns
+        WHERE Name = N'art_paper' AND Object_ID = Object_ID(N'e_assessments')
+      )
+      ALTER TABLE e_assessments ADD art_paper BIT NOT NULL CONSTRAINT DF_e_assessments_art_paper DEFAULT 0
+    `);
+
     /* ---------------- music paper: marker annotations + model answer ----------
        e_assessment_answers.music_annotations: JSON array of transparent PNG
          overlays (the marker's red pen / ticks / crosses / notes), one per

@@ -125,6 +125,8 @@ const createEAssessment = async (req, res) => {
     // A paper whose subject is Music is identified automatically; the teacher
     // can still send music_paper explicitly (true/false) to override it.
     const musicPaper = typeof req.body.music_paper === "boolean" ? req.body.music_paper : /music/i.test(String(subject || ""));
+    // Same for Art & Craft (art, arts, craft, creative arts, visual art, art and craft ...).
+    const artPaper = typeof req.body.art_paper === "boolean" ? req.body.art_paper : ART_SUBJECT_RE.test(String(subject || ""));
 
     if (!title || !subject || !class_id) {
       return res.status(400).json({ message: "Missing required fields" });
@@ -144,12 +146,13 @@ const createEAssessment = async (req, res) => {
       .input("exam_password", sql.NVarChar, (exam_password || "").trim() || null)
       .input("questions_deadline", sql.DateTime, questions_deadline ? new Date(questions_deadline) : null)
       .input("music_paper", sql.Bit, musicPaper ? 1 : 0)
+      .input("art_paper", sql.Bit, artPaper ? 1 : 0)
       .query(`
         INSERT INTO e_assessments
-          (title, subject, class_id, year_of_study, teacher_id, duration_minutes, total_marks, instructions, status, active_status, exam_password, questions_deadline, music_paper)
+          (title, subject, class_id, year_of_study, teacher_id, duration_minutes, total_marks, instructions, status, active_status, exam_password, questions_deadline, music_paper, art_paper)
         OUTPUT INSERTED.id
         VALUES
-          (@title, @subject, @class_id, @year_of_study, @teacher_id, @duration_minutes, @total_marks, @instructions, 'pending', 'Inactive', @exam_password, @questions_deadline, @music_paper)
+          (@title, @subject, @class_id, @year_of_study, @teacher_id, @duration_minutes, @total_marks, @instructions, 'pending', 'Inactive', @exam_password, @questions_deadline, @music_paper, @art_paper)
       `);
     // active_status starts explicitly 'Inactive' (never left NULL) so the
     // admin's Start/Stop button and the isActive check on the frontend
@@ -230,6 +233,14 @@ const updateEAssessment = async (req, res) => {
         .input("id", sql.Int, id)
         .input("v", sql.Bit, req.body.music_paper ? 1 : 0)
         .query(`UPDATE e_assessments SET music_paper = @v WHERE id = @id`);
+    }
+
+    // Same for the art-paper flag.
+    if (typeof req.body.art_paper === "boolean") {
+      await pool.request()
+        .input("id", sql.Int, id)
+        .input("v", sql.Bit, req.body.art_paper ? 1 : 0)
+        .query(`UPDATE e_assessments SET art_paper = @v WHERE id = @id`);
     }
 
     // Only touch the setter list when the caller explicitly sent one —
@@ -1448,6 +1459,10 @@ const parseQuestionsDocx = async (req, res) => {
     res.status(500).json({ success: false, message: err.message || "Failed to read that document" });
   }
 };
+
+/* Subjects that are identified as an Art & Craft paper automatically. Word
+   boundaries keep "Party", "Smart" or "Earth" from matching. */
+const ART_SUBJECT_RE = /\b(art|arts|craft|crafts|visual art|visual arts|creative arts?|fine art|art\s*(and|&)\s*craft|art\s*(and|&)\s*design)\b/i;
 
 /* ---- music paper helpers: marker overlays + model answer sheet ---------- */
 const PNG_DATA_URL_RE = /^data:image\/png;base64,[A-Za-z0-9+/=]+$/;
@@ -3682,6 +3697,45 @@ const setMusicPaper = async (req, res) => {
 
 
 /* =========================================================================
+   ART & CRAFT PAPER SWITCH
+   Same idea as the Music paper switch: when ON, students get a drawing /
+   colouring pad on this assessment's essay questions. The drawing is stored
+   exactly like a music sheet (a PNG inside the answer) so marking, the
+   red-pen overlay, the model answer and the marked paper all work unchanged.
+========================================================================= */
+const setArtPaper = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const id = toInt(req.params.id);
+    if (!id) return res.status(400).json({ message: "Invalid assessment ID" });
+    if (typeof req.body?.enabled !== "boolean") {
+      return res.status(400).json({ message: "`enabled` (true/false) is required" });
+    }
+    const permission = await canManageAssessmentQuestions(pool, req, id);
+    if (!permission.ok) return res.status(permission.status).json({ message: permission.message });
+
+    const enabled = req.body.enabled;
+    const r = await pool.request()
+      .input("id", sql.Int, id)
+      .input("v", sql.Bit, enabled ? 1 : 0)
+      .query(`UPDATE e_assessments SET art_paper = @v WHERE id = @id; SELECT @@ROWCOUNT AS n;`);
+    if (!r.recordset[0]?.n) return res.status(404).json({ message: "Assessment not found" });
+
+    res.json({
+      success: true,
+      art_paper: enabled,
+      message: enabled
+        ? "Art & Craft paper is ON — students get the drawing pad on the essay questions."
+        : "Art & Craft paper is OFF — students answer with the normal text box only.",
+    });
+  } catch (err) {
+    console.error("SET ART-PAPER ERROR:", err);
+    res.status(500).json({ message: "Failed to update the art & craft paper setting" });
+  }
+};
+
+
+/* =========================================================================
    REJECTED DEVICES + PER-DEVICE ALLOW-LIST (Desktop-only switch)
    getDeviceAccess  — every phone/tablet the switch rejected, with student,
                       assessment, platform (Android/iPhone/...), attempts.
@@ -4340,7 +4394,9 @@ const setModelSheet = async (req, res) => {
     if (!permission.ok) return res.status(permission.status).json({ success: false, message: permission.message });
 
     const sheets = cleanPngList(req.body?.sheets);
-    const html = sheets.map((png) => `<p><img data-music-sheet="1" data-tpl="treble" src="${png}" alt="Model answer"></p>`).join("");
+    // the pad's paper id travels with each sheet so an art model answer stays an art sheet
+    const tplOf = (i) => { const t = Array.isArray(req.body?.sheets) ? req.body.sheets[i]?.tpl : null; return typeof t === "string" && /^[\w-]{1,24}$/.test(t) ? t : "treble"; };
+    const html = sheets.map((png, i) => `<p><img data-music-sheet="1" data-tpl="${tplOf(i)}" src="${png}" alt="Model answer"></p>`).join("");
     await pool.request()
       .input("id", sql.Int, questionId)
       .input("v", sql.NVarChar(sql.MAX), html || null)
@@ -5346,6 +5402,7 @@ const updateGradingSystem = async (req, res) => {
 module.exports = {
   setDesktopOnly,
   setMusicPaper,
+  setArtPaper,
   setModelSheet,
   getAccessSettings, getStudentsActivation, setStudentsActivation,
   setAccessSettings,

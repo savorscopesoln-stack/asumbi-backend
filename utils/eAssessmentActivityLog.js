@@ -84,6 +84,7 @@ const ROUTE_ACTIONS = {
   "PUT /admin/:id/toggle-active":        { action: "start_stop_assessment",   kind: "assessment" },
   "PUT /admin/:id/desktop-only":         { action: "set_desktop_only",        kind: "assessment" },
   "PUT /:id/music-paper":                { action: "set_music_paper",          kind: "assessment" },
+  "PUT /:id/art-paper":                  { action: "set_art_paper",            kind: "assessment" },
   "PUT /admin/:id/access":               { action: "set_student_access",        kind: "assessment" },
   "PUT /admin/students-activation/status": { action: "set_student_status",       kind: "none" },
   "PUT /admin/:id/security":             { action: "set_security_settings",   kind: "assessment" },
