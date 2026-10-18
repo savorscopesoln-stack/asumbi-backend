@@ -318,6 +318,22 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       ALTER TABLE e_assessments ADD art_paper BIT NOT NULL CONSTRAINT DF_e_assessments_art_paper DEFAULT 0
     `);
 
+    /* ---------------- e_assessments.auto_capitalize / auto_fullstop ----------
+       Typing helps in the student's essay box (exercise-book style):
+         auto_capitalize - first letter of every sentence becomes a capital
+         auto_fullstop   - Enter adds the full stop to an unfinished line
+       Both default to 1 (on); the teacher/admin can switch either off per paper. */
+    for (const col of ["auto_capitalize", "auto_fullstop"]) {
+      await pool.request().query(`
+        IF EXISTS (SELECT * FROM sysobjects WHERE name='e_assessments' AND xtype='U')
+        AND NOT EXISTS (
+          SELECT * FROM sys.columns
+          WHERE Name = N'${col}' AND Object_ID = Object_ID(N'e_assessments')
+        )
+        ALTER TABLE e_assessments ADD ${col} BIT NOT NULL CONSTRAINT DF_e_assessments_${col} DEFAULT 1
+      `);
+    }
+
     /* ---------------- music paper: marker annotations + model answer ----------
        e_assessment_answers.music_annotations: JSON array of transparent PNG
          overlays (the marker's red pen / ticks / crosses / notes), one per

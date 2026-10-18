@@ -3734,6 +3734,41 @@ const setArtPaper = async (req, res) => {
   }
 };
 
+/* =========================================================================
+   WRITING AIDS SWITCHES
+   Per-paper on/off for the essay box typing helps:
+     auto_capitalize - first letter of each sentence becomes a capital
+     auto_fullstop   - Enter adds the full stop to an unfinished line
+   Send either or both as booleans; anything omitted is left unchanged.
+========================================================================= */
+const setWritingAids = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const id = toInt(req.params.id);
+    if (!id) return res.status(400).json({ message: "Invalid assessment ID" });
+    const fields = ["auto_capitalize", "auto_fullstop"].filter((f) => typeof req.body?.[f] === "boolean");
+    if (!fields.length) {
+      return res.status(400).json({ message: "Send `auto_capitalize` and/or `auto_fullstop` (true/false)" });
+    }
+    const permission = await canManageAssessmentQuestions(pool, req, id);
+    if (!permission.ok) return res.status(permission.status).json({ message: permission.message });
+
+    const r = pool.request().input("id", sql.Int, id);
+    fields.forEach((f) => r.input(f, sql.Bit, req.body[f] ? 1 : 0));
+    const out = await r.query(
+      `UPDATE e_assessments SET ${fields.map((f) => `${f} = @${f}`).join(", ")} WHERE id = @id; SELECT @@ROWCOUNT AS n;`
+    );
+    if (!out.recordset[0]?.n) return res.status(404).json({ message: "Assessment not found" });
+
+    const result = { success: true };
+    fields.forEach((f) => { result[f] = req.body[f]; });
+    res.json(result);
+  } catch (err) {
+    console.error("SET WRITING-AIDS ERROR:", err);
+    res.status(500).json({ message: "Failed to update the typing-help settings" });
+  }
+};
+
 
 /* =========================================================================
    REJECTED DEVICES + PER-DEVICE ALLOW-LIST (Desktop-only switch)
@@ -5403,6 +5438,7 @@ module.exports = {
   setDesktopOnly,
   setMusicPaper,
   setArtPaper,
+  setWritingAids,
   setModelSheet,
   getAccessSettings, getStudentsActivation, setStudentsActivation,
   setAccessSettings,
