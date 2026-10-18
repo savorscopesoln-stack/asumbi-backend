@@ -83,7 +83,7 @@ const getReportCardOptions = async (req, res) => {
     await ensureColumn(pool);
     const current = await getReportCardSource(pool);
     const assessments = (await pool.request().query(`
-      SELECT TOP 500 a.id, a.title, a.subject, c.name AS class_name, a.createdAt
+      SELECT TOP 500 a.id, a.title, a.subject, c.name AS class_name
       FROM e_assessments a LEFT JOIN Classes c ON c.id = a.class_id
       ORDER BY a.id DESC`)).recordset;
     const exams = (await pool.request().query(`
