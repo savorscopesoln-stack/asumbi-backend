@@ -5061,7 +5061,7 @@ WHERE s.id = @id
    already released or not yet marked. */
 const releaseSubmissions = async (pool, submissionIds) => {
   let released = 0;
-    for (const id of submission_ids) {
+    for (const id of submissionIds) {
       const transaction = new sql.Transaction(pool);
       try {
         await transaction.begin();
