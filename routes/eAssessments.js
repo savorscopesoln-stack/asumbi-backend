@@ -1,5 +1,6 @@
 const express = require("express");
 const { getMarkingLeaderboard } = require("../controllers/markingLeaderboard.controller");
+const { getReportCardOptions, putReportCardSource } = require("../utils/reportCardSource");
 const router = express.Router();
 
 const {
@@ -49,7 +50,7 @@ const {
   requestRemark, getRemarkRequests, reviewRemarkRequest,
 
   // release
-  getReleasedMarks, releaseMarks, bulkReleaseMarks,
+  getReleasedMarks, releaseMarks, bulkReleaseMarks, getReportCardReleaseStatus, releaseReportCardMarks,
 
   // grading system
   getGradingSystem, updateGradingSystem,
@@ -132,6 +133,10 @@ router.put("/admin/:id/access", protect, requirePage("E-Assessments"), setAccess
 router.get("/admin/students-activation", protect, requirePage("E-Assessments"), getStudentsActivation);
 router.put("/admin/students-activation/status", protect, requirePage("E-Assessments"), setStudentsActivation);
 router.put("/admin/:id/security", protect, requirePage("E-Assessments"), setSecuritySettings);
+router.get("/admin/report-card-release-status", protect, requirePage("E-Assessments"), getReportCardReleaseStatus);
+router.put("/admin/report-card-release", protect, requirePage("E-Assessments"), releaseReportCardMarks);
+router.get("/admin/report-card-options", protect, requirePage("E-Assessments"), getReportCardOptions);
+router.put("/admin/report-card-source", protect, requirePage("E-Assessments"), putReportCardSource);
 router.put("/admin/:id/seb", protect, requirePage("E-Assessments"), setSebSettings);
 router.put("/admin/:id/seb-config", protect, requirePage("E-Assessments"), uploadSebConfig);
 router.delete("/admin/:id/seb-config", protect, requirePage("E-Assessments"), deleteSebConfig);
@@ -246,6 +251,8 @@ router.post("/submissions/:id/request-remark", protect, authorize("student"), re
 // stay above the "/:id" route below so "/public/covers" isn't parsed
 // as an :id.
 router.get("/public/covers", getPublicAssessmentCovers);
+router.get("/public/:id/seb-info", getSebInfo);
+router.get("/public/:id/seb-config", downloadSebConfig);
 
 // Step 1 of the picker. Built for a whole school behind ONE public IP (400+
 // students): the limit is per username (stops guessing/hammering one account),

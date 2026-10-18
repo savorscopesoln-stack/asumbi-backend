@@ -437,6 +437,9 @@ const setReportCardExam = async (req, res) => {
     await transaction.begin();
     if (active) {
       await new sql.Request(transaction).query(`UPDATE main_examinations SET is_report_exam = 0 WHERE is_report_exam = 1`);
+      // one source only: picking an exam drops any single e-assessment selection
+      try { await require("../utils/reportCardSource").ensureColumn(pool); } catch (_) {}
+      await new sql.Request(transaction).query(`UPDATE e_assessments SET is_report_assessment = 0 WHERE is_report_assessment = 1`);
       await new sql.Request(transaction)
         .input("id", sql.Int, id)
         .query(`UPDATE main_examinations SET is_report_exam = 1, updatedAt = GETDATE() WHERE id = @id`);

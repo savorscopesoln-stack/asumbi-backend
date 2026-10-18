@@ -3284,6 +3284,7 @@ const setDesktopOnly = async (req, res) => {
    stable; it holds nothing secret — just the exam's start URL.
 ========================================================================= */
 const zlib = require("zlib");
+const { getReportCardSource } = require("../utils/reportCardSource");
 
 const findAssessmentAnyTenant = async (id) => {
   for (const tenantKey of listTenantKeys()) {
@@ -5055,13 +5056,11 @@ WHERE s.id = @id
   }
 };
 
-const bulkReleaseMarks = async (req, res) => {
-  const pool = req.pool;
-  try {
-    const { submission_ids } = req.body;
-    if (!Array.isArray(submission_ids) || !submission_ids.length) return res.status(400).json({ message: "No submissions provided" });
-
-    let released = 0;
+/* Releases the given submissions into the Marks table (same per-submission
+   work as releaseMarks) and returns how many were released. Skips anything
+   already released or not yet marked. */
+const releaseSubmissions = async (pool, submissionIds) => {
+  let released = 0;
     for (const id of submission_ids) {
       const transaction = new sql.Transaction(pool);
       try {
@@ -5107,10 +5106,103 @@ const bulkReleaseMarks = async (req, res) => {
         console.error("BULK RELEASE ITEM ERROR:", innerErr);
       }
     }
+  return released;
+};
+
+const bulkReleaseMarks = async (req, res) => {
+  const pool = req.pool;
+  try {
+    const { submission_ids } = req.body;
+    if (!Array.isArray(submission_ids) || !submission_ids.length) return res.status(400).json({ message: "No submissions provided" });
+
+    const released = await releaseSubmissions(pool, submission_ids);
     res.json({ success: true, released_count: released });
   } catch (err) {
     console.error("BULK RELEASE MARKS ERROR:", err);
     res.status(500).json({ message: err.message });
+  }
+};
+
+/* =========================================================================
+   REPORT CARD MARKS — release
+   For whatever the admin picked under "Report Card Marks" (one assessment, or
+   every paper of a main examination): shows marking progress and, only when
+   marking is COMPLETE, releases every marked submission into the Marks table
+   so the report card can read it.
+     GET /e-assessments/admin/report-card-release-status
+     PUT /e-assessments/admin/report-card-release
+   Complete = every submission is marked (none still awaiting marking, none
+   with a re-mark request open) and at least one submission exists.
+========================================================================= */
+const reportCardReleaseStatus = async (pool) => {
+  const source = await getReportCardSource(pool);
+  if (source.mode === "none") return { source, items: [], complete: false, reason: "Pick an assessment or main examination first." };
+
+  const idsResult = source.mode === "assessment"
+    ? { recordset: [{ id: source.id }] }
+    : await pool.request().input("id", sql.Int, source.id).query(
+        `SELECT DISTINCT e_assessment_id AS id FROM exam_subject_sessions WHERE main_examination_id = @id AND e_assessment_id IS NOT NULL`);
+  const ids = idsResult.recordset.map((r) => r.id);
+  if (!ids.length) return { source, items: [], complete: false, reason: "No assessments are attached to this examination yet." };
+
+  const req = pool.request();
+  const ph = ids.map((v, i) => { req.input(`a${i}`, sql.Int, v); return `@a${i}`; });
+  const rows = (await req.query(`
+    SELECT a.id, a.title, a.subject,
+      COUNT(s.id) AS total,
+      SUM(CASE WHEN s.status = 'released' THEN 1 ELSE 0 END) AS released,
+      SUM(CASE WHEN s.status = 'marked' AND s.score IS NOT NULL THEN 1 ELSE 0 END) AS ready,
+      SUM(CASE WHEN s.status NOT IN ('marked','released') OR s.score IS NULL AND s.status <> 'released' THEN 1 ELSE 0 END) AS unmarked,
+      SUM(CASE WHEN s.status <> 'released' AND ISNULL(s.remark_requested,0) = 1 AND ISNULL(s.remark_completed,0) = 0 THEN 1 ELSE 0 END) AS remark_open
+    FROM e_assessments a
+    LEFT JOIN e_assessment_submissions s ON s.e_assessment_id = a.id
+    WHERE a.id IN (${ph.join(",")})
+    GROUP BY a.id, a.title, a.subject
+    ORDER BY a.subject, a.title`)).recordset.map((r) => ({
+      id: r.id, title: r.title, subject: r.subject,
+      total: r.total, released: r.released, ready: r.ready, unmarked: r.unmarked, remark_open: r.remark_open,
+    }));
+
+  const totalSubs = rows.reduce((n, r) => n + r.total, 0);
+  const pending = rows.reduce((n, r) => n + r.unmarked + r.remark_open, 0);
+  const ready = rows.reduce((n, r) => n + r.ready, 0);
+  const complete = totalSubs > 0 && pending === 0;
+  const reason = totalSubs === 0 ? "No student has submitted yet."
+    : pending > 0 ? `Marking is not complete — ${pending} submission${pending === 1 ? " is" : "s are"} still waiting to be marked.` : null;
+  return { source, items: rows, complete, ready, pending, reason };
+};
+
+const getReportCardReleaseStatus = async (req, res) => {
+  try {
+    const st = await reportCardReleaseStatus(req.pool);
+    res.json({
+      mode: st.source.mode, id: st.source.id, name: st.source.name,
+      items: st.items, complete: st.complete, ready: st.ready || 0, pending: st.pending || 0, reason: st.reason || null,
+    });
+  } catch (err) {
+    console.error("REPORT CARD RELEASE STATUS ERROR:", err);
+    res.status(500).json({ message: "Could not check marking progress" });
+  }
+};
+
+const releaseReportCardMarks = async (req, res) => {
+  const pool = req.pool;
+  try {
+    const st = await reportCardReleaseStatus(pool);
+    if (st.source.mode === "none") return res.status(400).json({ message: st.reason });
+    // server-side guard — the button is disabled in the UI, but never trust it
+    if (!st.complete) return res.status(409).json({ message: st.reason || "Marking is not complete." });
+    if (!st.ready) return res.json({ success: true, released_count: 0, message: "Everything has already been released." });
+
+    const req2 = pool.request();
+    const ph = st.items.map((r, i) => { req2.input(`a${i}`, sql.Int, r.id); return `@a${i}`; });
+    const subs = (await req2.query(
+      `SELECT id FROM e_assessment_submissions WHERE e_assessment_id IN (${ph.join(",")}) AND status = 'marked' AND score IS NOT NULL`)).recordset;
+    const released = await releaseSubmissions(pool, subs.map((x) => x.id));
+    res.json({ success: true, released_count: released, message: `${released} mark${released === 1 ? "" : "s"} released to the marks table` });
+  } catch (err) {
+    console.error("RELEASE REPORT CARD MARKS ERROR:", err);
+    res.status(500).json({ message: "Could not release the marks" });
   }
 };
 
@@ -5311,7 +5403,7 @@ module.exports = {
   requestRemark, getRemarkRequests, reviewRemarkRequest,
 
   // release
-  getReleasedMarks, releaseMarks, bulkReleaseMarks,
+  getReleasedMarks, releaseMarks, bulkReleaseMarks, getReportCardReleaseStatus, releaseReportCardMarks,
 
   // grading system
   getGradingSystem, updateGradingSystem,

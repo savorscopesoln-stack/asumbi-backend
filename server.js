@@ -13,6 +13,7 @@ const jwt = require("jsonwebtoken");
 const path = require("path");
 
 const { runWithTenant } = require("./utils/uploadPaths");
+const { getReportCardSource } = require("./utils/reportCardSource");
 const { poolPromise, sql, getPool, listTenantKeys, hasTenant } = require("./config/db");
 const { resolveTenantKey } = require("./config/tenants");
 const { protect, authorize, adminOnly, requirePage } = require("./middleware/authMiddleware");
@@ -1142,11 +1143,48 @@ app.get("/api/marks/:assessmentId", protect, async (req, res) => {
   }
 });
 
+/* What the report card may show right now: { mode: none|assessment|exam, id, name, subjects[] } */
+app.get("/api/report-card-source", protect, async (req, res) => {
+  try {
+    res.json(await getReportCardSource(req.pool));
+  } catch (err) {
+    console.log("REPORT CARD SOURCE ERROR:", err.message);
+    res.status(500).json({ mode: "none", id: null, name: null, subjects: [] });
+  }
+});
+
 app.get("/api/student/marks", protect, async (req, res) => {
   try {
     const pool = req.pool;
     const studentId = toInt(req.query.studentId);
     if (!studentId) return res.status(400).json({ message: "studentId required" });
+
+    // The REPORT CARD asks with ?reportCard=1 and may only see what the admin
+    // picked under E-Assessments → "Report card marks": nothing (blank), one
+    // e-assessment, or one main examination. Everything else (dashboard,
+    // results page) keeps getting every mark as before.
+    if (String(req.query.reportCard) === "1") {
+      const source = await getReportCardSource(pool);
+      if (source.mode === "none") return res.json([]);
+      const scope = source.mode === "assessment"
+        ? "a.sourceRefId = @sourceId"
+        : `a.sourceRefId IN (SELECT ess.e_assessment_id FROM exam_subject_sessions ess
+                              WHERE ess.main_examination_id = @sourceId AND ess.e_assessment_id IS NOT NULL)`;
+      const scoped = await pool.request()
+        .input("studentId", sql.Int, studentId)
+        .input("sourceId", sql.Int, source.id)
+        .input("examName", sql.NVarChar, source.name)
+        .query(`
+          SELECT m.studentId, m.subjectId, s.name AS subjectName, s.code AS subjectCode,
+                 m.assessmentId, m.score, m.percentage, m.grade, m.createdAt, @examName AS examName
+          FROM Marks m
+          JOIN Subjects s ON s.id = m.subjectId
+          JOIN Assessments a ON a.id = m.assessmentId AND a.sourceSystem = 'e_assessment' AND ${scope}
+          WHERE m.studentId = @studentId
+          ORDER BY m.createdAt DESC
+        `);
+      return res.json(scoped.recordset);
+    }
 
     const result = await pool
       .request()

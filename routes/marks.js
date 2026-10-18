@@ -1,6 +1,7 @@
 const express = require("express");
 const app = express();
 const { notifyUsers } = require("../utils/notify");
+const { getReportCardSource } = require("../utils/reportCardSource");
 
 /* ================= SAFE NUMBER ================= */
 const toNum = (v) => {
@@ -208,6 +209,16 @@ app.get("/api/marks/:assessmentId", async (req, res) => {
    If no exam has been picked yet (a school that hasn't used this
    feature, or between exams), this falls back to every mark on record
    for the student — the same behaviour as before this feature existed. */
+app.get("/api/report-card-source", async (req, res) => {
+  try {
+    const pool = req.pool || req.app.locals.pool;
+    res.json(await getReportCardSource(pool));
+  } catch (err) {
+    console.error("REPORT CARD SOURCE ERROR:", err);
+    res.status(500).json({ mode: "none", id: null, name: null, subjects: [] });
+  }
+});
+
 app.get("/api/student/marks", async (req, res) => {
   try {
     const pool = req.pool || req.app.locals.pool;
@@ -215,13 +226,26 @@ app.get("/api/student/marks", async (req, res) => {
     const studentId = toNum(req.query.studentId);
     if (!studentId) return res.json([]);
 
-    const activeExamResult = await pool.request().query(`
-      SELECT TOP 1 id, name FROM main_examinations WHERE is_report_exam = 1
-    `);
-    const activeExam = activeExamResult.recordset?.[0] || null;
+    // What may the report card show? (E-Assessments → "Report card marks")
+    //   none       -> nothing: the report card stays blank
+    //   assessment -> only that one e-assessment's marks
+    //   exam       -> marks for the papers scheduled in that main examination
+    const source = await getReportCardSource(pool);
+    if (source.mode === "none") return res.json([]);
 
-    const request = pool.request().input("studentId", studentId);
-    let query = `
+    const request = pool.request()
+      .input("studentId", studentId)
+      .input("sourceId", source.id)
+      .input("examName", source.name);
+
+    const scope = source.mode === "assessment"
+      ? `a.sourceRefId = @sourceId`
+      : `a.sourceRefId IN (
+            SELECT ess.e_assessment_id FROM exam_subject_sessions ess
+            WHERE ess.main_examination_id = @sourceId AND ess.e_assessment_id IS NOT NULL
+          )`;
+
+    const result = await request.query(`
       SELECT
         m.studentId,
         m.subjectId,
@@ -231,34 +255,16 @@ app.get("/api/student/marks", async (req, res) => {
         m.score,
         m.percentage,
         m.grade,
-        m.createdAt
-    `;
-
-    if (activeExam) {
-      request.input("mainExaminationId", activeExam.id);
-      query += `, @examName AS examName`;
-      request.input("examName", activeExam.name);
-    }
-
-    query += `
+        m.createdAt,
+        @examName AS examName
       FROM Marks m
       LEFT JOIN Subjects sub ON sub.id = m.subjectId
-    `;
-
-    if (activeExam) {
-      query += `
-        INNER JOIN Assessments a ON a.id = m.assessmentId
-          AND a.sourceSystem = 'e_assessment'
-          AND a.sourceRefId IN (
-            SELECT ess.e_assessment_id FROM exam_subject_sessions ess
-            WHERE ess.main_examination_id = @mainExaminationId AND ess.e_assessment_id IS NOT NULL
-          )
-      `;
-    }
-
-    query += ` WHERE m.studentId = @studentId ORDER BY m.createdAt DESC`;
-
-    const result = await request.query(query);
+      INNER JOIN Assessments a ON a.id = m.assessmentId
+        AND a.sourceSystem = 'e_assessment'
+        AND ${scope}
+      WHERE m.studentId = @studentId
+      ORDER BY m.createdAt DESC
+    `);
 
     return res.json(result.recordset || []);
 
