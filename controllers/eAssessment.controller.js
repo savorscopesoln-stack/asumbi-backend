@@ -4129,30 +4129,172 @@ const deleteAssignments = async (req, res) => {
 /* =========================================================================
    DELETE ASSESSMENTS
 ========================================================================= */
+/* ── delete assessments ──────────────────────────────────────────────────
+   Used to fail for papers that had been through a Main Examination: those
+   papers carry far more linked rows (violation photos, device access, drafts,
+   marking assignments, sync records, ...) than the old hard-coded list of six
+   tables cleaned up, so SQL Server refused the delete.
+
+   Now, per assessment and inside one transaction:
+     1. rows hanging off its answers / submissions / questions are removed
+        (found from the database catalog, not a fixed list),
+     2. every other e_assessment_* table keyed by e_assessment_id is cleared
+        (audit *_log tables are kept, as before),
+     3. anything still linked by a declared foreign key is removed too — but
+        only inside e_assessment_* tables; a link from any other area is
+        reported by name instead of being wiped,
+     4. a Main Examination subject slot that used the paper is detached
+        (slot kept, paper cleared, back to draft if it had not run yet).
+   RULE: a paper scheduled in a Main Examination (its subject slot is past
+   'draft') can only be deleted once its RESULTS ARE PUBLISHED — i.e. it has
+   submitted papers and every one of them has been released to the students.
+   Slots that are still drafts, and slots of a cancelled Main Examination, don't
+   count as scheduled. One failure never stops the others — the response lists
+   what was and wasn't deleted. */
+const qIdent = (n) => `[${String(n).replace(/]/g, "]]")}]`;
+
+async function eaTablesWithColumn(pool, column) {
+  const r = await pool.request().input("c", sql.NVarChar, column).query(`
+    SELECT t.name AS table_name
+    FROM sys.tables t
+    INNER JOIN sys.columns c ON c.object_id = t.object_id AND c.name = @c
+    WHERE t.name LIKE 'e[_]assessment[_]%' AND t.name <> 'e_assessments'
+  `);
+  return r.recordset.map((x) => x.table_name);
+}
+
+async function eaFkChildren(pool, table) {
+  const r = await pool.request().input("t", sql.NVarChar, table).query(`
+    SELECT OBJECT_NAME(fkc.parent_object_id) AS child_table,
+           COL_NAME(fkc.parent_object_id, fkc.parent_column_id) AS child_col,
+           COL_NAME(fkc.referenced_object_id, fkc.referenced_column_id) AS parent_col
+    FROM sys.foreign_key_columns fkc
+    WHERE fkc.referenced_object_id = OBJECT_ID(@t)
+  `);
+  return r.recordset;
+}
+
+// Delete `where` rows of `table` after the rows that reference them through a declared FK.
+async function eaDeleteWithDependents(pool, tx, id, table, where, trail = []) {
+  if (trail.length > 6) throw new Error(`too many levels of linked records under ${table}`);
+  for (const c of await eaFkChildren(pool, table)) {
+    if (c.child_table === table || trail.includes(c.child_table)) continue;
+    if (!/^e_assessment/i.test(c.child_table)) {
+      throw new Error(`it is still linked to records in "${c.child_table}" — remove those first`);
+    }
+    await eaDeleteWithDependents(
+      pool, tx, id, c.child_table,
+      `${qIdent(c.child_col)} IN (SELECT ${qIdent(c.parent_col)} FROM ${qIdent(table)} WHERE ${where})`,
+      [...trail, table]
+    );
+  }
+  await new sql.Request(tx).input("id", sql.Int, id).query(`DELETE FROM ${qIdent(table)} WHERE ${where}`);
+}
+
+async function eaPurgeAssessment(pool, id) {
+  const tx = new sql.Transaction(pool);
+  await tx.begin();
+  try {
+    const run = (query) => new sql.Request(tx).input("id", sql.Int, id).query(query);
+    const skipLogs = (names) => names.filter((n) => !/_logs?$/i.test(n));
+
+    // 1. children of answers, then of submissions, then of questions
+    const keyed = [
+      ["answer_id", "SELECT a.id FROM e_assessment_answers a INNER JOIN e_assessment_submissions s ON a.submission_id = s.id WHERE s.e_assessment_id = @id"],
+      ["submission_id", "SELECT id FROM e_assessment_submissions WHERE e_assessment_id = @id"],
+      ["question_id", "SELECT id FROM e_assessment_questions WHERE e_assessment_id = @id"],
+    ];
+    for (const [col, parentIds] of keyed) {
+      for (const table of skipLogs(await eaTablesWithColumn(pool, col))) {
+        if (table === "e_assessment_submissions" || table === "e_assessment_questions") continue;
+        await run(`DELETE FROM ${qIdent(table)} WHERE ${qIdent(col)} IN (${parentIds})`);
+      }
+    }
+
+    // 2. everything else keyed by the assessment id — submissions and questions last
+    const direct = skipLogs(await eaTablesWithColumn(pool, "e_assessment_id"))
+      .sort((x, y) => (Number(/^e_assessment_(submissions|questions)$/.test(x)) - Number(/^e_assessment_(submissions|questions)$/.test(y))));
+    for (const table of direct) {
+      await run(`DELETE FROM ${qIdent(table)} WHERE e_assessment_id = @id`);
+    }
+
+    // 3. detach it from any Main Examination timetable slot (the slot stays)
+    const unlinked = await run(`
+      UPDATE exam_subject_sessions
+      SET e_assessment_id = NULL,
+          status = CASE WHEN LOWER(status) IN ('scheduled', 'waiting') THEN 'draft' ELSE status END,
+          updatedAt = GETDATE()
+      WHERE e_assessment_id = @id;
+      SELECT @@ROWCOUNT AS n;
+    `);
+
+    // 4. the assessment itself (plus anything still tied to it by a declared FK)
+    await eaDeleteWithDependents(pool, tx, id, "e_assessments", "id = @id");
+
+    await tx.commit();
+    return { unlinkedSlots: unlinked.recordset?.[0]?.n || 0 };
+  } catch (err) {
+    try { await tx.rollback(); } catch { /* already rolled back */ }
+    throw err;
+  }
+}
+
 const deleteAssessments = async (req, res) => {
   try {
     const pool = req.pool;
-    const { ids } = req.body;
-    if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ success: false, message: "No assessments selected" });
+    const ids = [...new Set((Array.isArray(req.body?.ids) ? req.body.ids : []).map(toInt).filter(Boolean))];
+    if (!ids.length) return res.status(400).json({ success: false, message: "No assessments selected" });
+
+    const deleted = [];
+    const failed = [];
+    let unlinkedSlots = 0;
 
     for (const id of ids) {
-      await pool.request().input("id", sql.Int, id).query(`
-        DELETE o FROM e_assessment_options o
-        INNER JOIN e_assessment_questions q ON o.question_id = q.id
-        WHERE q.e_assessment_id = @id
+      const info = await pool.request().input("id", sql.Int, id).query(`
+        SELECT ea.title,
+               (SELECT COUNT(*) FROM exam_subject_sessions ess
+                  INNER JOIN main_examinations me ON me.id = ess.main_examination_id
+                 WHERE ess.e_assessment_id = ea.id
+                   AND LOWER(ess.status) <> 'draft'
+                   AND LOWER(me.status) <> 'cancelled') AS scheduled_slots,
+               (SELECT COUNT(*) FROM e_assessment_submissions s
+                 WHERE s.e_assessment_id = ea.id AND s.submitted_at IS NOT NULL) AS submitted_count,
+               (SELECT COUNT(*) FROM e_assessment_submissions s
+                 WHERE s.e_assessment_id = ea.id AND s.submitted_at IS NOT NULL
+                   AND LOWER(ISNULL(s.status, '')) <> 'released') AS unreleased_count
+        FROM e_assessments ea WHERE ea.id = @id
       `);
-      await pool.request().input("id", sql.Int, id).query(`
-        DELETE a FROM e_assessment_answers a
-        INNER JOIN e_assessment_submissions s ON a.submission_id = s.id
-        WHERE s.e_assessment_id = @id
-      `);
-      await pool.request().input("id", sql.Int, id).query(`DELETE FROM e_assessment_submissions WHERE e_assessment_id = @id`);
-      await pool.request().input("id", sql.Int, id).query(`DELETE FROM e_assessment_questions WHERE e_assessment_id = @id`);
-      await pool.request().input("id", sql.Int, id).query(`DELETE FROM e_assessment_exam_sessions WHERE e_assessment_id = @id`);
-      await pool.request().input("id", sql.Int, id).query(`DELETE FROM e_assessments WHERE id = @id`);
+      const row = info.recordset[0];
+      if (!row) { deleted.push(id); continue; } // already gone
+
+      // Scheduled in a Main Examination → only deletable once every submitted paper has been released.
+      const resultsPublished = row.submitted_count > 0 && row.unreleased_count === 0;
+      if (row.scheduled_slots > 0 && !resultsPublished) {
+        failed.push({
+          id,
+          title: row.title,
+          message: row.submitted_count === 0
+            ? "It is scheduled in a Main Examination and its results have not been published yet"
+            : `It is scheduled in a Main Examination and results are not published yet (${row.unreleased_count} of ${row.submitted_count} submitted paper(s) not released)`,
+        });
+        continue;
+      }
+      try {
+        const out = await eaPurgeAssessment(pool, id);
+        unlinkedSlots += out.unlinkedSlots;
+        deleted.push(id);
+      } catch (err) {
+        console.error(`DELETE ASSESSMENT ${id} ERROR:`, err);
+        failed.push({ id, title: row.title, message: err.message });
+      }
     }
 
-    res.json({ success: true, message: "Assessments deleted successfully" });
+    let message = deleted.length ? `${deleted.length} assessment(s) deleted` : "Nothing was deleted";
+    if (unlinkedSlots) message += ` — ${unlinkedSlots} Main Examination subject slot(s) now have no paper attached`;
+    if (failed.length) message += `. Could not delete: ${failed.map((f) => `"${f.title}" (${f.message})`).join("; ")}`;
+    res.status(failed.length && !deleted.length ? 409 : 200).json({
+      success: !failed.length, message, deleted, failed, unlinkedSlots,
+    });
   } catch (err) {
     console.error("DELETE ASSESSMENTS ERROR:", err);
     res.status(500).json({ success: false, message: err.message });
