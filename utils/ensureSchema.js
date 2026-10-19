@@ -60,6 +60,8 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
     `);
     // manual split marking: which teacher marks which question (utils/questionSplit.js)
     await require("./questionSplit").ensureTable(pool);
+    // per-teacher marking option 1 / 2 (controllers/markingOption.controller.js)
+    await require("../controllers/markingOption.controller").ensureTable(pool);
     await pool.request().query(`
       IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='e_assessment_assignment_batches' AND xtype='U')
       CREATE TABLE e_assessment_assignment_batches (

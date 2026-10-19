@@ -1,5 +1,6 @@
 const express = require("express");
 const { getMarkingLeaderboard } = require("../controllers/markingLeaderboard.controller");
+const { getMyMarkingOption, listMarkingOptions, setMarkingOption } = require("../controllers/markingOption.controller");
 const { getReportCardOptions, putReportCardSource } = require("../utils/reportCardSource");
 const router = express.Router();
 
@@ -171,6 +172,11 @@ router.post("/admin/assignment-batches/:id/undo", protect, requirePage("E-Assess
 ========================================================================= */
 // Marking leaderboard: visible to every teacher as well as admins (everyone sees the same race)
 router.get("/marking-leaderboard", protect, authorize("teacher", "admin", "sub_admin", "sub_admin_2"), getMarkingLeaderboard);
+// Marking option 1 / 2 per teacher (option 1 is the default)
+router.get("/marking-option", protect, authorize("teacher", "admin", "sub_admin", "sub_admin_2"), getMyMarkingOption);
+router.get("/admin/marking-options", protect, requirePage("E-Assessments"), listMarkingOptions);
+router.put("/admin/marking-options/:teacherId", protect, requirePage("E-Assessments"), setMarkingOption);
+router.put("/admin/marking-options", protect, requirePage("E-Assessments"), setMarkingOption);
 router.get("/admin/remark-requests", protect, requirePage("E-Assessments"), getRemarkRequests);
 router.put("/admin/remark-requests/:id/review", protect, requirePage("E-Assessments"), reviewRemarkRequest);
 
