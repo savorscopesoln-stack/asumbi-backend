@@ -586,6 +586,9 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       // show "From: Jane Admin" instead of just a source/id pair.
       ["createdByName", "NVARCHAR(200) NULL"],
       ["createdAt", "DATETIME NULL DEFAULT GETDATE()"],
+      // When the notification was archived. Set automatically the moment it is
+      // marked read (see routes/notifications.js); NULL = still in the inbox.
+      ["archivedAt", "DATETIME NULL"],
     ];
 
     for (const [name, type] of notifColumns) {
@@ -596,6 +599,20 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
         )
         ALTER TABLE Notifications ADD ${name} ${type}
       `);
+    }
+
+    // One-time-ish backfill for the "read notifications are archived" feature:
+    // anything already read before archivedAt existed goes straight to the
+    // archive. Separate batch so archivedAt is resolvable; after the first boot
+    // every read sets archivedAt itself, so this matches no rows. Never blocks boot.
+    try {
+      await pool.request().query(`
+        IF EXISTS (SELECT * FROM sys.columns WHERE Name = N'archivedAt' AND Object_ID = Object_ID(N'Notifications'))
+        UPDATE Notifications SET archivedAt = ISNULL(createdAt, GETDATE())
+        WHERE isRead = 1 AND archivedAt IS NULL
+      `);
+    } catch (e) {
+      console.warn("[ensureSchema] Notifications.archivedAt backfill skipped:", e.message);
     }
 
     /* ---------------- leave_outs table ---------------- */
@@ -3072,8 +3089,12 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
     // already-huge function stays readable; never throws.
     await require("./aiMarkingSchema").ensureAiMarkingSchemaUpgrades(pool);
 
+    // Missing non-clustered indexes across the app (see utils/indexSpecs.js and
+    // migrations/2026-10-19_add_missing_indexes.sql). Runs LAST so every table
+    // and column created/altered above already exists. Never throws.
+    await require("./indexSpecs").ensureIndexes(pool);
 
-    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, PortalPageSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, leave_outs code-verification columns, meal_daily_codes, leave_auto_approve, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl, Students.profileCompleted, student_profile_change_requests, website_content, contact_messages, newsletter_subscribers, e_assessments.cover_page_url, e_assessments.cover_page_width/height, e_assessment_question_images, e_assessment_violation_photos, e_assessment_sync_devices, e_assessment_sync_devices.tenant_key, e_assessment_sync_device_assessments, e_assessment_sync_logs, e_assessment_submissions.sync_batch_id, SchoolSettings, SchoolOfficials, SchoolOfficials.stampUrl, ClassTeachers.stampUrl, GradingSystem, main_examinations, exam_subject_sessions, exam_audit_log, Assessments.examScope/sourceSystem/sourceRefId, Marks indexes, main_examinations.is_report_exam, institution_wallets, wallet_ledger, institution_payments, credit_issuances, student_exam_entitlements, institution_exam_billing_settings, student_exam_payments, finance_audit_log, finance_invoices, finance_receipts, Users.mfaSecret/mfaEnabled, ai_marking_wallets, ai_marking_ledger, ai_marking_pricing, ai_marking_jobs, ai_marking_evaluations, ai_marking_scheme_versions, ai_marking_adjustments)");
+    console.log("✅ Schema check complete (election_* Student Council tables, Notifications, Notifications.link, Notifications.archivedAt, Notifications/ScheduledNotifications.createdByName, ScheduledNotifications, NotificationSettings, PortalPageSettings, e_assessment_question_setters, questions_deadline, leave_outs.leave_type, leave_outs approval-workflow columns, leave_outs gate-verification columns, leave_outs code-verification columns, meal_daily_codes, leave_auto_approve, mustChangePassword, Users.permissions, Users.name, staff→sub_admin migration, Students/Teachers.photoUrl, Students.profileCompleted, student_profile_change_requests, website_content, contact_messages, newsletter_subscribers, e_assessments.cover_page_url, e_assessments.cover_page_width/height, e_assessment_question_images, e_assessment_violation_photos, e_assessment_sync_devices, e_assessment_sync_devices.tenant_key, e_assessment_sync_device_assessments, e_assessment_sync_logs, e_assessment_submissions.sync_batch_id, SchoolSettings, SchoolOfficials, SchoolOfficials.stampUrl, ClassTeachers.stampUrl, GradingSystem, main_examinations, exam_subject_sessions, exam_audit_log, Assessments.examScope/sourceSystem/sourceRefId, Marks indexes, main_examinations.is_report_exam, institution_wallets, wallet_ledger, institution_payments, credit_issuances, student_exam_entitlements, institution_exam_billing_settings, student_exam_payments, finance_audit_log, finance_invoices, finance_receipts, Users.mfaSecret/mfaEnabled, ai_marking_wallets, ai_marking_ledger, ai_marking_pricing, ai_marking_jobs, ai_marking_evaluations, ai_marking_scheme_versions, ai_marking_adjustments)");
   } catch (err) {
     console.error("⚠️  Schema ensure failed:", err.message);
   }

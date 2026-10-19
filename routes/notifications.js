@@ -5,22 +5,43 @@ const { authorize } = require("../middleware/authMiddleware");
 
 /* =========================================================
    GET /api/notifications
-   Every notification addressed to the logged-in user
-   (student / teacher / admin), newest first.
+   The logged-in user's INBOX: every notification addressed to them
+   that has not been archived yet, newest first. A notification is
+   archived automatically the moment it is marked read (single or
+   read-all), so the inbox only ever holds unread items plus anything
+   read since the page was last loaded.
+
+   GET /api/notifications?archived=1
+   The ARCHIVE: read notifications, most recently archived first.
+   Capped (default 200, max 500, ?limit=) so a long history can't
+   make the page heavy.
 ========================================================= */
 router.get("/", async (req, res) => {
   try {
     const pool = req.pool; // tenant-resolved by server.js DB middleware
+    const wantArchive = ["1", "true"].includes(String(req.query.archived || "").toLowerCase());
 
-    const result = await pool.request()
+    const request = pool.request()
       .input("id", sql.Int, req.user.id)
-      .input("source", sql.NVarChar, req.user.source)
-      .query(`
+      .input("source", sql.NVarChar, req.user.source);
+
+    let result;
+    if (wantArchive) {
+      const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 200, 1), 500);
+      result = await request.input("limit", sql.Int, limit).query(`
+        SELECT TOP (@limit) *
+        FROM Notifications
+        WHERE recipientId = @id AND recipientSource = @source AND archivedAt IS NOT NULL
+        ORDER BY archivedAt DESC, createdAt DESC
+      `);
+    } else {
+      result = await request.query(`
         SELECT *
         FROM Notifications
-        WHERE recipientId = @id AND recipientSource = @source
+        WHERE recipientId = @id AND recipientSource = @source AND archivedAt IS NULL
         ORDER BY createdAt DESC
       `);
+    }
 
     res.json(result.recordset || []);
   } catch (err) {
@@ -54,6 +75,7 @@ router.get("/unread-count", async (req, res) => {
 
 /* =========================================================
    PUT /api/notifications/read-all
+   Marks every inbox notification read AND archives it.
 ========================================================= */
 router.put("/read-all", async (req, res) => {
   try {
@@ -64,11 +86,11 @@ router.put("/read-all", async (req, res) => {
       .input("source", sql.NVarChar, req.user.source)
       .query(`
         UPDATE Notifications
-        SET isRead = 1
-        WHERE recipientId = @id AND recipientSource = @source
+        SET isRead = 1, archivedAt = GETDATE()
+        WHERE recipientId = @id AND recipientSource = @source AND archivedAt IS NULL
       `);
 
-    res.json({ message: "All notifications marked as read" });
+    res.json({ message: "All notifications marked as read and archived" });
   } catch (err) {
     console.log("MARK ALL READ ERROR:", err);
     res.status(500).json({ message: "Failed to update notifications" });
@@ -77,6 +99,7 @@ router.put("/read-all", async (req, res) => {
 
 /* =========================================================
    PUT /api/notifications/:id/read
+   Marks one notification read AND archives it.
 ========================================================= */
 router.put("/:id/read", async (req, res) => {
   try {
@@ -88,11 +111,11 @@ router.put("/:id/read", async (req, res) => {
       .input("source", sql.NVarChar, req.user.source)
       .query(`
         UPDATE Notifications
-        SET isRead = 1
+        SET isRead = 1, archivedAt = ISNULL(archivedAt, GETDATE())
         WHERE id = @id AND recipientId = @uid AND recipientSource = @source
       `);
 
-    res.json({ message: "Marked as read" });
+    res.json({ message: "Marked as read and archived" });
   } catch (err) {
     console.log("MARK READ ERROR:", err);
     res.status(500).json({ message: "Failed to update notification" });

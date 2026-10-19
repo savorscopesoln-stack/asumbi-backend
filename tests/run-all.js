@@ -44,6 +44,8 @@ require("./aiMarkingScheme.test.js");
 require("./aiMarkingCalibration.test.js");
 require("./aiMarkingAnalytics.test.js");
 require("./aiMarkingSecurity.test.js");
+require("./indexSpecs.test.js");
+require("./notificationsArchive.test.js");
 
 // If any test promise never settles, Node's event loop simply empties and the
 // process exits with code 0 and NO summary — a silent false pass. Detect it.
