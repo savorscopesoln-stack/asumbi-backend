@@ -28,6 +28,8 @@ require("./aiMarkingTeacher.test.js");
 require("./deviceAccess.test.js");
 require("./sebConfigFile.test.js");
 require("./examAccess.test.js");
+require("./submitQueue.test.js");
+require("./examAutosaveLock.test.js");
 require("./examClock.test.js");
 require("./sebRestriction.test.js");
 require("./eAssessmentAttendance.test.js");

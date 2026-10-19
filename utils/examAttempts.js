@@ -1,5 +1,7 @@
 const sql = require("mssql");
 const { clockStartSql } = require("./examClock");
+const { queueFor } = require("./submitQueue");
+const { withTransientRetry } = require("./transientDbRetry");
 
 /* =========================================================================
    E-ASSESSMENT ATTEMPTS — shared by the submit endpoint, the autosave
@@ -129,7 +131,7 @@ async function archiveSubmission(transaction, submissionId, assessmentId, studen
 
 /* Creates the submission for one attempt.
    Returns { ok: true, submissionId } or { ok: false, reason: 'duplicate', submissionId }. */
-async function persistAttempt(pool, { assessmentId, studentId, answers, auto = false }) {
+async function persistAttemptNow(pool, { assessmentId, studentId, answers, auto = false }) {
   const transaction = new sql.Transaction(pool);
   await transaction.begin();
   try {
@@ -198,6 +200,25 @@ async function persistAttempt(pool, { assessmentId, studentId, answers, auto = f
   }
 }
 
+/* The public entry point. Every submission — the student's own submit, the
+   time-up auto-submit and the server's sweep — goes through ONE line per
+   database (utils/submitQueue.js), so a room full of students finishing at the
+   same instant writes a few at a time instead of all at once.
+   Throws QueueBusyError (code "QUEUE_BUSY") if the line is too long or the
+   wait runs out; callers turn that into a retryable 503.
+   opts.background: the server's own sweep — waits its turn, never gives up. */
+function persistAttempt(pool, args, opts = {}) {
+  const key = `${Number(args.assessmentId)}:${Number(args.studentId)}`;
+  return queueFor(pool).run(
+    key,
+    // One quick retry for a pool-timeout blip, INSIDE the slot so retries never
+    // jump the line. Safe to repeat: a second pass after a committed first one
+    // just returns { ok: false, reason: "duplicate" }.
+    () => withTransientRetry(() => persistAttemptNow(pool, args), { retries: 1, label: "persistAttempt" }),
+    opts.background ? { maxWaitMs: Infinity } : {}
+  );
+}
+
 /* Draft answers are stored as { "<questionId>": value } (the shape the exam
    page keeps in state). Convert to the submit payload shape. */
 function draftToAnswerArray(draftObj, questionTypes) {
@@ -260,7 +281,7 @@ async function finalizeExpiredAttempts(pool) {
         studentId: row.student_id,
         answers: draftToAnswerArray(draft, types),
         auto: true,
-      });
+      }, { background: true });
       if (result.ok) {
         submitted++;
         console.log(`📥 Auto-submitted unfinished exam from autosave (assessment ${row.e_assessment_id}, student ${row.student_id}${row.session_status === "locked" ? ", device was LOCKED" : ""})`);

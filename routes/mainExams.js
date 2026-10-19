@@ -103,10 +103,12 @@ router.put("/:mainExamId/subjects/:id", updateSubjectSession);
 router.put("/:mainExamId/subjects/:id/assessment", attachAssessment);
 router.delete("/:mainExamId/subjects/:id", deleteSubjectSession);
 // Replay a finished paper for individually selected students only.
-const { getReplayCandidates, grantReplay, cancelReplay } = require("../controllers/examReplay.controller");
+const { getReplayCandidates, grantReplay, cancelReplay, extendActiveExam } = require("../controllers/examReplay.controller");
 router.get("/:mainExamId/subjects/:id/replay", getReplayCandidates);
 router.post("/:mainExamId/subjects/:id/replay", grantReplay);
 router.post("/:mainExamId/subjects/:id/replay/cancel", cancelReplay);
+// Add minutes to an exam that is currently running.
+router.post("/:mainExamId/subjects/:id/extend", extendActiveExam);
 
 /* ---------------- Timetable (§5-§6) ---------------- */
 router.get("/:mainExamId/timetable", getTimetable);

@@ -12,6 +12,7 @@ const { questionImagesDir, questionImageUrlFor, deleteQuestionImageByUrl } = req
 const { saveViolationPhoto, violationPhotoUrlFor } = require("../middleware/violationPhotoUpload");
 const { getPool, listTenantKeys } = require("../config/db");
 const { persistAttempt, FINALIZE_GRACE_MINUTES } = require("../utils/examAttempts");
+const { isQueueBusy } = require("../utils/submitQueue");
 const { clockStartSql, secondsLeftSql } = require("../utils/examClock");
 const { queryActivityLog } = require("../utils/eAssessmentActivityLog");
 const { generateAttendancePdf } = require("../utils/eAssessmentAttendance");
@@ -2003,7 +2004,15 @@ const autosaveExamAnswers = async (req, res) => {
     const sess = sessRes.recordset[0];
     if (!sess) return res.status(404).json({ message: "No exam session found" });
     if (sess.status === "ended") return res.status(409).json({ ended: true, message: "This assessment has already been completed" });
-    if (sess.status === "locked") return res.status(423).json({ locked: true, message: "Exam session is locked" });
+    // A LOCKED session still accepts a save from the device that is bound to it.
+    // The student's progress must reach the server the moment a device locks
+    // (violation, admin lock, flaky network) so that after an admin unlocks it
+    // — on this device or another — nothing typed before the lock is missing.
+    // It only stores answers already entered; it never submits, reopens or
+    // unlocks anything. A different device (e.g. the second device that caused
+    // the lock) is still refused, and an unlock clears the binding.
+    const lockedFlush = sess.status === "locked" && !!sess.device_id && !!device_id && sess.device_id === device_id;
+    if (sess.status === "locked" && !lockedFlush) return res.status(423).json({ locked: true, message: "Exam session is locked" });
     if (token && sess.token !== token) return res.status(403).json({ message: "Token does not match this session" });
     if (sess.device_id && device_id && sess.device_id !== device_id) {
       return res.status(423).json({ locked: true, message: "Device mismatch" });
@@ -2020,6 +2029,25 @@ const autosaveExamAnswers = async (req, res) => {
       if (val === null || val === undefined || String(val).trim() === "") return;
       clean[qid] = typeof val === "string" ? val : String(val);
     });
+    // First sync after (re)entering the exam — e.g. resuming on a new device after
+    // an unlock: ADD to what the server already holds instead of replacing it, so
+    // a device that failed to download the saved draft can't wipe earlier progress.
+    // After that first sync the normal "latest copy wins" behaviour applies, which
+    // is what lets a student clear an answer.
+    if (req.body.merge_existing === true) {
+      try {
+        const ex = await pool.request()
+          .input("aid", sql.Int, assessmentId)
+          .input("sid", sql.Int, student_id)
+          .query(`SELECT answers_json FROM e_assessment_drafts WHERE e_assessment_id = @aid AND student_id = @sid`);
+        const prev = ex.recordset[0]?.answers_json ? JSON.parse(ex.recordset[0].answers_json) : null;
+        if (prev && typeof prev === "object" && !Array.isArray(prev)) {
+          Object.entries(prev).forEach(([qid, val]) => {
+            if (!(qid in clean) && val !== null && val !== undefined && String(val).trim() !== "") clean[qid] = String(val);
+          });
+        }
+      } catch (_) { /* unreadable draft: fall back to saving what the device sent */ }
+    }
     const json = JSON.stringify(clean);
     const count = Object.keys(clean).length;
     // Never let an empty payload (e.g. a device that failed to restore its
@@ -2764,6 +2792,17 @@ const submitEAssessment = async (req, res) => {
 
     return res.status(201).json({ success: true, submission_id: result.submissionId, message: "Assessment submitted successfully" });
   } catch (err) {
+    // Too many submissions at once: not a failure. The student's answers are
+    // still in their browser and in the autosave; the page retries on its own.
+    if (isQueueBusy(err)) {
+      res.set("Retry-After", String(err.retryAfterSec || 5));
+      return res.status(503).json({
+        success: false,
+        busy: true,
+        retry_after: err.retryAfterSec || 5,
+        message: "Many students are submitting right now. Your answers are safe — saving them in a moment…",
+      });
+    }
     console.error("SUBMIT ERROR:", err);
     return res.status(500).json({ success: false, message: "Submission failed", error: err.message });
   }

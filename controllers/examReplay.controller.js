@@ -17,6 +17,7 @@ const toInt = (v) => {
 };
 
 const DONE_STATUSES = ["ended", "marking", "completed"];
+const MAX_REPLAY_BATCH = 2000;
 
 // Loads the subject session and checks it is a finished paper with an assessment.
 async function loadDoneSession(pool, mainExamId, id) {
@@ -112,14 +113,31 @@ const grantReplay = async (req, res) => {
     const mainExamId = toInt(req.params.mainExamId);
     const id = toInt(req.params.id);
     if (!mainExamId || !id) return res.status(400).json({ success: false, message: "Invalid id" });
-    const ids = Array.isArray(req.body?.student_ids)
-      ? [...new Set(req.body.student_ids.map(toInt).filter(Boolean))]
-      : [];
-    if (!ids.length) return res.status(400).json({ success: false, message: "Select at least one student to replay the paper for." });
-    if (ids.length > 200) return res.status(400).json({ success: false, message: "Too many students at once (max 200)." });
-
     const { session, error } = await loadDoneSession(pool, mainExamId, id);
     if (error) return res.status(error.code).json({ success: false, message: error.message });
+
+    // "Select all": every student who sat this paper and does not already have a
+    // replay waiting. The server resolves the list so a big class never has to be
+    // sent from (or even loaded in) the browser.
+    let ids;
+    if (req.body?.all === true) {
+      const rows = await pool.request().input("aid", sql.Int, session.e_assessment_id).query(`
+        SELECT DISTINCT es.student_id
+        FROM e_assessment_exam_sessions es
+        LEFT JOIN e_assessment_submissions sub
+               ON sub.e_assessment_id = es.e_assessment_id AND sub.student_id = es.student_id
+        WHERE es.e_assessment_id = @aid
+          AND (es.status = 'ended' OR sub.id IS NOT NULL)
+          AND NOT (ISNULL(es.resit_allowed, 0) = 1 AND es.status = 'issued')`);
+      ids = rows.recordset.map((r) => r.student_id).filter(Boolean);
+      if (!ids.length) return res.status(409).json({ success: false, message: "Every student who sat this paper already has a replay waiting." });
+    } else {
+      ids = Array.isArray(req.body?.student_ids)
+        ? [...new Set(req.body.student_ids.map(toInt).filter(Boolean))]
+        : [];
+      if (!ids.length) return res.status(400).json({ success: false, message: "Select at least one student to replay the paper for." });
+    }
+    if (ids.length > MAX_REPLAY_BATCH) return res.status(400).json({ success: false, message: `Too many students at once (max ${MAX_REPLAY_BATCH}).` });
 
     const { grantResit } = require("./eAssessment.controller"); // lazy: avoids a load-order cycle
     const score_policy = req.body?.score_policy === "keep_best" ? "keep_best" : "replace";
@@ -139,7 +157,7 @@ const grantReplay = async (req, res) => {
       action: "paper_replay_granted",
       actorId: req.user?.id,
       actorRole: req.user?.role,
-      details: { subject: session.subject, granted: granted.length, failed: failed.length, student_ids: granted, score_policy },
+      details: { subject: session.subject, granted: granted.length, failed: failed.length, student_ids: granted, score_policy, all: req.body?.all === true },
     });
 
     res.json({
@@ -186,4 +204,74 @@ const cancelReplay = async (req, res) => {
   }
 };
 
-module.exports = { getReplayCandidates, grantReplay, cancelReplay };
+/* =========================================================================
+   ADD TIME TO AN ACTIVE EXAM
+   POST /:mainExamId/subjects/:id/extend   { minutes }
+   Pushes the subject's end_time (so the scheduler does not close it early) and
+   the assessment's duration_minutes (which every student's countdown, and the
+   auto-submit sweep, are computed from) forward by the same amount. Students
+   already sitting pick the new time up on their next autosave/heartbeat.
+========================================================================= */
+const MAX_EXTRA_MINUTES = 240;
+
+const extendActiveExam = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const mainExamId = toInt(req.params.mainExamId);
+    const id = toInt(req.params.id);
+    const minutes = toInt(req.body?.minutes);
+    if (!mainExamId || !id) return res.status(400).json({ success: false, message: "Invalid id" });
+    if (!minutes || minutes > MAX_EXTRA_MINUTES) {
+      return res.status(400).json({ success: false, message: `Enter the extra time in whole minutes (1 to ${MAX_EXTRA_MINUTES}).` });
+    }
+
+    const r = await pool.request()
+      .input("id", sql.Int, id).input("mid", sql.Int, mainExamId)
+      .query(`SELECT id, subject, status, e_assessment_id, end_time, duration_minutes
+              FROM exam_subject_sessions WHERE id = @id AND main_examination_id = @mid`);
+    const row = r.recordset[0];
+    if (!row) return res.status(404).json({ success: false, message: "Subject session not found" });
+    if (row.status !== "active") return res.status(409).json({ success: false, message: "Time can only be added while the exam is active." });
+    if (!row.e_assessment_id) return res.status(409).json({ success: false, message: "This subject has no assessment attached." });
+
+    const tx = new sql.Transaction(pool);
+    await tx.begin();
+    try {
+      await new sql.Request(tx).input("id", sql.Int, id).input("m", sql.Int, minutes).query(`
+        UPDATE exam_subject_sessions
+        SET end_time = CASE WHEN end_time IS NULL THEN NULL ELSE DATEADD(MINUTE, @m, end_time) END,
+            duration_minutes = CASE WHEN duration_minutes IS NULL THEN NULL ELSE duration_minutes + @m END,
+            updatedAt = GETDATE()
+        WHERE id = @id AND status = 'active'`);
+      await new sql.Request(tx).input("aid", sql.Int, row.e_assessment_id).input("m", sql.Int, minutes).query(
+        `UPDATE e_assessments SET duration_minutes = ISNULL(duration_minutes, 30) + @m WHERE id = @aid`);
+      await tx.commit();
+    } catch (e) { await tx.rollback().catch(() => {}); throw e; }
+
+    const after = await pool.request().input("aid", sql.Int, row.e_assessment_id)
+      .query(`SELECT duration_minutes FROM e_assessments WHERE id = @aid`);
+    const newDuration = after.recordset[0]?.duration_minutes ?? null;
+
+    await logExamAudit(pool, {
+      mainExaminationId: mainExamId, examSubjectSessionId: id, action: "exam_time_extended",
+      actorId: req.user?.id, actorRole: req.user?.role,
+      details: { subject: row.subject, added_minutes: minutes, new_duration_minutes: newDuration },
+    });
+
+    try {
+      const io = req.app?.get("io");
+      const tenant = String(req.tenantKey || req.tenant || "default").toLowerCase();
+      io?.to(`tenant:${tenant}`).emit("main-exam:time-extended", { mainExaminationId: mainExamId, subjectSessionId: id, minutes });
+    } catch (_) { /* live push is best-effort; students resync on autosave anyway */ }
+
+    res.json({
+      success: true, added_minutes: minutes, duration_minutes: newDuration,
+      message: `Added ${minutes} minute${minutes === 1 ? "" : "s"} to ${row.subject}. Students see it within a minute.`,
+    });
+  } catch (err) {
+    console.error("EXTEND EXAM ERROR:", err);
+    res.status(500).json({ success: false, message: "Server error adding time" });
+  }
+};
+
+module.exports = { getReplayCandidates, grantReplay, cancelReplay, extendActiveExam };
