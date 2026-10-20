@@ -18,6 +18,7 @@ const { downloadTranscripts } = require("../controllers/transcript.controller");
 
 const {
   addSubjectSession,
+  moveSubjectStatus,
   getSubjectSessions,
   getSubjectSessionById,
   updateSubjectSession,
@@ -101,6 +102,8 @@ router.post("/:mainExamId/subjects", addSubjectSession);
 router.get("/:mainExamId/subjects/:id", getSubjectSessionById);
 router.put("/:mainExamId/subjects/:id", updateSubjectSession);
 router.put("/:mainExamId/subjects/:id/assessment", attachAssessment);
+// Move a draft subject to Scheduled or Done at any time (also lets a subject be added already scheduled/done)
+router.put("/:mainExamId/subjects/:id/status", moveSubjectStatus);
 router.delete("/:mainExamId/subjects/:id", deleteSubjectSession);
 // Replay a finished paper for individually selected students only.
 const { getReplayCandidates, grantReplay, cancelReplay, extendActiveExam } = require("../controllers/examReplay.controller");

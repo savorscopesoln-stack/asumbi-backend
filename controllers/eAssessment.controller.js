@@ -11,7 +11,7 @@ const { coverPageUrlFor, deleteCoverPageByUrl } = require("../middleware/coverPa
 const { questionImagesDir, questionImageUrlFor, deleteQuestionImageByUrl } = require("../middleware/questionImageUpload");
 const { saveViolationPhoto, violationPhotoUrlFor } = require("../middleware/violationPhotoUpload");
 const { getPool, listTenantKeys } = require("../config/db");
-const { persistAttempt, FINALIZE_GRACE_MINUTES } = require("../utils/examAttempts");
+const { persistAttempt, draftToAnswerArray, FINALIZE_GRACE_MINUTES } = require("../utils/examAttempts");
 const { isQueueBusy } = require("../utils/submitQueue");
 const { clockStartSql, secondsLeftSql } = require("../utils/examClock");
 const { queryActivityLog } = require("../utils/eAssessmentActivityLog");
@@ -2618,6 +2618,239 @@ const unlockExamSessionsBulk = async (req, res) => {
 };
 
 /* =========================================================================
+   ADMIN LIVE CONTROL — submit, stop or watch ONE student's exam at any moment
+   ─────────────────────────────────────────────────────────────────────────
+   SUBMIT  (POST /admin/exam-sessions/:id/submit, /submit-bulk)
+           Ends the exam now and submits the student's LAST AUTOSAVE (the
+           device syncs every ~30s) — the same path the time-up sweep uses, so
+           marking, split rules and the "Submitted" group all behave normally.
+           It is final: the student's screen goes to "Exam finished".
+   STOP    (PUT /admin/exam-sessions/:id/stop, /stop-bulk)
+           PAUSES the exam: the session is locked, the student's screen shows
+           the locked page within ~10s, and nothing they type is lost (a locked
+           bound device can still flush its answers). It is reversible — use
+           Unlock to let them resume — and if nobody unlocks it, the saved
+           answers are submitted automatically when the time ends.
+   WATCH   (GET /admin/exam-sessions/:id/activity)
+           Live view of one session: connection, time left, the answers saved
+           so far, and the student's recent activity-log events.
+========================================================================= */
+const ADMIN_STOP_REASON = "[admin_stop] Stopped by the invigilator";
+const ADMIN_BULK_MAX = 2000;
+
+// Sessions an admin action should touch: an explicit id list, or every
+// session of one assessment. Never "everything" — the caller must say what.
+const sessionsForAdminAction = async (pool, body) => {
+  const ids = Array.isArray(body?.sessionIds)
+    ? [...new Set(body.sessionIds.map(toInt).filter(Boolean))] : null;
+  const aid = toInt(body?.assessmentId);
+  if (ids && ids.length > ADMIN_BULK_MAX) return { error: `Too many sessions at once (max ${ADMIN_BULK_MAX})` };
+  if (!(ids && ids.length) && !aid) return { error: "Say which sessions: sessionIds or assessmentId" };
+  const request = pool.request();
+  let scope;
+  if (ids && ids.length) scope = `id IN (${ids.join(",")})`; // integers only (toInt) — safe to inline
+  else { request.input("aid", sql.Int, aid); scope = "e_assessment_id = @aid"; }
+  const r = await request.query(`SELECT id, e_assessment_id, student_id, status, activated_at FROM e_assessment_exam_sessions WHERE ${scope}`);
+  return { rows: r.recordset || [] };
+};
+
+// Submit one session from its last autosave. Returns a short result code.
+const forceSubmitSession = async (pool, row) => {
+  if (row.status === "ended") return "already_ended";
+  if (row.status === "issued" && !row.activated_at) return "not_started"; // never entered: nothing to submit
+  const d = await pool.request()
+    .input("aid", sql.Int, row.e_assessment_id).input("sid", sql.Int, row.student_id)
+    .query(`SELECT answers_json FROM e_assessment_drafts WHERE e_assessment_id = @aid AND student_id = @sid`);
+  let draft = {};
+  try { draft = d.recordset[0]?.answers_json ? JSON.parse(d.recordset[0].answers_json) : {}; } catch (_) { draft = {}; }
+
+  const closeSession = () => pool.request().input("id", sql.Int, row.id).query(`
+    UPDATE e_assessment_exam_sessions SET status = 'ended', ended_at = GETDATE(), auto_submitted = 1
+    WHERE id = @id AND status IN ('active','locked','issued')`);
+
+  if (!Object.keys(draft).length) { await closeSession(); return "closed_no_answers"; }
+
+  const q = await pool.request().input("aid", sql.Int, row.e_assessment_id)
+    .query(`SELECT id, question_type FROM e_assessment_questions WHERE e_assessment_id = @aid`);
+  const types = {};
+  q.recordset.forEach((x) => { types[x.id] = x.question_type; });
+
+  const out = await persistAttempt(pool, {
+    assessmentId: row.e_assessment_id, studentId: row.student_id,
+    answers: draftToAnswerArray(draft, types), auto: true,
+  });
+  if (out.ok) return "submitted";
+  await closeSession(); // a submission already exists (duplicate) — just close the session
+  return "already_submitted";
+};
+
+const submitSummary = (results) => {
+  const n = (k) => results.filter((r) => r === k).length;
+  const submitted = n("submitted") + n("closed_no_answers") + n("already_submitted");
+  const parts = [];
+  if (n("submitted")) parts.push(`${n("submitted")} submitted`);
+  if (n("closed_no_answers")) parts.push(`${n("closed_no_answers")} closed with no saved answers`);
+  if (n("already_submitted")) parts.push(`${n("already_submitted")} already had a submission`);
+  const skipped = n("already_ended") + n("not_started") + n("failed");
+  if (skipped) parts.push(`${skipped} skipped (already finished / not started / failed)`);
+  return { submitted, message: parts.length ? parts.join(", ") : "Nothing to submit" };
+};
+
+const adminSubmitExamSession = async (req, res) => {
+  try {
+    const id = toInt(req.params.id);
+    const found = await sessionsForAdminAction(req.pool, { sessionIds: [id] });
+    if (found.error || !found.rows.length) return res.status(404).json({ message: "Session not found" });
+    const result = await forceSubmitSession(req.pool, found.rows[0]);
+    examSessionsCache.clear();
+    if (result === "not_started") return res.status(409).json({ message: "This student has not entered the exam yet, so there is nothing to submit" });
+    if (result === "already_ended") return res.status(409).json({ message: "This exam is already finished" });
+    res.json({ success: true, result, message: submitSummary([result]).message });
+  } catch (err) {
+    if (err?.code === "QUEUE_BUSY") return res.status(503).json({ message: "The server is busy submitting exams — try again in a few seconds" });
+    console.error("ADMIN SUBMIT EXAM SESSION ERROR:", err);
+    res.status(500).json({ message: err.message });
+  }
+};
+
+const adminSubmitExamSessionsBulk = async (req, res) => {
+  try {
+    const found = await sessionsForAdminAction(req.pool, req.body);
+    if (found.error) return res.status(400).json({ message: found.error });
+    const results = [];
+    for (const row of found.rows) {
+      try { results.push(await forceSubmitSession(req.pool, row)); }
+      catch (e) { console.error(`ADMIN BULK SUBMIT failed (session ${row.id}):`, e.message); results.push("failed"); }
+    }
+    examSessionsCache.clear();
+    const { submitted, message } = submitSummary(results);
+    res.json({ success: true, submitted, message });
+  } catch (err) {
+    console.error("ADMIN BULK SUBMIT EXAM SESSIONS ERROR:", err);
+    res.status(500).json({ message: err.message });
+  }
+};
+
+const stopSessionsSql = (scope) => `
+  UPDATE e_assessment_exam_sessions
+  SET status = 'locked', locked_at = GETDATE(), lock_reason = @reason
+  WHERE status = 'active' AND ${scope}`;
+
+const adminStopExamSession = async (req, res) => {
+  try {
+    const id = toInt(req.params.id);
+    const r = await req.pool.request().input("id", sql.Int, id).input("reason", sql.NVarChar(300), ADMIN_STOP_REASON)
+      .query(stopSessionsSql("id = @id"));
+    examSessionsCache.clear();
+    if (!r.rowsAffected[0]) return res.status(409).json({ message: "Only an exam that is currently active can be stopped (it may already be locked or finished)" });
+    res.json({ success: true, message: "Exam stopped — the student's screen locks within a few seconds. Unlock to let them resume." });
+  } catch (err) {
+    console.error("ADMIN STOP EXAM SESSION ERROR:", err);
+    res.status(500).json({ message: err.message });
+  }
+};
+
+const adminStopExamSessionsBulk = async (req, res) => {
+  try {
+    const found = await sessionsForAdminAction(req.pool, req.body);
+    if (found.error) return res.status(400).json({ message: found.error });
+    const ids = found.rows.filter((r) => r.status === "active").map((r) => r.id);
+    if (!ids.length) return res.json({ success: true, stopped: 0, message: "No active exams to stop" });
+    const r = await req.pool.request().input("reason", sql.NVarChar(300), ADMIN_STOP_REASON)
+      .query(stopSessionsSql(`id IN (${ids.join(",")})`));
+    examSessionsCache.clear();
+    const stopped = r.rowsAffected[0] || 0;
+    res.json({ success: true, stopped, message: `${stopped} exam${stopped === 1 ? "" : "s"} stopped — unlock to let students resume` });
+  } catch (err) {
+    console.error("ADMIN BULK STOP EXAM SESSIONS ERROR:", err);
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// A drawing is a PNG data URL inside the answer — never ship megabytes to the
+// live view, and cap very long essays (the full text is in the marking screen).
+const ACTIVITY_ANSWER_MAX_CHARS = 6000;
+const liveAnswerText = (v) => {
+  if (v == null) return "";
+  const t = String(v);
+  if (/data:image\//i.test(t)) return "[drawing]";
+  return t.length > ACTIVITY_ANSWER_MAX_CHARS ? `${t.slice(0, ACTIVITY_ANSWER_MAX_CHARS)}…` : t;
+};
+
+const getExamSessionActivity = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const id = toInt(req.params.id);
+    const s = await pool.request().input("id", sql.Int, id).query(`
+      SELECT es.id, es.e_assessment_id, es.student_id, es.token, es.status, es.device_label,
+             es.issued_at, es.activated_at, es.last_heartbeat, es.locked_at, es.lock_reason,
+             es.ended_at, es.auto_submitted,
+             st.name AS student_name, st.studentClass AS student_class, st.username AS student_username,
+             a.title AS assessment_title, a.subject AS subject_name,
+             ISNULL(a.duration_minutes, 30) AS duration_minutes,
+             CASE WHEN es.status IN ('active','locked') AND es.activated_at IS NOT NULL
+                  THEN ${secondsLeftSql("a", "es")} END AS seconds_left,
+             CASE WHEN es.last_heartbeat IS NOT NULL THEN DATEDIFF(SECOND, es.last_heartbeat, GETDATE()) END AS last_heartbeat_age,
+             (SELECT COUNT(*) FROM e_assessment_violation_photos vp WHERE vp.session_id = es.id) AS photo_count
+      FROM e_assessment_exam_sessions es
+      LEFT JOIN Students st ON st.id = es.student_id
+      LEFT JOIN e_assessments a ON a.id = es.e_assessment_id
+      WHERE es.id = @id`);
+    const session = s.recordset[0];
+    if (!session) return res.status(404).json({ message: "Session not found" });
+
+    const questions = (await pool.request().input("aid", sql.Int, session.e_assessment_id)
+      .query(`SELECT id, question_text, question_type, marks FROM e_assessment_questions WHERE e_assessment_id = @aid ORDER BY id`)).recordset;
+
+    // Live answers come from the autosaved draft; once submitted the draft is
+    // gone, so fall back to the submission's own answers.
+    let answers = {}; let answersSource = "none"; let savedAt = null;
+    const d = await pool.request().input("aid", sql.Int, session.e_assessment_id).input("sid", sql.Int, session.student_id)
+      .query(`SELECT answers_json, saved_at FROM e_assessment_drafts WHERE e_assessment_id = @aid AND student_id = @sid`);
+    if (d.recordset[0]?.answers_json) {
+      try { answers = JSON.parse(d.recordset[0].answers_json) || {}; answersSource = "autosave"; savedAt = d.recordset[0].saved_at; } catch (_) { answers = {}; }
+    } else if (session.status === "ended") {
+      const a = await pool.request().input("aid", sql.Int, session.e_assessment_id).input("sid", sql.Int, session.student_id).query(`
+        SELECT ans.question_id, ans.selected_answer, ans.essay_answer, sub.submitted_at
+        FROM e_assessment_submissions sub
+        JOIN e_assessment_answers ans ON ans.submission_id = sub.id
+        WHERE sub.e_assessment_id = @aid AND sub.student_id = @sid`);
+      a.recordset.forEach((r) => { answers[r.question_id] = r.essay_answer != null ? r.essay_answer : r.selected_answer; savedAt = r.submitted_at; });
+      if (a.recordset.length) answersSource = "submission";
+    }
+
+    const items = questions.map((q) => ({
+      question_id: q.id, type: q.question_type, marks: q.marks,
+      question: String(q.question_text || "").replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 300),
+      answer: liveAnswerText(answers[q.id]),
+    }));
+    const answeredCount = items.filter((i) => i.answer.replace(/<[^>]*>/g, "").replace(/&nbsp;/g, " ").trim().length > 0).length;
+
+    // Recent events for this student on this exam (login, device, lock, stop, submit…).
+    // Answers are never stored in the log — only counts and outcomes.
+    const ev = await pool.request().input("aid", sql.Int, session.e_assessment_id).input("sid", sql.Int, session.student_id).query(`
+      SELECT TOP 60 created_at, actor_role, action, outcome, ip, device, details
+      FROM e_assessment_activity_log
+      WHERE assessment_id = @aid AND (student_id = @sid OR (actor_id = @sid AND actor_role = 'student'))
+      ORDER BY created_at DESC`);
+
+    const hbAge = session.last_heartbeat_age == null ? null : Number(session.last_heartbeat_age);
+    res.json({
+      session: {
+        ...session,
+        connection: session.status === "active" ? (hbAge != null && hbAge <= HEARTBEAT_STALE_SECONDS ? "online" : "no_signal") : null,
+      },
+      progress: { answered: answeredCount, total: items.length, source: answersSource, saved_at: savedAt },
+      answers: items,
+      events: ev.recordset || [],
+    });
+  } catch (err) {
+    console.error("GET EXAM SESSION ACTIVITY ERROR:", err);
+    res.status(500).json({ message: "Failed to load the live activity" });
+  }
+};
+
+/* =========================================================================
    CAMERA VIOLATION PHOTOS
    Student side: TakeEAssessment.jsx's webcam eye/gaze check no longer
    locks the exam on its own (see the HONEST SCOPE NOTE at the top of
@@ -4422,7 +4655,11 @@ const getAssessmentSubmissions = async (req, res) => {
         a.total_marks AS total_marks,
         st.name AS student_name,
         (SELECT COUNT(*) FROM e_assessment_violation_photos vp
-          WHERE vp.e_assessment_id = s.e_assessment_id AND vp.student_id = s.student_id) AS photo_count
+          WHERE vp.e_assessment_id = s.e_assessment_id AND vp.student_id = s.student_id) AS photo_count,
+        -- answers the admin pushed back for re-marking (Suggested Remarks) that are still waiting
+        (SELECT COUNT(*) FROM e_assessment_answers ra
+          WHERE ra.submission_id = s.id AND ra.return_status = 'pending'
+          ${isTeacher ? "AND ra.returned_to = @teacherId" : ""}) AS returned_pending
       FROM e_assessment_submissions s
       LEFT JOIN e_assessments a ON a.id = s.e_assessment_id
       LEFT JOIN Students st ON st.id = s.student_id
@@ -4523,6 +4760,7 @@ const getSubmissionForMarking = async (req, res) => {
     if (isTeacherViewer) answersReq.input("teacherId", sql.Int, toInt(req.user.id));
     const answers = await answersReq.query(`
       SELECT a.id, a.question_id, a.selected_answer, a.essay_answer, a.is_correct, a.marks_awarded, a.remarks, a.highlights, a.highlighted_html, a.music_annotations,
+             a.return_status, a.return_note, a.returned_at,
              q.question_text, q.correct_answer, q.marks AS max_marks, q.question_type, q.model_answer_sheet
       FROM e_assessment_answers a
       INNER JOIN e_assessment_questions q ON q.id = a.question_id
@@ -4575,6 +4813,7 @@ const getAllSubmissionsForMarking = async (req, res) => {
       if (isTeacher) answersReq.input("teacherId", sql.Int, toInt(req.user.id));
       const answersResult = await answersReq.query(`
         SELECT a.id, a.submission_id, a.question_id, a.essay_answer, a.marks_awarded, a.remarks, a.highlights, a.highlighted_html, a.music_annotations,
+       a.return_status, a.return_note, a.returned_at,
        q.question_text, q.question_type, q.marks AS max_marks, q.marking_guide, q.model_answer_sheet
 FROM e_assessment_answers a
 INNER JOIN e_assessment_questions q ON a.question_id = q.id
@@ -4667,7 +4906,8 @@ const saveMarking = async (req, res) => {
               highlights = @highlights,
               highlighted_html = @highlightedHtml,
               marked_by = @markerId,
-              marked_at = ISNULL(marked_at, GETDATE())
+              marked_at = ISNULL(marked_at, GETDATE()),
+              return_status = CASE WHEN return_status = 'pending' THEN 'done' ELSE return_status END
           WHERE id = @answerId
         `);
       } catch (e) {
@@ -5616,6 +5856,7 @@ const updateGradingSystem = async (req, res) => {
    EXPORTS (single source of truth — no other module.exports in this file)
 ========================================================================= */
 module.exports = {
+  generateToken, // used by examReplay.controller (first sitting for students who never sat the paper)
   setDesktopOnly,
   setMusicPaper,
   setArtPaper,
@@ -5651,7 +5892,8 @@ module.exports = {
 
   // exam session / device lock
   startExamSession, activateExamSession, heartbeatExamSession, endExamSession,
-  getExamSessions, unlockExamSession, unlockExamSessionsBulk, examSessionStatus, lockExamSession,
+  getExamSessions, unlockExamSession, unlockExamSessionsBulk,
+  adminSubmitExamSession, adminSubmitExamSessionsBulk, adminStopExamSession, adminStopExamSessionsBulk, getExamSessionActivity, examSessionStatus, lockExamSession,
   autosaveExamAnswers, getExamDraft, grantResit, cancelResit, getUnsubmittedSessions,
 
   // camera violation photos (evidence capture, no longer a lock trigger)

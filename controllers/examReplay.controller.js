@@ -46,6 +46,75 @@ async function callController(fn, req, body) {
   return out;
 }
 
+/* ---------------------------------------------------------------------------
+   STUDENTS WHO DID NOT SIT THE PAPER
+   "Didn't sit" = a student this paper is for (same audience rule that decides
+   who may enter it: class / year, restriction list, active, not blocked) who has
+   no submission and no exam session that was ever used — either no session at
+   all, or one that was issued but never started and has no replay waiting.
+   They can be given the paper the same way as a replay: a fresh token, and
+   nobody else gets in.
+--------------------------------------------------------------------------- */
+async function loadAbsentStudents(pool, assessmentId) {
+  const { getPermittedStudents } = require("../utils/examAccess");
+  const permitted = await getPermittedStudents(pool, assessmentId);
+  if (!permitted.length) return [];
+  const used = await pool.request().input("aid", sql.Int, assessmentId).query(`
+    SELECT es.student_id FROM e_assessment_exam_sessions es
+    WHERE es.e_assessment_id = @aid
+      AND NOT (es.status = 'issued' AND ISNULL(es.resit_allowed, 0) = 0)
+    UNION
+    SELECT sub.student_id FROM e_assessment_submissions sub WHERE sub.e_assessment_id = @aid`);
+  const sat = new Set(used.recordset.map((r) => r.student_id));
+  return permitted.filter((st) => !sat.has(st.id));
+}
+
+// Gives one absent student their first sitting (kept as attempt 1: there is nothing to replace).
+async function grantFirstSitting(pool, req, assessmentId, studentId, title) {
+  const { generateToken } = require("./eAssessment.controller"); // lazy: avoids a load-order cycle
+  const by = toInt(req.user?.id);
+  let token = null;
+  for (let i = 0; i < 5 && !token; i++) {
+    const t = generateToken();
+    try {
+      const upd = await pool.request()
+        .input("aid", sql.Int, assessmentId).input("sid", sql.Int, studentId)
+        .input("token", sql.Char(6), t).input("by", sql.Int, by)
+        .query(`
+          UPDATE e_assessment_exam_sessions
+          SET token = @token, status = 'issued', device_id = NULL, device_label = NULL, locked_at = NULL,
+              lock_reason = NULL, ended_at = NULL, activated_at = NULL, last_heartbeat = NULL, auto_submitted = 0,
+              resit_allowed = 1, resit_policy = 'replace', resit_granted_at = GETDATE(), resit_granted_by = @by
+          WHERE e_assessment_id = @aid AND student_id = @sid AND status = 'issued' AND ISNULL(resit_allowed, 0) = 0`);
+      if (!upd.rowsAffected[0]) {
+        await pool.request()
+          .input("aid", sql.Int, assessmentId).input("sid", sql.Int, studentId)
+          .input("token", sql.Char(6), t).input("by", sql.Int, by)
+          .query(`
+            INSERT INTO e_assessment_exam_sessions
+              (e_assessment_id, student_id, token, status, resit_allowed, attempt_no, resit_policy, resit_granted_at, resit_granted_by)
+            VALUES (@aid, @sid, @token, 'issued', 1, 1, 'replace', GETDATE(), @by)`);
+      }
+      token = t;
+    } catch (e) {
+      if (e.number === 2627 || e.number === 2601) continue; // token collision — try another
+      throw e;
+    }
+  }
+  if (!token) return { ok: false, message: "Could not issue an exam token. Please try again." };
+  await pool.request().input("aid", sql.Int, assessmentId).input("sid", sql.Int, studentId)
+    .query(`DELETE FROM e_assessment_drafts WHERE e_assessment_id = @aid AND student_id = @sid`);
+  try {
+    const { notifyOne } = require("../utils/notify");
+    await notifyOne(pool, studentId, "Students", {
+      title: "Exam Opportunity",
+      message: `You have been given a chance to sit "${title || "an assessment"}". Sign in to the exam to take it.`,
+      type: "exam",
+    });
+  } catch (e) { console.error("FIRST SITTING NOTIFY ERROR:", e.message); }
+  return { ok: true };
+}
+
 /* GET /:mainExamId/subjects/:id/replay
    Summary counts always; individual students ONLY for a search (?q=), so a
    big class is never dumped on screen. */
@@ -73,8 +142,25 @@ const getReplayCandidates = async (req, res) => {
              SUM(CASE WHEN ISNULL(es.attempt_no, 1) > 1 THEN 1 ELSE 0 END) AS replayed
       ${base}`);
 
+    const scope = req.query.scope === "absent" ? "absent" : "sat";
+    const absent = await loadAbsentStudents(pool, session.e_assessment_id);
+
     let students = [];
-    if (q.length >= 2) {
+    if (scope === "absent") {
+      if (q.length >= 2) {
+        const words = q.toLowerCase().split(/\s+/).filter(Boolean).slice(0, 5);
+        students = absent
+          .filter((st) => {
+            const hay = `${st.name || ""} ${st.username || ""} ${st.studentClass || ""}`.toLowerCase();
+            return words.every((w) => hay.includes(w));
+          })
+          .slice(0, 50)
+          .map((st) => ({
+            student_id: st.id, name: st.name, username: st.username, class_name: st.studentClass,
+            session_status: "not_sat", attempt_no: 1, resit_allowed: 0, score: null, submission_status: null,
+          }));
+      }
+    } else if (q.length >= 2) {
       const words = q.toLowerCase().split(/\s+/).filter(Boolean).slice(0, 5);
       const request = pool.request().input("aid", sql.Int, session.e_assessment_id);
       const likes = words.map((w, i) => {
@@ -96,7 +182,8 @@ const getReplayCandidates = async (req, res) => {
       success: true,
       subject: session.subject,
       paper_label: session.paper_label,
-      summary: { sat: c.total || 0, pending: c.pending || 0, replayed: c.replayed || 0 },
+      summary: { sat: c.total || 0, pending: c.pending || 0, replayed: c.replayed || 0, absent: absent.length },
+      scope,
       students,
       searched: q.length >= 2,
     });
@@ -119,8 +206,10 @@ const grantReplay = async (req, res) => {
     // "Select all": every student who sat this paper and does not already have a
     // replay waiting. The server resolves the list so a big class never has to be
     // sent from (or even loaded in) the browser.
-    let ids;
-    if (req.body?.all === true) {
+    let ids = [];
+    const wantAll = req.body?.all === true;
+    const wantAllAbsent = req.body?.all_absent === true;
+    if (wantAll) {
       const rows = await pool.request().input("aid", sql.Int, session.e_assessment_id).query(`
         SELECT DISTINCT es.student_id
         FROM e_assessment_exam_sessions es
@@ -130,12 +219,19 @@ const grantReplay = async (req, res) => {
           AND (es.status = 'ended' OR sub.id IS NOT NULL)
           AND NOT (ISNULL(es.resit_allowed, 0) = 1 AND es.status = 'issued')`);
       ids = rows.recordset.map((r) => r.student_id).filter(Boolean);
-      if (!ids.length) return res.status(409).json({ success: false, message: "Every student who sat this paper already has a replay waiting." });
-    } else {
-      ids = Array.isArray(req.body?.student_ids)
-        ? [...new Set(req.body.student_ids.map(toInt).filter(Boolean))]
-        : [];
-      if (!ids.length) return res.status(400).json({ success: false, message: "Select at least one student to replay the paper for." });
+      if (!ids.length && !wantAllAbsent && !(Array.isArray(req.body?.student_ids) && req.body.student_ids.length)) {
+        return res.status(409).json({ success: false, message: "Every student who sat this paper already has a replay waiting." });
+      }
+    }
+    // Ticked students (sat the paper OR didn't sit it) and, when asked, every student who didn't sit.
+    const ticked = Array.isArray(req.body?.student_ids) ? req.body.student_ids.map(toInt).filter(Boolean) : [];
+    const absentList = await loadAbsentStudents(pool, session.e_assessment_id);
+    const absentSet = new Set(absentList.map((st) => st.id));
+    if (wantAllAbsent) absentList.forEach((st) => ids.push(st.id));
+    ids = [...new Set([...ids, ...ticked])];
+    if (!ids.length) {
+      return res.status(wantAll || wantAllAbsent ? 409 : 400).json({ success: false,
+        message: wantAllAbsent ? "There is nobody left who didn't sit this paper." : "Select at least one student to replay the paper for." });
     }
     if (ids.length > MAX_REPLAY_BATCH) return res.status(400).json({ success: false, message: `Too many students at once (max ${MAX_REPLAY_BATCH}).` });
 
@@ -143,7 +239,15 @@ const grantReplay = async (req, res) => {
     const score_policy = req.body?.score_policy === "keep_best" ? "keep_best" : "replace";
     const granted = [];
     const failed = [];
+    let firstSittings = 0;
     for (const studentId of ids) {
+      if (absentSet.has(studentId)) {
+        // never sat it: a first sitting, not a re-sit (the paper's audience was checked above)
+        const out = await grantFirstSitting(pool, req, session.e_assessment_id, studentId, session.subject);
+        if (out.ok) { granted.push(studentId); firstSittings += 1; }
+        else failed.push({ student_id: studentId, message: out.message });
+        continue;
+      }
       const out = await callController(grantResit, req, {
         assessment_id: session.e_assessment_id, student_id: studentId, score_policy,
       });
@@ -157,7 +261,7 @@ const grantReplay = async (req, res) => {
       action: "paper_replay_granted",
       actorId: req.user?.id,
       actorRole: req.user?.role,
-      details: { subject: session.subject, granted: granted.length, failed: failed.length, student_ids: granted, score_policy, all: req.body?.all === true },
+      details: { subject: session.subject, granted: granted.length, first_sittings: firstSittings, failed: failed.length, student_ids: granted, score_policy, all: wantAll, all_absent: wantAllAbsent },
     });
 
     res.json({

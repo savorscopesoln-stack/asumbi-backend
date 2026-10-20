@@ -60,6 +60,53 @@ async function loadMainExam(pool, mainExamId) {
 }
 
 /* =========================================================================
+   MOVING A SUBJECT OUT OF DRAFT (any time, not only at "Publish timetable")
+
+   A subject starts as 'draft'. Publishing the timetable flips every draft to
+   'scheduled' ONCE, so a subject added afterwards used to sit in draft for
+   good. These helpers let the admin move a draft subject to:
+     scheduled → the scheduler opens/closes it at its start/end time
+     done      → stored as 'ended': the paper was already sat (or is no longer
+                 going to run), so it is closed and can be replayed/marked
+   and let a subject be ADDED already scheduled or done.
+========================================================================= */
+const wallClockNow = () => require("../utils/examAccess").nowAsSchoolWallClock();
+
+// "scheduled" | "done" | "draft" from whatever the client sent (null = not recognised)
+const normaliseTarget = (v) => {
+  const t = String(v || "").trim().toLowerCase();
+  if (t === "scheduled") return "scheduled";
+  if (t === "done" || t === "ended" || t === "completed") return "done";
+  if (t === "draft" || t === "") return "draft";
+  return null;
+};
+
+// row = { start_time, end_time, e_assessment_id }. Returns an error message, or null when OK.
+async function checkCanMove(pool, row, target) {
+  if (target !== "scheduled") return null; // "done" needs nothing: it is just recording what already happened
+  if (!row.start_time || !row.end_time) return "Set the exam date and its start and end time before scheduling it.";
+  if (!row.e_assessment_id) return "Attach an assessment (paper) before scheduling it.";
+  const a = await pool.request().input("id", sql.Int, row.e_assessment_id)
+    .query(`SELECT status, title FROM e_assessments WHERE id = @id`);
+  if (!a.recordset[0]) return "The attached assessment no longer exists.";
+  if (a.recordset[0].status !== "approved") return `Assessment "${a.recordset[0].title}" is not approved yet, so this subject can't be scheduled.`;
+  if (new Date(row.end_time) <= wallClockNow()) {
+    return "This subject's end time has already passed, so it can't be scheduled. Move it to Done instead, or change its time.";
+  }
+  return null;
+}
+
+// Closes out a subject that is being recorded as done: ended now, paper no longer open for new attempts.
+async function markSubjectDone(pool, id, eAssessmentId) {
+  await pool.request().input("id", sql.Int, id).input("now", sql.DateTime, wallClockNow())
+    .query(`UPDATE exam_subject_sessions SET status = 'ended', ended_at = @now, updatedAt = GETDATE() WHERE id = @id`);
+  if (eAssessmentId) {
+    await pool.request().input("aid", sql.Int, eAssessmentId)
+      .query(`UPDATE e_assessments SET active_status = 'Inactive' WHERE id = @aid`);
+  }
+}
+
+/* =========================================================================
    VALIDATION (§6 — "before saving/publishing the timetable, detect...")
    Returns a plain array of human-readable error strings — empty means
    valid. Deliberately synchronous-looking (awaits inside) so callers can
@@ -166,11 +213,18 @@ const addSubjectSession = async (req, res) => {
     const startVal = toDateTime(start_time);
     const endVal = toDateTime(end_time);
 
+    // Optional: add the subject already 'scheduled' or 'done' (default: draft, as before).
+    const target = normaliseTarget(req.body.status);
+    if (target === null) return res.status(400).json({ success: false, message: "Status must be draft, scheduled or done." });
+
     const errors = await validateSessionInput(pool, {
       mainExam, subject, class_id: toInt(class_id), exam_date: examDateVal,
       start_time: startVal, end_time: endVal, duration_minutes, mainExamId,
     });
     if (errors.length) return res.status(400).json({ success: false, message: errors[0], errors });
+
+    const moveError = await checkCanMove(pool, { start_time: startVal, end_time: endVal, e_assessment_id: toInt(e_assessment_id) }, target);
+    if (moveError) return res.status(400).json({ success: false, message: moveError, errors: [moveError] });
 
     const derivedDuration = duration_minutes !== undefined && duration_minutes !== null
       ? toInt(duration_minutes)
@@ -188,15 +242,18 @@ const addSubjectSession = async (req, res) => {
       .input("venue", sql.NVarChar, venue || null)
       .input("maxMarks", sql.Int, toInt(max_marks))
       .input("instructions", sql.NVarChar, instructions || null)
+      // a subject that is going to be marked done is first stored as 'draft' and then closed by markSubjectDone
+      .input("status", sql.NVarChar, target === "scheduled" ? "scheduled" : "draft")
       .query(`
         INSERT INTO exam_subject_sessions
           (main_examination_id, e_assessment_id, subject, class_id, exam_date, start_time, end_time, duration_minutes, venue, max_marks, instructions, status)
         OUTPUT INSERTED.id
         VALUES
-          (@mainExaminationId, @eAssessmentId, @subject, @classId, @examDate, @startTime, @endTime, @durationMinutes, @venue, @maxMarks, @instructions, 'draft')
+          (@mainExaminationId, @eAssessmentId, @subject, @classId, @examDate, @startTime, @endTime, @durationMinutes, @venue, @maxMarks, @instructions, @status)
       `);
 
     const id = result.recordset[0].id;
+    if (target === "done") await markSubjectDone(pool, id, toInt(e_assessment_id));
 
     await logExamAudit(pool, {
       mainExaminationId: mainExamId,
@@ -204,10 +261,10 @@ const addSubjectSession = async (req, res) => {
       action: "subject_session_added",
       actorId: req.user?.id,
       actorRole: req.user?.role,
-      details: { subject },
+      details: { subject, status: target },
     });
 
-    res.status(201).json({ success: true, id });
+    res.status(201).json({ success: true, id, status: target === "done" ? "ended" : target });
   } catch (err) {
     console.error("ADD SUBJECT SESSION ERROR:", err);
     res.status(500).json({ success: false, message: "Server error adding subject" });
@@ -345,6 +402,63 @@ const updateSubjectSession = async (req, res) => {
   } catch (err) {
     console.error("UPDATE SUBJECT SESSION ERROR:", err);
     res.status(500).json({ success: false, message: "Server error updating subject" });
+  }
+};
+
+/* =========================================================================
+   MOVE A DRAFT SUBJECT TO SCHEDULED OR DONE
+   PUT /:mainExamId/subjects/:id/status   { status: "scheduled" | "done" }
+   Only a draft can be moved this way. Whatever else a subject is doing is
+   owned by the scheduler and the marking workflow.
+========================================================================= */
+const moveSubjectStatus = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const mainExamId = toInt(req.params.mainExamId);
+    const id = toInt(req.params.id);
+    if (!mainExamId || !id) return res.status(400).json({ success: false, message: "Invalid id" });
+
+    const target = normaliseTarget(req.body?.status);
+    if (target !== "scheduled" && target !== "done") {
+      return res.status(400).json({ success: false, message: "Choose Scheduled or Done." });
+    }
+
+    const found = await pool.request().input("id", sql.Int, id).input("mid", sql.Int, mainExamId)
+      .query(`SELECT id, subject, status, start_time, end_time, e_assessment_id
+              FROM exam_subject_sessions WHERE id = @id AND main_examination_id = @mid`);
+    const row = found.recordset[0];
+    if (!row) return res.status(404).json({ success: false, message: "Subject session not found" });
+    if (row.status !== "draft") {
+      return res.status(409).json({ success: false, message: `Only a draft subject can be moved. "${row.subject}" is already ${row.status}.` });
+    }
+
+    const problem = await checkCanMove(pool, row, target);
+    if (problem) return res.status(409).json({ success: false, message: problem });
+
+    if (target === "scheduled") {
+      await pool.request().input("id", sql.Int, id)
+        .query(`UPDATE exam_subject_sessions SET status = 'scheduled', updatedAt = GETDATE() WHERE id = @id AND status = 'draft'`);
+    } else {
+      await markSubjectDone(pool, id, row.e_assessment_id);
+    }
+
+    await logExamAudit(pool, {
+      mainExaminationId: mainExamId,
+      examSubjectSessionId: id,
+      action: "subject_session_status_moved",
+      actorId: req.user?.id,
+      actorRole: req.user?.role,
+      details: { subject: row.subject, from: "draft", to: target === "done" ? "ended" : "scheduled" },
+    });
+
+    res.json({
+      success: true,
+      status: target === "done" ? "ended" : "scheduled",
+      message: target === "done" ? `"${row.subject}" marked as done.` : `"${row.subject}" scheduled.`,
+    });
+  } catch (err) {
+    console.error("MOVE SUBJECT STATUS ERROR:", err);
+    res.status(500).json({ success: false, message: "Server error moving the subject" });
   }
 };
 
@@ -637,6 +751,7 @@ const unpublishTimetable = async (req, res) => {
 
 module.exports = {
   addSubjectSession,
+  moveSubjectStatus,
   getSubjectSessions,
   getSubjectSessionById,
   updateSubjectSession,

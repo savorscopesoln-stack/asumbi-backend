@@ -1,6 +1,8 @@
 const express = require("express");
 const { getMarkingLeaderboard } = require("../controllers/markingLeaderboard.controller");
 const { getMyMarkingOption, listMarkingOptions, setMarkingOption } = require("../controllers/markingOption.controller");
+const { getZeroMarked, pushBackZeroMarked } = require("../controllers/zeroMarkReturn.controller");
+const { grantResitBulk } = require("../controllers/resitBulk.controller");
 const { getReportCardOptions, putReportCardSource } = require("../utils/reportCardSource");
 const router = express.Router();
 
@@ -26,7 +28,9 @@ const {
   // exam session / device lock
   startExamSession, activateExamSession, heartbeatExamSession, endExamSession,
   setDesktopOnly, setMusicPaper, setArtPaper, setWritingAids, setModelSheet, getAccessSettings, setAccessSettings, getStudentsActivation, setStudentsActivation, setSecuritySettings, setSebSettings, uploadSebConfig, deleteSebConfig, getSebInfo, downloadSebConfig, getSecuritySettings, getActivityLog,
-  getExamSessions, unlockExamSession, unlockExamSessionsBulk, getDeviceAccess, allowDevice, revokeDevice, downloadAttendancePdf, examSessionStatus, lockExamSession,
+  getExamSessions, unlockExamSession, unlockExamSessionsBulk,
+  adminSubmitExamSession, adminSubmitExamSessionsBulk, adminStopExamSession, adminStopExamSessionsBulk, getExamSessionActivity,
+  getDeviceAccess, allowDevice, revokeDevice, downloadAttendancePdf, examSessionStatus, lockExamSession,
   autosaveExamAnswers, getExamDraft, grantResit, cancelResit, getUnsubmittedSessions,
 
   // camera violation photos (evidence capture, no longer a lock trigger)
@@ -177,6 +181,9 @@ router.get("/marking-option", protect, authorize("teacher", "admin", "sub_admin"
 router.get("/admin/marking-options", protect, requirePage("E-Assessments"), listMarkingOptions);
 router.put("/admin/marking-options/:teacherId", protect, requirePage("E-Assessments"), setMarkingOption);
 router.put("/admin/marking-options", protect, requirePage("E-Assessments"), setMarkingOption);
+// Suggested remarks: answers marked 0, grouped by the teacher who marked them, pushable back to that teacher
+router.get("/admin/zero-marked", protect, requirePage("E-Assessments"), getZeroMarked);
+router.post("/admin/zero-marked/push-back", protect, requirePage("E-Assessments"), pushBackZeroMarked);
 router.get("/admin/remark-requests", protect, requirePage("E-Assessments"), getRemarkRequests);
 router.put("/admin/remark-requests/:id/review", protect, requirePage("E-Assessments"), reviewRemarkRequest);
 
@@ -205,7 +212,14 @@ router.get("/admin/exam-sessions", protect, requirePage("E-Assessments"), getExa
 router.get("/admin/exam-sessions/unsubmitted", protect, requirePage("E-Assessments"), getUnsubmittedSessions);
 router.put("/admin/exam-sessions/unlock-bulk", protect, requirePage("E-Assessments"), unlockExamSessionsBulk);
 router.put("/admin/exam-sessions/:id/unlock", protect, requirePage("E-Assessments"), unlockExamSession);
+// Live control: watch, stop (pause) or submit one student's exam — or many — at any moment
+router.get("/admin/exam-sessions/:id/activity", protect, requirePage("E-Assessments"), getExamSessionActivity);
+router.put("/admin/exam-sessions/stop-bulk", protect, requirePage("E-Assessments"), adminStopExamSessionsBulk);
+router.put("/admin/exam-sessions/:id/stop", protect, requirePage("E-Assessments"), adminStopExamSession);
+router.post("/admin/exam-sessions/submit-bulk", protect, requirePage("E-Assessments"), adminSubmitExamSessionsBulk);
+router.post("/admin/exam-sessions/:id/submit", protect, requirePage("E-Assessments"), adminSubmitExamSession);
 router.post("/admin/resit", protect, requirePage("E-Assessments"), grantResit);
+router.post("/admin/resit/bulk", protect, requirePage("E-Assessments"), grantResitBulk);
 router.post("/admin/resit/cancel", protect, requirePage("E-Assessments"), cancelResit);
 
 /* =========================================================================

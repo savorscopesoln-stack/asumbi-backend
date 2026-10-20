@@ -406,6 +406,12 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       ["e_assessment_answers", "marked_at", "DATETIME NULL"],
       ["e_assessment_submissions", "marking_completed_at", "DATETIME NULL"],
       ["e_assessment_submissions", "marking_completed_by", "INT NULL"],
+      // Suggested Remarks: a 0-marked answer the admin pushed back to the teacher who marked it
+      ["e_assessment_answers", "return_status", "NVARCHAR(12) NULL"],   // 'pending' → 'done'
+      ["e_assessment_answers", "return_note", "NVARCHAR(500) NULL"],
+      ["e_assessment_answers", "returned_at", "DATETIME NULL"],
+      ["e_assessment_answers", "returned_by", "INT NULL"],
+      ["e_assessment_answers", "returned_to", "INT NULL"],
     ]) {
       await pool.request().query(`
         IF EXISTS (SELECT * FROM sysobjects WHERE name='${tbl}' AND xtype='U')
