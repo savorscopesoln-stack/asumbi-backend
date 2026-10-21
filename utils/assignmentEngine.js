@@ -242,7 +242,120 @@ async function undoBatch(pool, batchId, userId) {
   return { status: 200, restored, keptMarked, changedSince };
 }
 
+/* ── RECALL (take assigned work back from teachers) ─────────────────────────
+   Used by the "Retrieve submissions" button and automatically when a teacher's
+   subject/class assignment is removed. Work a teacher has ALREADY marked stays
+   with them: only submissions still waiting (status submitted / empty) and
+   answers with no mark yet go back to "unassigned".
+   opts: { subjectName, teacherIds?: number[], classNames?: string[] | null }
+     teacherIds  — only recall from these teachers (default: every teacher)
+     classNames  — only recall submissions of students in these classes
+                   (default / null: every class)
+   Returns { submissions, answers, perTeacher: { teacherId: count } }.        */
+async function recallAssigned(pool, opts) {
+  const subjectName = String(opts?.subjectName ?? "").trim();
+  if (!subjectName) return { submissions: 0, answers: 0, perTeacher: {} };
+  const teachers = ints(opts.teacherIds);
+  const classes = Array.isArray(opts.classNames) ? opts.classNames.map((c) => String(c).trim()).filter(Boolean) : null;
+  if (classes && !classes.length) return { submissions: 0, answers: 0, perTeacher: {} };
+
+  const bind = (rq) => {
+    rq.input("subject", sql.NVarChar(300), subjectName);
+    (classes || []).forEach((c, i) => rq.input(`c${i}`, sql.NVarChar(300), c));
+    return rq;
+  };
+  const classClause = (subAlias) => classes
+    ? `AND EXISTS (SELECT 1 FROM Students st WHERE st.id = ${subAlias}.student_id AND st.studentClass IN (${classes.map((_, i) => `@c${i}`).join(",")}))`
+    : "";
+  const notMarked = (subAlias) => `(${subAlias}.status IS NULL OR ${subAlias}.status = 'submitted')`;
+  const perTeacher = {};
+  const bump = (rows) => (rows || []).forEach((r) => { perTeacher[r.teacher_id] = (perTeacher[r.teacher_id] || 0) + 1; });
+
+  // whole submissions handed to a teacher
+  const subs = await bind(pool.request()).query(`
+    DELETE aa OUTPUT deleted.teacher_id
+    FROM e_assessment_submission_assignments aa
+    INNER JOIN e_assessment_submissions s ON s.id = aa.submission_id
+    INNER JOIN e_assessments a ON a.id = s.e_assessment_id
+    WHERE a.subject = @subject AND ${notMarked("s")}
+      ${teachers.length ? `AND aa.teacher_id IN (${teachers.join(",")})` : ""}
+      ${classClause("s")}`);
+  bump(subs.recordset);
+
+  // single answers handed to a teacher (split by question) that are still unmarked
+  const ansRes = await bind(pool.request()).query(`
+    DELETE ax OUTPUT deleted.teacher_id
+    FROM e_assessment_answer_assignments ax
+    INNER JOIN e_assessment_answers an ON an.id = ax.answer_id
+    INNER JOIN e_assessment_submissions s ON s.id = an.submission_id
+    INNER JOIN e_assessments a ON a.id = s.e_assessment_id
+    WHERE a.subject = @subject AND an.marks_awarded IS NULL AND ${notMarked("s")}
+      ${teachers.length ? `AND ax.teacher_id IN (${teachers.join(",")})` : ""}
+      ${classClause("s")}`);
+  bump(ansRes.recordset);
+
+  return { submissions: (subs.recordset || []).length, answers: (ansRes.recordset || []).length, perTeacher };
+}
+
+/* A (teacher, subject, class) assignment was removed -> that teacher's pending
+   work for it goes back to unassigned.
+   removed: [{ teacher_id, subject_id, class_id }]  (rows already deleted).
+   • classes the teacher STILL has for that subject keep their submissions;
+   • if the teacher has no class left for the subject, everything pending in
+     that subject is recalled and their manual split-marking rules for the
+     subject's papers are dropped (otherwise new submissions would still be
+     routed to them).                                                         */
+async function unassignAfterRemoval(pool, removed) {
+  const rows = (removed || []).filter((r) => r.teacher_id && r.subject_id);
+  const out = { submissions: 0, answers: 0, perTeacher: {} };
+  if (!rows.length) return out;
+
+  const names = async (table, ids) => {
+    const map = {};
+    for (const part of chunks(ints(ids), 1000)) {
+      const r = await pool.request().query(`SELECT id, name FROM ${table} WHERE id IN (${part.join(",")})`);
+      (r.recordset || []).forEach((x) => { map[x.id] = x.name; });
+    }
+    return map;
+  };
+  const subjectName = await names("Subjects", rows.map((r) => r.subject_id));
+  const className = await names("Classes", rows.map((r) => r.class_id));
+
+  const groups = {};
+  rows.forEach((r) => { (groups[`${r.teacher_id}:${r.subject_id}`] ||= { teacher_id: r.teacher_id, subject_id: r.subject_id, classIds: [] }).classIds.push(r.class_id); });
+
+  for (const g of Object.values(groups)) {
+    const subject = subjectName[g.subject_id];
+    if (!subject) continue;
+    const left = await pool.request().input("t", sql.Int, g.teacher_id).input("s", sql.Int, g.subject_id)
+      .query(`SELECT c.name FROM TeacherSubjects ts LEFT JOIN Classes c ON c.id = ts.class_id WHERE ts.teacher_id = @t AND ts.subject_id = @s`);
+    const stillTeaches = new Set((left.recordset || []).map((x) => String(x.name || "").toLowerCase()));
+    const fullyRemoved = (left.recordset || []).length === 0;
+
+    let classNames = null; // null = every class
+    if (!fullyRemoved) {
+      classNames = [...new Set(g.classIds.map((id) => className[id]).filter(Boolean))]
+        .filter((n) => !stillTeaches.has(String(n).toLowerCase()));
+      if (!classNames.length) continue;
+    }
+    const rec = await recallAssigned(pool, { subjectName: subject, teacherIds: [g.teacher_id], classNames });
+    out.submissions += rec.submissions;
+    out.answers += rec.answers;
+    Object.entries(rec.perTeacher).forEach(([t, n]) => { out.perTeacher[t] = (out.perTeacher[t] || 0) + n; });
+
+    if (fullyRemoved) {
+      try {
+        await pool.request().input("t", sql.Int, g.teacher_id).input("subject", sql.NVarChar(300), subject).query(`
+          DELETE r FROM e_assessment_question_assignments r
+          INNER JOIN e_assessments a ON a.id = r.e_assessment_id
+          WHERE r.teacher_id = @t AND a.subject = @subject`);
+      } catch (_) { /* split-marking table may not exist yet */ }
+    }
+  }
+  return out;
+}
+
 module.exports = {
   MODE, chooseMode, planAllocation, recordBatch, distributeBySubmission, distributeByQuestion,
-  loadAllocatableAnswers, undoBatch, ints,
+  loadAllocatableAnswers, undoBatch, ints, recallAssigned, unassignAfterRemoval,
 };

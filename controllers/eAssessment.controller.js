@@ -4391,7 +4391,27 @@ const deleteAssignments = async (req, res) => {
       kind: "teacher_subject", summary: `Removed ${gone.length} teacher/subject/class assignment(s)`, userId: req.user?.id,
       changes: gone.map((x) => ({ kind: "ts_removed", target_id: x.id, teacher_id: x.teacher_id, subject_id: x.subject_id, class_id: x.class_id })),
     });
-    res.json({ success: true, message: "Assignments deleted", batch_id: batchId });
+
+    // the teacher no longer marks these classes -> their pending submissions go back to "unassigned"
+    let recalled = { submissions: 0, answers: 0, perTeacher: {} };
+    try {
+      recalled = await assignmentEngine.unassignAfterRemoval(pool, gone);
+      for (const [tid, count] of Object.entries(recalled.perTeacher)) {
+        try {
+          await notifyOne(pool, Number(tid), "Teachers", {
+            title: "Marking Allocation Removed",
+            message: `${count} item${count === 1 ? "" : "s"} waiting to be marked ${count === 1 ? "was" : "were"} taken back because your class allocation changed.`,
+            type: "allocation",
+          });
+        } catch (_) { /* notification is optional */ }
+      }
+    } catch (e) { console.error("UNASSIGN AFTER REMOVAL ERROR:", e.message); }
+
+    const back = recalled.submissions + recalled.answers;
+    res.json({
+      success: true, batch_id: batchId, unassigned_submissions: recalled.submissions, unassigned_answers: recalled.answers,
+      message: back ? `Assignments deleted — ${recalled.submissions} submission(s)${recalled.answers ? ` and ${recalled.answers} answer(s)` : ""} went back to unassigned` : "Assignments deleted",
+    });
   } catch (err) {
     console.error("DELETE ASSIGNMENTS ERROR:", err);
     res.status(500).json({ message: "Delete failed" });
@@ -5220,6 +5240,40 @@ const smartDistribute = async (req, res) => {
   }
 };
 
+/* RETRIEVE SUBMISSIONS — "Retrieve" button on a subject card. Takes the pending
+   (not yet marked) submissions / answers of that subject back from every teacher
+   (or only the listed ones) so they are unassigned again and can be
+   re-distributed. Anything already marked stays with the teacher who marked it. */
+const retrieveSubmissions = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const subjectName = String(req.body?.subject_name || "").trim();
+    if (!subjectName) return res.status(400).json({ message: "Subject is required" });
+    const teacherIds = assignmentEngine.ints(req.body?.teacher_ids);
+
+    const out = await assignmentEngine.recallAssigned(pool, { subjectName, teacherIds });
+    const total = out.submissions + out.answers;
+    if (!total) return res.json({ success: true, submissions: 0, answers: 0, message: "Nothing to retrieve: no unmarked work is assigned to a teacher for this subject." });
+
+    for (const [tid, count] of Object.entries(out.perTeacher)) {
+      try {
+        await notifyOne(pool, Number(tid), "Teachers", {
+          title: "Marking Allocation Recalled",
+          message: `${count} item${count === 1 ? "" : "s"} for ${subjectName} ${count === 1 ? "was" : "were"} taken back by the admin.`,
+          type: "allocation",
+        });
+      } catch (_) { /* notification is optional */ }
+    }
+    res.json({
+      success: true, submissions: out.submissions, answers: out.answers, teachers: Object.keys(out.perTeacher).length,
+      message: `Retrieved ${out.submissions} submission(s)${out.answers ? ` and ${out.answers} answer(s)` : ""} from ${Object.keys(out.perTeacher).length} teacher(s). They are unassigned again.`,
+    });
+  } catch (err) {
+    console.error("RETRIEVE SUBMISSIONS ERROR:", err);
+    res.status(500).json({ message: "Could not retrieve the submissions" });
+  }
+};
+
 const getAssignmentBatches = async (req, res) => {
   try {
     const r = await req.pool.request().query(`
@@ -5912,7 +5966,7 @@ module.exports = {
 
   // submissions / marking
   getAllSubmissions, getAssessmentSubmissions, getSubmissionForMarking, getAllSubmissionsForMarking,
-  saveMarking, saveMarkingBulk, assignSubmission, bulkAssignSubmissions, smartDistribute, getAssignmentBatches, undoAssignmentBatch, getNextSubmissionForMarking,
+  saveMarking, saveMarkingBulk, assignSubmission, bulkAssignSubmissions, smartDistribute, retrieveSubmissions, getAssignmentBatches, undoAssignmentBatch, getNextSubmissionForMarking,
   getMarkingSession, saveMarkingSession, clearMarkingSession,
 
   // remarks
