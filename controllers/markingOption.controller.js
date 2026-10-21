@@ -5,7 +5,7 @@
                           choice made there decides the point.
      option 2           - select words and a ✓ highlight is added straight
                           away; tap the ✓ afterwards to flip it to ✗.
-     option 3           - works exactly like option 2; only the layout differs:
+     option 3           - works exactly like option 1; only the layout differs:
                           the ✓ / ✗ buttons sit on top of the answer editor and
                           the extra "R" button is gone.
    The admin chooses which one each teacher uses. A teacher with no row
