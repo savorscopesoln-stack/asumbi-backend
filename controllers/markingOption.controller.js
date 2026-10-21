@@ -1,13 +1,14 @@
 /* =========================================================================
    MARKING OPTION (per teacher)
    Three ways of marking an answer exist on the marking screens:
-     option 1 (default) - select words, a small ✓ / ✗ box pops up and the
-                          choice made there decides the point.
+     option 1 (default) - select words and a ✓ point is added straight away
+                          (no ✓ / ✗ box); tap the ✓ afterwards to flip it to ✗.
      option 2           - select words and a ✓ highlight is added straight
-                          away; tap the ✓ afterwards to flip it to ✗.
+                          away; tap the ✓ afterwards to flip it to ✗ (the original
+                          auto-highlight mode).
      option 3           - works exactly like option 1; only the layout differs:
-                          the ✓ / ✗ buttons sit on top of the answer editor and
-                          the extra "R" button is gone.
+                          the ✓ / ✗ buttons sit INSIDE the answer editor, in a
+                          column beside the text, and the extra "R" button is gone.
    The admin chooses which one each teacher uses. A teacher with no row
    uses option 1, so nothing changes until an admin switches someone.
 ========================================================================= */
