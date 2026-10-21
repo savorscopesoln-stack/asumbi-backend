@@ -5191,6 +5191,59 @@ const bulkAssignSubmissions = async (req, res) => {
   }
 };
 
+/* ALLOCATE SUBMISSIONS — give a chosen NUMBER of a subject's unassigned, unmarked
+   submissions to ONE teacher (e.g. the 400 just retrieved from teacher A -> teacher B).
+   body: { teacher_id, subject_name, assessment_id?, limit? }
+   Only submissions nobody holds (no teacher, no question allocation) and not yet marked are
+   taken — oldest first — so nothing assigned to someone else is ever moved. Recorded in the
+   assignment history, so it can be undone. */
+const allocateSubmissions = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const teacherId = toInt(req.body?.teacher_id);
+    const subjectName = String(req.body?.subject_name || "").trim();
+    const assessmentId = toInt(req.body?.assessment_id) || null;
+    const limit = toInt(req.body?.limit) || null;
+    if (!teacherId) return res.status(400).json({ message: "Choose a teacher" });
+    if (!subjectName) return res.status(400).json({ message: "Subject is required" });
+
+    const t = await pool.request().input("id", sql.Int, teacherId).query(`SELECT id, name FROM Teachers WHERE id = @id`);
+    if (!t.recordset.length) return res.status(404).json({ message: "Teacher not found" });
+
+    const rq = pool.request().input("subject", sql.NVarChar(300), subjectName);
+    if (assessmentId) rq.input("aid", sql.Int, assessmentId);
+    if (limit) rq.input("lim", sql.Int, limit);
+    const found = await rq.query(`
+      SELECT ${limit ? "TOP (@lim)" : ""} s.id
+      FROM e_assessment_submissions s
+      INNER JOIN e_assessments a ON a.id = s.e_assessment_id
+      WHERE a.subject = @subject
+        AND (s.status IS NULL OR s.status = 'submitted')
+        ${assessmentId ? "AND s.e_assessment_id = @aid" : ""}
+        AND NOT EXISTS (SELECT 1 FROM e_assessment_submission_assignments aa WHERE aa.submission_id = s.id)
+        AND NOT EXISTS (SELECT 1 FROM e_assessment_answer_assignments ax INNER JOIN e_assessment_answers an ON an.id = ax.answer_id WHERE an.submission_id = s.id)
+      ORDER BY s.submitted_at ASC, s.id ASC`);
+    const ids = (found.recordset || []).map((r) => r.id);
+    if (!ids.length) return res.json({ success: true, allocated: 0, message: "There are no unassigned, unmarked submissions to allocate for this subject." });
+
+    const changes = await assignmentEngine.distributeBySubmission(pool, ids, [teacherId]);
+    const teacherName = t.recordset[0].name || `teacher #${teacherId}`;
+    const batchId = await safeRecord(pool, { kind: "submission", summary: `Allocated ${ids.length} ${subjectName} submission(s) to ${teacherName}`, userId: req.user?.id, changes });
+    try {
+      await notifyOne(pool, teacherId, "Teachers", {
+        title: "New Marking Allocation",
+        message: `You've been given ${ids.length} ${subjectName} submission${ids.length === 1 ? "" : "s"} to mark.`,
+        type: "allocation",
+      });
+    } catch (_) { /* notification is optional */ }
+    res.json({ success: true, allocated: ids.length, teacher: teacherName, batch_id: batchId,
+      message: `${ids.length} submission(s) allocated to ${teacherName}` });
+  } catch (err) {
+    console.error("ALLOCATE SUBMISSIONS ERROR:", err);
+    res.status(500).json({ message: "Could not allocate the submissions" });
+  }
+};
+
 /* SMART DISTRIBUTE — one entry point for "Distribute Equally" / "Auto-Assign All".
    More teachers than submissions -> split by ANSWERED QUESTIONS (every teacher
    gets work); otherwise share out whole submissions as before. Either way the
@@ -5966,7 +6019,7 @@ module.exports = {
 
   // submissions / marking
   getAllSubmissions, getAssessmentSubmissions, getSubmissionForMarking, getAllSubmissionsForMarking,
-  saveMarking, saveMarkingBulk, assignSubmission, bulkAssignSubmissions, smartDistribute, retrieveSubmissions, getAssignmentBatches, undoAssignmentBatch, getNextSubmissionForMarking,
+  saveMarking, saveMarkingBulk, assignSubmission, bulkAssignSubmissions, smartDistribute, retrieveSubmissions, allocateSubmissions, getAssignmentBatches, undoAssignmentBatch, getNextSubmissionForMarking,
   getMarkingSession, saveMarkingSession, clearMarkingSession,
 
   // remarks

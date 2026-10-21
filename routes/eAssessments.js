@@ -48,7 +48,7 @@ const {
 
   // submissions / marking
   getAllSubmissions, getAssessmentSubmissions, getSubmissionForMarking, getAllSubmissionsForMarking,
-  saveMarking, saveMarkingBulk, assignSubmission, bulkAssignSubmissions, smartDistribute, retrieveSubmissions, getAssignmentBatches, undoAssignmentBatch, getNextSubmissionForMarking,
+  saveMarking, saveMarkingBulk, assignSubmission, bulkAssignSubmissions, smartDistribute, retrieveSubmissions, allocateSubmissions, getAssignmentBatches, undoAssignmentBatch, getNextSubmissionForMarking,
   getMarkingSession, saveMarkingSession, clearMarkingSession,
 
   // remarks
@@ -169,6 +169,7 @@ router.post("/admin/assign-submission", protect, requirePage("E-Assessments"), a
 router.post("/admin/bulk-assign-submissions", protect, requirePage("E-Assessments"), bulkAssignSubmissions);
 router.post("/admin/smart-distribute", protect, requirePage("E-Assessments"), smartDistribute);
 router.post("/admin/retrieve-submissions", protect, requirePage("E-Assessments"), retrieveSubmissions);
+router.post("/admin/allocate-submissions", protect, requirePage("E-Assessments"), allocateSubmissions);
 router.get("/admin/assignment-batches", protect, requirePage("E-Assessments"), getAssignmentBatches);
 router.post("/admin/assignment-batches/:id/undo", protect, requirePage("E-Assessments"), undoAssignmentBatch);
 
