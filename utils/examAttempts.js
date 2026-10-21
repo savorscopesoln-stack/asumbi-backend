@@ -297,4 +297,4 @@ async function finalizeExpiredAttempts(pool) {
   return submitted;
 }
 
-module.exports = { persistAttempt, finalizeExpiredAttempts, FINALIZE_GRACE_MINUTES };
+module.exports = { persistAttempt, finalizeExpiredAttempts, draftToAnswerArray, FINALIZE_GRACE_MINUTES };
