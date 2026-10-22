@@ -1,6 +1,6 @@
 /* =========================================================================
    MARKING OPTION (per teacher)
-   Three ways of marking an answer exist on the marking screens:
+   Four ways of marking an answer exist on the marking screens:
      option 1 (default) - select words and a ✓ point is added straight away
                           (no ✓ / ✗ box); tap the ✓ afterwards to flip it to ✗.
      option 2           - select words and a ✓ highlight is added straight
@@ -9,6 +9,10 @@
      option 3           - works exactly like option 1; only the layout differs:
                           the ✓ / ✗ buttons sit INSIDE the answer editor, in a
                           column beside the text, and the extra "R" button is gone.
+     option 4           - marks like option 1 (standard layout) and replaces the
+                          credit-based AI marking tools with the simple word-match
+                          SUGGESTED MARKS (compare answer with marking guide; marks
+                          are only added once the teacher approves).
    The admin chooses which one each teacher uses. A teacher with no row
    uses option 1, so nothing changes until an admin switches someone.
 ========================================================================= */
@@ -29,7 +33,7 @@ async function ensureTable(pool) {
   ensured.add(pool);
 }
 
-const clean = (v) => (Number(v) === 3 ? 3 : Number(v) === 2 ? 2 : 1);
+const clean = (v) => ([2, 3, 4].includes(Number(v)) ? Number(v) : 1);
 
 // Teacher: which option do I use? (any failure falls back to option 1)
 const getMyMarkingOption = async (req, res) => {
@@ -59,11 +63,11 @@ const listMarkingOptions = async (req, res) => {
   }
 };
 
-// Admin: PUT { option: 1|2|3 } for one teacher, or { option, teacherIds: [...] } on the bulk route
+// Admin: PUT { option: 1|2|3|4 } for one teacher, or { option, teacherIds: [...] } on the bulk route
 const setMarkingOption = async (req, res) => {
   try {
     const opt = Number(req.body?.option);
-    if (opt !== 1 && opt !== 2 && opt !== 3) return res.status(400).json({ message: "option must be 1, 2 or 3" });
+    if (![1, 2, 3, 4].includes(opt)) return res.status(400).json({ message: "option must be 1, 2, 3 or 4" });
     const ids = (req.params.teacherId ? [req.params.teacherId] : (req.body?.teacherIds || []))
       .map((x) => parseInt(x, 10)).filter(Number.isFinite);
     if (!ids.length) return res.status(400).json({ message: "No teacher chosen" });
