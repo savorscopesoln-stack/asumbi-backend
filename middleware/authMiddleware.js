@@ -71,6 +71,13 @@ const protect = (req, res, next) => {
 
     const decoded = jwt.verify(token, secret);
 
+    /* REPORT LINKS (utils/reportLink.js)
+       A download-link token only proves "this link was issued for student X" — it is
+       exchanged at POST /api/auth/report-link and must never work as a login itself. */
+    if (decoded?.typ === "report-link" || decoded?.typ === "transcript-link") {
+      return res.status(401).json({ success: false, message: "This is a download link, not a login." });
+    }
+
     /* =====================================================
        ATTACH USER
     ===================================================== */
@@ -132,6 +139,19 @@ const protect = (req, res, next) => {
       examOnly: !!decoded?.examOnly,
       examAssessmentId: decoded?.examAssessmentId ?? null,
     };
+
+    /* REPORT-ONLY SESSION
+       Opened from a report link: a student session limited to reading what the report
+       form needs. Everything else (any write, any other endpoint) is refused. */
+    if (decoded?.scope === "report") {
+      const { isAllowedForReportSession } = require("../utils/reportLink");
+      if (!isAllowedForReportSession(req.method, req.originalUrl)) {
+        return res.status(403).json({
+          success: false, code: "REPORT_LINK_SCOPE",
+          message: "This link only opens your report form.",
+        });
+      }
+    }
 
     /* =====================================================
        MANDATORY PASSWORD CHANGE

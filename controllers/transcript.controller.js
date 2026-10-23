@@ -8,7 +8,14 @@ const round2 = (n) => (n == null ? null : Math.floor(Number(n) + 1e-9));
 
 /* =========================================================================
    TRANSCRIPT DOWNLOAD
-   GET /api/main-exams/transcripts/download?scope=class|all&className=...&examId=all|<id>
+   GET /api/main-exams/transcripts/download
+       ?scope=class|all|student  &className=...  &studentId=<id>  &examId=all|<id>  &separate=1
+
+   scope=student gives ONE student's transcript; separate=1 (class / all) returns a
+   ZIP with a separate PDF for every student instead of one combined PDF.
+   buildTranscripts() below is the shared builder: the admin download, and the
+   per-student transcript link a student opens (GET /api/auth/transcript-link,
+   routes/auth.js) both use it, so they can never disagree.
 
    Builds one printable PDF covering every matching student — one page
    (or more, if they've sat enough exams) each — showing either every
@@ -25,20 +32,15 @@ const round2 = (n) => (n == null ? null : Math.floor(Number(n) + 1e-9));
    released marks for the chosen scope are silently skipped rather
    than given a blank page.
 ========================================================================= */
-const downloadTranscripts = async (req, res) => {
-  try {
-    const pool = req.pool;
-    const scope = String(req.query.scope || "class");
-    const className = req.query.className ? String(req.query.className) : null;
-    const examIdRaw = req.query.examId ? String(req.query.examId) : "all";
-    const examId = examIdRaw === "all" ? null : toInt(examIdRaw);
+const fail = (status, message) => ({ ok: false, status, message });
+const slug = (v) => String(v || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
 
-    if (examIdRaw !== "all" && !examId) {
-      return res.status(400).json({ success: false, message: "Invalid exam selection" });
-    }
-    if (scope === "class" && !className) {
-      return res.status(400).json({ success: false, message: "A class is required for a per-class transcript" });
-    }
+/** Builds the transcript file for a selection. Returns { ok:true, buffer, filename, contentType } or { ok:false, status, message }. */
+const buildTranscripts = async (pool, { scope, className, studentId, examId, separate }) => {
+  try {
+    if (!["all", "class", "student"].includes(scope)) scope = "class";
+    if (scope === "class" && !className) return fail(400, "A class is required for a per-class transcript");
+    if (scope === "student" && !studentId) return fail(400, "A student is required");
 
     /* ---------------- 1. Students in scope ---------------- */
     const studentsReq = pool.request();
@@ -46,13 +48,14 @@ const downloadTranscripts = async (req, res) => {
     if (scope === "class") {
       studentsReq.input("className", sql.NVarChar, className);
       studentsQuery += ` WHERE studentClass = @className`;
+    } else if (scope === "student") {
+      studentsReq.input("studentId", sql.Int, studentId);
+      studentsQuery += ` WHERE id = @studentId`;
     }
     studentsQuery += ` ORDER BY studentClass, name`;
     const studentsResult = await studentsReq.query(studentsQuery);
     const students = studentsResult.recordset;
-    if (!students.length) {
-      return res.status(404).json({ success: false, message: "No students found for this selection" });
-    }
+    if (!students.length) return fail(404, "No students found for this selection");
 
     /* ---------------- 2. Resolve the selected exam's name (for the title/filename) ---------------- */
     let singleExam = null;
@@ -60,7 +63,7 @@ const downloadTranscripts = async (req, res) => {
       const examResult = await pool.request().input("id", sql.Int, examId)
         .query(`SELECT id, name FROM main_examinations WHERE id = @id`);
       singleExam = examResult.recordset[0];
-      if (!singleExam) return res.status(404).json({ success: false, message: "Exam not found" });
+      if (!singleExam) return fail(404, "Exam not found");
     }
 
     /* ---------------- 3. Released marks for every matching student ----------------
@@ -93,12 +96,9 @@ const downloadTranscripts = async (req, res) => {
     const marksRows = marksResult.recordset;
 
     if (!marksRows.length) {
-      return res.status(404).json({
-        success: false,
-        message: singleExam
-          ? `No released marks found for "${singleExam.name}" for this selection`
-          : "No released marks found for this selection",
-      });
+      return fail(404, singleExam
+        ? `No released marks found for "${singleExam.name}" for this selection`
+        : "No released marks found for this selection");
     }
 
     /* ---------------- 4. Group rows: studentId → examId → subjects[] ---------------- */
@@ -174,35 +174,85 @@ const downloadTranscripts = async (req, res) => {
     });
 
     if (!studentPages.length) {
-      return res.status(404).json({
-        success: false,
-        message: singleExam
-          ? `No released marks found for "${singleExam.name}" for this selection`
-          : "No released marks found for this selection",
-      });
+      return fail(404, singleExam
+        ? `No released marks found for "${singleExam.name}" for this selection`
+        : "No released marks found for this selection");
     }
 
-    /* ---------------- 6. Render + send ---------------- */
+    /* ---------------- 6. Render ---------------- */
     const institution = await getInstitutionHeader(pool);
     const officials = await getSigningOfficials(pool);
-    const buffer = await buildTranscriptPdf({
-      institution,
-      officials,
-      title: singleExam ? singleExam.name : "Full Academic Transcript (All Exams)",
-      subtitle: scope === "class" ? `Class: ${className}` : "All Students",
-      students: studentPages,
-    });
-
-    const filenameBase = scope === "class" ? className : "all-students";
+    const title = singleExam ? singleExam.name : "Full Academic Transcript (All Exams)";
+    const subtitle = scope === "class" ? `Class: ${className}`
+      : scope === "student" ? `Student: ${studentPages[0].student.name}` : "All Students";
     const examSlug = singleExam ? singleExam.name : "all-exams";
-    const filename = `Transcripts-${filenameBase}-${examSlug}`
-      .toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "") + ".pdf";
 
-    sendPdfBuffer(res, buffer, filename);
+    // one PDF per student, zipped
+    if (separate && scope !== "student" && studentPages.length > 1) {
+      const JSZip = require("jszip");
+      const zip = new JSZip();
+      const used = new Set();
+      for (const page of studentPages) {
+        const pdf = await buildTranscriptPdf({ institution, officials, title, subtitle: `Student: ${page.student.name}`, students: [page] });
+        let base = slug(`${page.student.name}-${page.student.admissionNo || page.student.id}`) || `student-${page.student.id}`;
+        while (used.has(base)) base += "-x";
+        used.add(base);
+        zip.file(`${base}.pdf`, pdf);
+      }
+      const buffer = await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
+      const filename = `${slug(`Transcripts-${scope === "class" ? className : "all-students"}-${examSlug}`)}.zip`;
+      return { ok: true, buffer, filename, contentType: "application/zip" };
+    }
+
+    const buffer = await buildTranscriptPdf({ institution, officials, title, subtitle, students: studentPages });
+    const filenameBase = scope === "class" ? className : scope === "student" ? studentPages[0].student.name : "all-students";
+    const filename = `${slug(`Transcripts-${filenameBase}-${examSlug}`)}.pdf`;
+    return { ok: true, buffer, filename, contentType: "application/pdf" };
   } catch (err) {
-    console.error("DOWNLOAD TRANSCRIPTS ERROR:", err);
-    res.status(500).json({ success: false, message: "Server error generating transcripts" });
+    console.error("BUILD TRANSCRIPTS ERROR:", err);
+    return fail(500, "Server error generating transcripts");
   }
 };
 
-module.exports = { downloadTranscripts };
+/** Which of these students have at least one released mark (for the chosen exam)? -> Set of student ids. */
+const studentIdsWithTranscript = async (pool, studentIds, examId) => {
+  const ids = [...new Set((studentIds || []).map(Number).filter(Number.isFinite))];
+  const out = new Set();
+  for (let i = 0; i < ids.length; i += 500) {
+    const part = ids.slice(i, i + 500);
+    const rq = pool.request();
+    const params = part.map((id, k) => { rq.input(`s${k}`, sql.Int, id); return `@s${k}`; });
+    if (examId) rq.input("examId", sql.Int, examId);
+    const r = await rq.query(`
+      SELECT DISTINCT m.studentId
+      FROM Marks m
+      INNER JOIN Assessments a ON a.id = m.assessmentId AND a.sourceSystem = 'e_assessment'
+      INNER JOIN e_assessments ea ON ea.id = a.sourceRefId
+      INNER JOIN exam_subject_sessions ess ON ess.e_assessment_id = ea.id
+      INNER JOIN main_examinations me ON me.id = ess.main_examination_id
+      WHERE m.studentId IN (${params.join(",")}) ${examId ? "AND me.id = @examId" : ""}`);
+    (r.recordset || []).forEach((row) => out.add(row.studentId));
+  }
+  return out;
+};
+
+const downloadTranscripts = async (req, res) => {
+  const examIdRaw = req.query.examId ? String(req.query.examId) : "all";
+  const examId = examIdRaw === "all" ? null : toInt(examIdRaw);
+  if (examIdRaw !== "all" && !examId) return res.status(400).json({ success: false, message: "Invalid exam selection" });
+
+  const result = await buildTranscripts(req.pool, {
+    scope: String(req.query.scope || "class"),
+    className: req.query.className ? String(req.query.className) : null,
+    studentId: toInt(req.query.studentId),
+    examId,
+    separate: String(req.query.separate || "") === "1",
+  });
+  if (!result.ok) return res.status(result.status).json({ success: false, message: result.message });
+  if (result.contentType === "application/pdf") return sendPdfBuffer(res, result.buffer, result.filename);
+  res.setHeader("Content-Type", result.contentType);
+  res.setHeader("Content-Disposition", `attachment; filename="${result.filename.replace(/"/g, "")}"`);
+  res.send(result.buffer);
+};
+
+module.exports = { downloadTranscripts, buildTranscripts, studentIdsWithTranscript };

@@ -64,6 +64,11 @@ const { requireFundableExamination } = require("../middleware/examWalletGuard");
 ========================================================================= */
 router.use(protect, requirePage("E-Assessments"));
 
+// Per-student download links for the report form (utils/reportLink.js) — before the /:mainExamId routes.
+const { previewReportLinks, sendReportLinks } = require("../controllers/reportLink.controller");
+router.post("/report-links/preview", previewReportLinks);
+router.post("/report-links/send", sendReportLinks);
+
 router.get("/", getMainExaminations);
 // Phase 5 (wallet integration): requireFundableExamination is a
 // pre-flight convenience that turns "no eligible students" / "no

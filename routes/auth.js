@@ -250,6 +250,104 @@ router.post("/login", async (req, res) => {
 });
 
 /* =========================================================
+   REPORT LINK — open a student's report form without a password
+   The link token (utils/reportLink.js) arrives as a Bearer token, so
+   server.js's DB middleware already routes the request to the right
+   school's database from its `tenant` claim. It is swapped here for a
+   2-hour, REPORT-ONLY student session (see authMiddleware.js). Public,
+   so it is rate-limited per IP.
+========================================================= */
+const reportLinkHits = new Map(); // ip -> [timestamps]
+router.post("/report-link", async (req, res) => {
+  try {
+    const now = Date.now();
+    const ip = req.ip || req.headers["x-forwarded-for"] || "unknown";
+    const recent = (reportLinkHits.get(ip) || []).filter((t) => now - t < 60_000);
+    if (recent.length >= 30) return res.status(429).json({ message: "Too many attempts. Please wait a minute and try again." });
+    recent.push(now);
+    reportLinkHits.set(ip, recent);
+    if (reportLinkHits.size > 5000) reportLinkHits.clear();
+
+    const { verifyReportLink, signReportSession } = require("../utils/reportLink");
+    const header = req.headers.authorization || "";
+    const linkToken = header.startsWith("Bearer ") ? header.slice(7) : String(req.body?.token || "");
+    let link;
+    try {
+      link = verifyReportLink(linkToken);
+    } catch (e) {
+      const expired = e.name === "TokenExpiredError";
+      return res.status(401).json({
+        expired,
+        message: expired ? "This link has expired. Please ask your school for a new one." : "This link is not valid.",
+      });
+    }
+
+    const tenant = link.tenant || "default";
+    const pool = await getPool(tenant);
+    const r = await pool.request().input("id", link.sid).query(
+      `SELECT * FROM Students WHERE id = @id`
+    );
+    const student = r.recordset[0];
+    if (!student) return res.status(404).json({ message: "This student record could not be found." });
+
+    return res.json({
+      token: signReportSession({ student, tenant }),
+      user: {
+        id: student.id, username: student.username, name: student.name || "", role: "student",
+        source: "Students", tenant, photoUrl: student.photoUrl || null, reportLinkSession: true,
+      },
+    });
+  } catch (err) {
+    console.log("REPORT LINK ERROR:", err);
+    return res.status(500).json({ message: "Could not open this link. Please try again." });
+  }
+});
+
+/* =========================================================
+   TRANSCRIPT LINK — a student downloads their own transcript PDF
+   GET with the link token as a Bearer token (so server.js's DB middleware
+   picks the right school database from its `tenant` claim). Returns the PDF.
+   Public + rate-limited (shares the report-link limiter above).
+========================================================= */
+router.get("/transcript-link", async (req, res) => {
+  try {
+    const now = Date.now();
+    const ip = req.ip || req.headers["x-forwarded-for"] || "unknown";
+    const recent = (reportLinkHits.get(ip) || []).filter((t) => now - t < 60_000);
+    if (recent.length >= 30) return res.status(429).json({ message: "Too many attempts. Please wait a minute and try again." });
+    recent.push(now);
+    reportLinkHits.set(ip, recent);
+
+    const { verifyTranscriptLink } = require("../utils/reportLink");
+    const header = req.headers.authorization || "";
+    let link;
+    try {
+      link = verifyTranscriptLink(header.startsWith("Bearer ") ? header.slice(7) : "");
+    } catch (e) {
+      const expired = e.name === "TokenExpiredError";
+      return res.status(401).json({
+        expired,
+        message: expired ? "This link has expired. Please ask your school for a new one." : "This link is not valid.",
+      });
+    }
+
+    const { buildTranscripts } = require("../controllers/transcript.controller");
+    const { sendPdfBuffer } = require("../utils/reportExport");
+    const pool = await getPool(link.tenant || "default");
+    const result = await buildTranscripts(pool, { scope: "student", studentId: Number(link.sid), examId: link.exam || null });
+    if (!result.ok) {
+      return res.status(result.status).json({
+        message: result.status === 404 ? "Your transcript isn't available yet — no released marks were found." : result.message,
+      });
+    }
+    return sendPdfBuffer(res, result.buffer, result.filename);
+  } catch (err) {
+    console.log("TRANSCRIPT LINK ERROR:", err);
+    return res.status(500).json({ message: "Could not prepare your transcript. Please try again." });
+  }
+});
+
+/* =========================================================
    FINANCE MFA — VERIFY
    Exchanges the short-lived mfaToken from the login response above
    (issued only when role === "finance" && Users.mfaEnabled) plus the
