@@ -20,6 +20,7 @@ const { backfillMarkersFromSessions } = require("../utils/markingBackfill");
 // Sessions change while teachers work, so re-credit them regularly, but not on every request.
 const BACKFILL_EVERY_MS = 60000;
 const lastBackfill = new Map(); // tenant -> timestamp
+const backfillRunning = new Set(); // tenants with a backfill still in progress
 
 const toInt = (v) => {
   const n = parseInt(v, 10);
@@ -31,8 +32,10 @@ const ms = (d) => (d ? new Date(d).getTime() : null);
    teacher page, so the heavy aggregation is computed once and shared briefly (and
    concurrent requests share the one in-flight computation) instead of every poll
    hitting the database. `me` is the only per-user field and is added per request. */
-const CACHE_TTL_MS = 15000;
-const cache = new Map(); // "tenant:assessment" -> { at, promise }
+const CACHE_TTL_MS = 15000;          // younger than this: served as is
+const CACHE_STALE_MAX_MS = 10 * 60000; // older than TTL but younger than this: served instantly while a
+                                     // refresh runs in the background (stale-while-revalidate)
+const cache = new Map(); // "tenant:assessment" -> { at, payload, refreshing }
 
 const computeLeaderboard = async (pool, aid, tkey) => {
   {
@@ -40,9 +43,14 @@ const computeLeaderboard = async (pool, aid, tkey) => {
     const bind = (r) => (aid ? r.input("aid", sql.Int, aid) : r);
 
     // Credit work recorded only in the teachers' marking sessions (marked before tracking existed).
-    if (Date.now() - (lastBackfill.get(tkey) || 0) > BACKFILL_EVERY_MS) {
+    // Runs in the BACKGROUND (never awaited): it is a loop of UPDATEs over every teacher's session and
+    // used to hold up the first request of every minute. Credit it earns shows on the next refresh.
+    if (!backfillRunning.has(tkey) && Date.now() - (lastBackfill.get(tkey) || 0) > BACKFILL_EVERY_MS) {
       lastBackfill.set(tkey, Date.now());
-      try { await backfillMarkersFromSessions(pool); } catch (e) { console.warn("marking backfill failed:", e.message); }
+      backfillRunning.add(tkey);
+      backfillMarkersFromSessions(pool)
+        .catch((e) => console.warn("marking backfill failed:", e.message))
+        .finally(() => backfillRunning.delete(tkey));
     }
 
     const [scripts, answers, openRows, sessionRows] = await Promise.all([
@@ -321,16 +329,32 @@ const getMarkingLeaderboard = async (req, res) => {
     const tkey = req.dbTenant || "default";
     const key = `${tkey}:${aid || 0}`;
     const now = Date.now();
-    let hit = cache.get(key);
-    // ?fresh=1 (the Refresh button) skips the short cache
-    if (!hit || req.query.fresh || now - hit.at > CACHE_TTL_MS) {
-      for (const [k, v] of cache) if (now - v.at > 5 * 60000) cache.delete(k); // keep the map small
-      const promise = computeLeaderboard(req.pool, aid, tkey);
-      hit = { at: now, promise };
-      cache.set(key, hit);
-      promise.catch(() => { if (cache.get(key) === hit) cache.delete(key); }); // never cache a failure
+    const entry = cache.get(key);
+    const refresh = () => {
+      if (entry && entry.refreshing) return entry.refreshing;
+      const p = computeLeaderboard(req.pool, aid, tkey).then((payload) => {
+        cache.set(key, { at: Date.now(), payload, refreshing: null });
+        return payload;
+      });
+      const holder = entry || { at: 0, payload: null };
+      holder.refreshing = p;
+      cache.set(key, holder);
+      // never keep a failed refresh around; the next request tries again
+      p.catch(() => { const cur = cache.get(key); if (cur) { cur.refreshing = null; if (!cur.payload) cache.delete(key); } });
+      return p;
+    };
+
+    let payload;
+    if (req.query.fresh || !entry || !entry.payload) {
+      // Refresh button / first ever load: compute (concurrent callers share one computation)
+      payload = await refresh();
+    } else {
+      payload = entry.payload;
+      const age = now - entry.at;
+      if (age > CACHE_STALE_MAX_MS) payload = await refresh();            // too old to show
+      else if (age > CACHE_TTL_MS) refresh().catch(() => {});             // show now, update behind the scenes
     }
-    const payload = await hit.promise;
+    for (const [k, v] of cache) if (now - v.at > 30 * 60000 && !v.refreshing) cache.delete(k); // keep the map small
     res.json({ ...payload, me: toInt(req.user?.id) });
   } catch (err) {
     console.error("MARKING LEADERBOARD ERROR:", err);
