@@ -277,7 +277,6 @@ const computeLeaderboard = async (pool, aid, tkey) => {
     teachers.sort((a, b) => (b.percent ?? -1) - (a.percent ?? -1) || b.wins - a.wins || b.marked - a.marked || a.teacher_name.localeCompare(b.teacher_name));
     teachers.forEach((t, i) => { t.rank = i + 1; });
 
-<<<<<<< HEAD
     // ---- all-time finishes: one row per teacher — their LATEST finish when they have
     // finished more than one assessment — ordered by that moment, earliest first, latest
     // last (no speed or win-count weighting) ----
@@ -290,12 +289,6 @@ const computeLeaderboard = async (pool, aid, tkey) => {
       if (!cur || ms(c.finished_at) > ms(cur.finished_at)) latestByTeacher.set(c.teacher_id, c);
     }
     const finishes = [...latestByTeacher.values()]
-=======
-    // ---- all-time finishes: every completed assessment by the moment it was finished,
-    // earliest finisher first, latest last (no speed or win-count weighting) ----
-    const finishes = [...cells.values()]
-      .filter((c) => c.finished_at)
->>>>>>> 9215664cf17c9051588580f197138ce52ae9bf27
       .sort((a, b) => ms(a.finished_at) - ms(b.finished_at) || a.teacher_id - b.teacher_id)
       .map((c, i) => ({
         rank: i + 1,
@@ -303,10 +296,7 @@ const computeLeaderboard = async (pool, aid, tkey) => {
         e_assessment_id: c.e_assessment_id, assessment_title: c.assessment_title, subject: c.subject,
         allocated: c.allocated, finished_at: c.finished_at,
         finish_place: c.finish_place || null, // 1 = first to finish that assessment
-<<<<<<< HEAD
         total_finishes: finishCount.get(c.teacher_id) || 1, // how many assessments they have finished in all
-=======
->>>>>>> 9215664cf17c9051588580f197138ce52ae9bf27
       }));
 
     const allocated = assessments.reduce((n, a) => n + a.allocated, 0);
@@ -321,7 +311,6 @@ const computeLeaderboard = async (pool, aid, tkey) => {
       teachers,
       assessments,
       finishes,
-<<<<<<< HEAD
     };
   }
 };
@@ -343,9 +332,6 @@ const getMarkingLeaderboard = async (req, res) => {
     }
     const payload = await hit.promise;
     res.json({ ...payload, me: toInt(req.user?.id) });
-=======
-    });
->>>>>>> 9215664cf17c9051588580f197138ce52ae9bf27
   } catch (err) {
     console.error("MARKING LEADERBOARD ERROR:", err);
     res.status(500).json({ message: "Failed to load marking stats", error: err.message });
