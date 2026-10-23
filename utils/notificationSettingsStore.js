@@ -4,7 +4,7 @@ const sql = require("mssql");
    NOTIFICATION SETTINGS STORE
    Backs the admin "Notification Settings" config page — a single-row
    table holding the API credentials for the outbound channels (SMTP for
-   email, Twilio for SMS/WhatsApp). Read through a short-lived in-memory
+   email, Africa's Talking / Twilio for SMS, Twilio for WhatsApp). Read through a short-lived in-memory
    cache so every broadcast send doesn't need its own round-trip, but a
    save from the config page is reflected on the very next send
    (invalidateCache() is called right after every successful write).
@@ -19,10 +19,11 @@ const sql = require("mssql");
 const CACHE_TTL_MS = 30 * 1000;
 let cache = null; // { row, cachedAt }
 
-const SECRET_FIELDS = ["emailPassword", "twilioAuthToken"];
+const SECRET_FIELDS = ["emailPassword", "twilioAuthToken", "atApiKey"];
 const ALL_FIELDS = [
   "emailHost", "emailPort", "emailSecure", "emailUser", "emailPassword", "emailFrom",
   "twilioAccountSid", "twilioAuthToken", "twilioSmsFrom", "twilioWhatsappFrom",
+  "smsProvider", "atUsername", "atApiKey", "atSenderId", "atSandbox",
 ];
 
 const invalidateCache = () => {
@@ -64,6 +65,11 @@ const getEffectiveConfig = async (pool) => {
     twilioAuthToken: row.twilioAuthToken || process.env.TWILIO_AUTH_TOKEN || null,
     twilioSmsFrom: row.twilioSmsFrom || process.env.TWILIO_SMS_FROM || null,
     twilioWhatsappFrom: row.twilioWhatsappFrom || process.env.TWILIO_WHATSAPP_FROM || null,
+    smsProvider: row.smsProvider || process.env.SMS_PROVIDER || null,
+    atUsername: row.atUsername || process.env.AT_USERNAME || null,
+    atApiKey: row.atApiKey || process.env.AT_API_KEY || null,
+    atSenderId: row.atSenderId || process.env.AT_SENDER_ID || null,
+    atSandbox: row.atSandbox ?? (String(process.env.AT_SANDBOX || "false") === "true"),
   };
 };
 
@@ -94,6 +100,14 @@ const getDisplaySettings = async (pool) => {
       authTokenSet: !!row.twilioAuthToken,
       smsFrom: row.twilioSmsFrom || "",
       source: sourceFor(row.twilioAccountSid, "TWILIO_ACCOUNT_SID"),
+    },
+    africastalking: {
+      provider: row.smsProvider || "",
+      username: row.atUsername || "",
+      apiKeySet: !!row.atApiKey,
+      senderId: row.atSenderId || "",
+      sandbox: !!row.atSandbox,
+      source: sourceFor(row.atUsername || row.atApiKey, "AT_API_KEY"),
     },
     whatsapp: {
       whatsappFrom: row.twilioWhatsappFrom || "",
@@ -126,7 +140,7 @@ const updateSettings = async (pool, fields, { updatedByName, clearFields = [] } 
 
     if (key === "emailPort") {
       request.input(key, sql.Int, val === "" || val === null ? null : Number(val));
-    } else if (key === "emailSecure") {
+    } else if (key === "emailSecure" || key === "atSandbox") {
       request.input(key, sql.Bit, !!val);
     } else {
       request.input(key, sql.NVarChar, val === "" ? null : val);

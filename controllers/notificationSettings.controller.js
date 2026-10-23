@@ -4,7 +4,7 @@ const { sendEmail, sendSms, sendWhatsapp } = require("../services/notificationCh
 /* =========================================================================
    NOTIFICATION SETTINGS (admin-only)
    Powers the "Notification Settings" config page — lets an admin plug in
-   the SMTP / Twilio credentials the broadcast notifications feature
+   the SMTP / Africa's Talking / Twilio credentials the broadcast notifications feature
    sends through, without needing server/.env access. Mounted behind
    `protect` + `adminOnly` in server.js — sub-admins never reach these
    routes even if granted the "Notifications" broadcast page, since API
@@ -12,7 +12,11 @@ const { sendEmail, sendSms, sendWhatsapp } = require("../services/notificationCh
 ========================================================================= */
 
 const EMAIL_FIELDS = ["emailHost", "emailPort", "emailSecure", "emailUser", "emailPassword", "emailFrom"];
-const TWILIO_FIELDS = ["twilioAccountSid", "twilioAuthToken", "twilioSmsFrom", "twilioWhatsappFrom"];
+const TWILIO_FIELDS = [
+  "twilioAccountSid", "twilioAuthToken", "twilioSmsFrom", "twilioWhatsappFrom",
+  // Africa's Talking (SMS) + which provider carries SMS
+  "smsProvider", "atUsername", "atApiKey", "atSenderId", "atSandbox",
+];
 
 const getSettings = async (req, res) => {
   try {

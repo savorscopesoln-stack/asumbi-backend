@@ -860,11 +860,35 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
         twilioAuthToken NVARCHAR(500) NULL,
         twilioSmsFrom NVARCHAR(50) NULL,
         twilioWhatsappFrom NVARCHAR(50) NULL,
+        smsProvider NVARCHAR(20) NULL,
+        atUsername NVARCHAR(100) NULL,
+        atApiKey NVARCHAR(500) NULL,
+        atSenderId NVARCHAR(20) NULL,
+        atSandbox BIT NULL,
         updatedAt DATETIME NULL,
         updatedByName NVARCHAR(200) NULL,
         CONSTRAINT CK_NotificationSettings_singleton CHECK (id = 1)
       )
     `);
+
+    /* Africa's Talking columns, patched onto a NotificationSettings table
+       that already existed before AT support was added. */
+    for (const [col, type] of [
+      ["smsProvider", "NVARCHAR(20)"],
+      ["atUsername", "NVARCHAR(100)"],
+      ["atApiKey", "NVARCHAR(500)"],
+      ["atSenderId", "NVARCHAR(20)"],
+      ["atSandbox", "BIT"],
+    ]) {
+      await pool.request().query(`
+        IF EXISTS (SELECT * FROM sysobjects WHERE name='NotificationSettings' AND xtype='U')
+        AND NOT EXISTS (
+          SELECT * FROM sys.columns
+          WHERE Name = N'${col}' AND Object_ID = Object_ID(N'NotificationSettings')
+        )
+        ALTER TABLE NotificationSettings ADD ${col} ${type} NULL
+      `);
+    }
 
     /* ---------------- Students.photoUrl / Teachers.photoUrl ----------------
        Profile photo, required at registration time for both portals (see

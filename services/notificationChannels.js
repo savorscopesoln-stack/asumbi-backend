@@ -3,7 +3,8 @@
    Thin, dependency-light wrappers around the three "outside the system"
    delivery channels used by the admin broadcast notifications page:
      - email     via SMTP (nodemailer)
-     - sms       via Twilio's REST API (plain fetch, no SDK)
+     - sms       via Africa's Talking (preferred when configured) or
+                 Twilio's REST API as a fallback (plain fetch, no SDK)
      - whatsapp  via Twilio's WhatsApp API (same REST endpoint, "whatsapp:"
                  prefixed numbers)
 
@@ -35,6 +36,11 @@ const envOnlyConfig = () => ({
   twilioAuthToken: process.env.TWILIO_AUTH_TOKEN || null,
   twilioSmsFrom: process.env.TWILIO_SMS_FROM || null,
   twilioWhatsappFrom: process.env.TWILIO_WHATSAPP_FROM || null,
+  smsProvider: process.env.SMS_PROVIDER || null,
+  atUsername: process.env.AT_USERNAME || null,
+  atApiKey: process.env.AT_API_KEY || null,
+  atSenderId: process.env.AT_SENDER_ID || null,
+  atSandbox: String(process.env.AT_SANDBOX || "false") === "true",
 });
 
 const resolveConfig = async (pool) => {
@@ -95,7 +101,7 @@ const sendEmail = async ({ to, subject, message }, pool) => {
   }
 };
 
-/* ================= SMS + WHATSAPP (Twilio) ================= */
+/* ================= SMS fallback + WHATSAPP (Twilio) ================= */
 
 const twilioConfigured = async (pool) => {
   const cfg = await resolveConfig(pool);
@@ -146,10 +152,91 @@ const twilioSendRaw = async ({ to, from, body, cfg }) => {
   }
 };
 
+/* ================= SMS (Africa's Talking) =================
+   POST https://api.africastalking.com/version1/messaging
+   (sandbox: https://api.sandbox.africastalking.com/version1/messaging —
+   the username must then be "sandbox").
+   Auth is an `apiKey` header + `username` form field. The reply carries a
+   per-recipient statusCode: 100 Processed, 101 Sent, 102 Queued are
+   successes; anything else (e.g. 405 InsufficientBalance, 403
+   InvalidPhoneNumber, 402 InvalidSenderId) is a failure for that number. */
+
+const AT_OK_CODES = new Set([100, 101, 102]);
+
+const atConfigured = async (pool) => {
+  const cfg = await resolveConfig(pool);
+  return !!(cfg.atUsername && cfg.atApiKey);
+};
+
+const atSendRaw = async ({ to, message, cfg }) => {
+  if (!cfg.atUsername || !cfg.atApiKey) {
+    return { ok: false, skipped: true, reason: "Africa's Talking is not configured yet — add it under Notification Settings" };
+  }
+
+  const host = cfg.atSandbox ? "api.sandbox.africastalking.com" : "api.africastalking.com";
+  const form = new URLSearchParams();
+  form.append("username", cfg.atUsername);
+  form.append("to", to);
+  form.append("message", message);
+  if (cfg.atSenderId) form.append("from", cfg.atSenderId);
+
+  try {
+    const res = await fetch(`https://${host}/version1/messaging`, {
+      method: "POST",
+      headers: {
+        apiKey: cfg.atApiKey,
+        Accept: "application/json",
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: form,
+    });
+
+    const raw = await res.text();
+    let data = null;
+    try { data = JSON.parse(raw); } catch { /* AT returns plain text on auth errors */ }
+
+    if (!res.ok) {
+      if (res.status === 401) {
+        return { ok: false, reason: "Africa's Talking rejected the credentials — check the username and API key" };
+      }
+      return { ok: false, reason: (data && (data.message || data.errorMessage)) || raw?.slice(0, 200) || `Africa's Talking HTTP ${res.status}` };
+    }
+
+    const smsData = data?.SMSMessageData;
+    const recipient = smsData?.Recipients?.[0];
+    if (!recipient) {
+      // No recipient rows usually means the whole request was refused
+      // (e.g. "InvalidSenderId", "Invalid phone number").
+      return { ok: false, reason: smsData?.Message || "Africa's Talking did not accept the message" };
+    }
+    if (!AT_OK_CODES.has(Number(recipient.statusCode))) {
+      return { ok: false, reason: `Africa's Talking: ${recipient.status || "failed"} (code ${recipient.statusCode})` };
+    }
+    return { ok: true, messageId: recipient.messageId, cost: recipient.cost };
+  } catch (err) {
+    return { ok: false, reason: err.message };
+  }
+};
+
+/* Which provider carries SMS?
+     smsProvider = "africastalking" | "twilio"  -> exactly that one
+     anything else (auto)                       -> Africa's Talking when its
+                                                   credentials exist, else Twilio
+   WhatsApp is unaffected and always goes through Twilio. */
+const pickSmsProvider = (cfg) => {
+  const want = String(cfg.smsProvider || "").toLowerCase();
+  if (want === "twilio") return "twilio";
+  if (want === "africastalking") return "africastalking";
+  return cfg.atUsername && cfg.atApiKey ? "africastalking" : "twilio";
+};
+
 const sendSms = async ({ to, message }, pool) => {
   const phone = normalizePhone(to);
   if (!phone) return { ok: false, reason: "No/invalid phone number on file" };
   const cfg = await resolveConfig(pool);
+  if (pickSmsProvider(cfg) === "africastalking") {
+    return atSendRaw({ to: phone, message, cfg });
+  }
   return twilioSendRaw({ to: phone, from: cfg.twilioSmsFrom, body: message, cfg });
 };
 
@@ -167,5 +254,7 @@ module.exports = {
   sendWhatsapp,
   emailConfigured,
   twilioConfigured,
+  atConfigured,
+  pickSmsProvider,
   normalizePhone,
 };
