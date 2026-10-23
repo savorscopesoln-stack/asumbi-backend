@@ -277,10 +277,18 @@ const computeLeaderboard = async (pool, aid, tkey) => {
     teachers.sort((a, b) => (b.percent ?? -1) - (a.percent ?? -1) || b.wins - a.wins || b.marked - a.marked || a.teacher_name.localeCompare(b.teacher_name));
     teachers.forEach((t, i) => { t.rank = i + 1; });
 
-    // ---- all-time finishes: every completed assessment by the moment it was finished,
-    // earliest finisher first, latest last (no speed or win-count weighting) ----
-    const finishes = [...cells.values()]
-      .filter((c) => c.finished_at)
+    // ---- all-time finishes: one row per teacher — their LATEST finish when they have
+    // finished more than one assessment — ordered by that moment, earliest first, latest
+    // last (no speed or win-count weighting) ----
+    const latestByTeacher = new Map();
+    const finishCount = new Map();
+    for (const c of cells.values()) {
+      if (!c.finished_at) continue;
+      finishCount.set(c.teacher_id, (finishCount.get(c.teacher_id) || 0) + 1);
+      const cur = latestByTeacher.get(c.teacher_id);
+      if (!cur || ms(c.finished_at) > ms(cur.finished_at)) latestByTeacher.set(c.teacher_id, c);
+    }
+    const finishes = [...latestByTeacher.values()]
       .sort((a, b) => ms(a.finished_at) - ms(b.finished_at) || a.teacher_id - b.teacher_id)
       .map((c, i) => ({
         rank: i + 1,
@@ -288,6 +296,7 @@ const computeLeaderboard = async (pool, aid, tkey) => {
         e_assessment_id: c.e_assessment_id, assessment_title: c.assessment_title, subject: c.subject,
         allocated: c.allocated, finished_at: c.finished_at,
         finish_place: c.finish_place || null, // 1 = first to finish that assessment
+        total_finishes: finishCount.get(c.teacher_id) || 1, // how many assessments they have finished in all
       }));
 
     const allocated = assessments.reduce((n, a) => n + a.allocated, 0);
