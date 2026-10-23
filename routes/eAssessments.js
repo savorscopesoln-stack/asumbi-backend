@@ -1,6 +1,7 @@
 const express = require("express");
 const { getMarkingLeaderboard } = require("../controllers/markingLeaderboard.controller");
 const { getMyMarkingOption, listMarkingOptions, setMarkingOption } = require("../controllers/markingOption.controller");
+const { getMarkingDeadline, listMarkingDeadlines, setMarkingDeadline } = require("../controllers/markingDeadline.controller");
 const { getZeroMarked, pushBackZeroMarked } = require("../controllers/zeroMarkReturn.controller");
 const { grantResitBulk } = require("../controllers/resitBulk.controller");
 const { getReportCardOptions, putReportCardSource } = require("../utils/reportCardSource");
@@ -183,6 +184,10 @@ router.get("/marking-option", protect, authorize("teacher", "admin", "sub_admin"
 router.get("/admin/marking-options", protect, requirePage("E-Assessments"), listMarkingOptions);
 router.put("/admin/marking-options/:teacherId", protect, requirePage("E-Assessments"), setMarkingOption);
 router.put("/admin/marking-options", protect, requirePage("E-Assessments"), setMarkingOption);
+// Marking deadline per assessment: admin sets it (Marking tab), teachers see a countdown while marking
+router.get("/marking-deadline/:assessmentId", protect, authorize("teacher", "admin", "sub_admin", "sub_admin_2"), getMarkingDeadline);
+router.get("/admin/marking-deadlines", protect, requirePage("E-Assessments"), listMarkingDeadlines);
+router.put("/admin/marking-deadlines", protect, requirePage("E-Assessments"), setMarkingDeadline);
 // Suggested remarks: answers marked 0, grouped by the teacher who marked them, pushable back to that teacher
 router.get("/admin/zero-marked", protect, requirePage("E-Assessments"), getZeroMarked);
 router.post("/admin/zero-marked/push-back", protect, requirePage("E-Assessments"), pushBackZeroMarked);
