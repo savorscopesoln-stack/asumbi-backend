@@ -82,6 +82,10 @@ const INDEX_SPECS = [
   ["e_assessment_options", "IX_ea_options_question", ["question_id"], []],
   ["e_assessment_question_images", "IX_ea_question_images_question", ["question_id", "sort_order"], []],
   ["e_assessment_answers", "IX_ea_answers_question", ["question_id"], []],
+  // Marking leaderboard "open marking" query: every answer a teacher marked, grouped by teacher.
+  // Without this it scans the whole answers table (essay text included) on every refresh.
+  // marked_by / marked_at are added at boot; the spec is skipped until the columns exist.
+  ["e_assessment_answers", "IX_ea_answers_marked_by", ["marked_by"], ["submission_id", "marks_awarded", "marked_at"]],
   ["e_assessment_submissions", "IX_ea_sub_student", ["student_id"], ["e_assessment_id"]],
   // token is looked up on every heartbeat / autosave / submit.
   ["e_assessment_exam_sessions", "IX_ea_sessions_token", ["token"], []],

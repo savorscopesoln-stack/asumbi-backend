@@ -27,15 +27,19 @@ const toInt = (v) => {
 };
 const ms = (d) => (d ? new Date(d).getTime() : null);
 
-const getMarkingLeaderboard = async (req, res) => {
-  try {
-    const pool = req.pool;
-    const aid = toInt(req.query.assessmentId);
+/* The board is the same for everyone and is polled every 30s by every open admin /
+   teacher page, so the heavy aggregation is computed once and shared briefly (and
+   concurrent requests share the one in-flight computation) instead of every poll
+   hitting the database. `me` is the only per-user field and is added per request. */
+const CACHE_TTL_MS = 15000;
+const cache = new Map(); // "tenant:assessment" -> { at, promise }
+
+const computeLeaderboard = async (pool, aid, tkey) => {
+  {
     const filter = aid ? "AND s.e_assessment_id = @aid" : "";
     const bind = (r) => (aid ? r.input("aid", sql.Int, aid) : r);
 
     // Credit work recorded only in the teachers' marking sessions (marked before tracking existed).
-    const tkey = req.dbTenant || "default";
     if (Date.now() - (lastBackfill.get(tkey) || 0) > BACKFILL_EVERY_MS) {
       lastBackfill.set(tkey, Date.now());
       try { await backfillMarkersFromSessions(pool); } catch (e) { console.warn("marking backfill failed:", e.message); }
@@ -273,11 +277,23 @@ const getMarkingLeaderboard = async (req, res) => {
     teachers.sort((a, b) => (b.percent ?? -1) - (a.percent ?? -1) || b.wins - a.wins || b.marked - a.marked || a.teacher_name.localeCompare(b.teacher_name));
     teachers.forEach((t, i) => { t.rank = i + 1; });
 
+    // ---- all-time finishes: every completed assessment by the moment it was finished,
+    // earliest finisher first, latest last (no speed or win-count weighting) ----
+    const finishes = [...cells.values()]
+      .filter((c) => c.finished_at)
+      .sort((a, b) => ms(a.finished_at) - ms(b.finished_at) || a.teacher_id - b.teacher_id)
+      .map((c, i) => ({
+        rank: i + 1,
+        teacher_id: c.teacher_id, teacher_name: c.teacher_name,
+        e_assessment_id: c.e_assessment_id, assessment_title: c.assessment_title, subject: c.subject,
+        allocated: c.allocated, finished_at: c.finished_at,
+        finish_place: c.finish_place || null, // 1 = first to finish that assessment
+      }));
+
     const allocated = assessments.reduce((n, a) => n + a.allocated, 0);
     const marked = assessments.reduce((n, a) => n + a.marked, 0);
-    res.json({
+    return {
       generated_at: new Date().toISOString(),
-      me: toInt(req.user?.id),
       summary: {
         teachers: teachers.length, assessments: assessments.length,
         allocated, marked, remaining: Math.max(0, allocated - marked),
@@ -285,7 +301,28 @@ const getMarkingLeaderboard = async (req, res) => {
       },
       teachers,
       assessments,
-    });
+      finishes,
+    };
+  }
+};
+
+const getMarkingLeaderboard = async (req, res) => {
+  try {
+    const aid = toInt(req.query.assessmentId);
+    const tkey = req.dbTenant || "default";
+    const key = `${tkey}:${aid || 0}`;
+    const now = Date.now();
+    let hit = cache.get(key);
+    // ?fresh=1 (the Refresh button) skips the short cache
+    if (!hit || req.query.fresh || now - hit.at > CACHE_TTL_MS) {
+      for (const [k, v] of cache) if (now - v.at > 5 * 60000) cache.delete(k); // keep the map small
+      const promise = computeLeaderboard(req.pool, aid, tkey);
+      hit = { at: now, promise };
+      cache.set(key, hit);
+      promise.catch(() => { if (cache.get(key) === hit) cache.delete(key); }); // never cache a failure
+    }
+    const payload = await hit.promise;
+    res.json({ ...payload, me: toInt(req.user?.id) });
   } catch (err) {
     console.error("MARKING LEADERBOARD ERROR:", err);
     res.status(500).json({ message: "Failed to load marking stats", error: err.message });

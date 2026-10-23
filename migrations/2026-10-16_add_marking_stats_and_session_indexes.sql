@@ -11,8 +11,8 @@ IF NOT EXISTS (SELECT * FROM sys.columns WHERE Name=N'marking_completed_by' AND 
 
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_ea_violation_photos_session')
   CREATE NONCLUSTERED INDEX IX_ea_violation_photos_session ON e_assessment_violation_photos (session_id);
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_ea_answers_submission_cover')
-  CREATE NONCLUSTERED INDEX IX_ea_answers_submission_cover ON e_assessment_answers (submission_id) INCLUDE (question_id, selected_answer, marks_awarded);
+-- (IX_ea_answers_submission_cover was superseded by IX_ea_answers_submission_marking, which also covers
+--  marked_at / marked_by for the marking leaderboard — see 2026-10-23_add_marking_leaderboard_indexes.sql)
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_ea_sessions_status_assessment')
   CREATE NONCLUSTERED INDEX IX_ea_sessions_status_assessment ON e_assessment_exam_sessions (status, e_assessment_id) INCLUDE (student_id, last_heartbeat, ended_at, issued_at);
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_ea_sub_assign_teacher')

@@ -1029,6 +1029,31 @@ BEGIN
   END CATCH
 END
 
+-- IX_ea_answers_marked_by
+IF OBJECT_ID(N'e_assessment_answers', N'U') IS NOT NULL
+  AND COL_LENGTH(N'e_assessment_answers', N'marked_by') IS NOT NULL
+  AND COL_LENGTH(N'e_assessment_answers', N'submission_id') IS NOT NULL
+  AND COL_LENGTH(N'e_assessment_answers', N'marks_awarded') IS NOT NULL
+  AND COL_LENGTH(N'e_assessment_answers', N'marked_at') IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_ea_answers_marked_by' AND object_id = OBJECT_ID(N'e_assessment_answers'))
+  AND NOT EXISTS (
+    SELECT 1 FROM sys.indexes ix
+    WHERE ix.object_id = OBJECT_ID(N'e_assessment_answers') AND ix.index_id > 0
+      AND EXISTS (SELECT 1 FROM sys.index_columns ic0
+        JOIN sys.columns c0 ON c0.object_id = ic0.object_id AND c0.column_id = ic0.column_id
+        WHERE ic0.object_id = ix.object_id AND ic0.index_id = ix.index_id
+          AND ic0.key_ordinal = 1 AND c0.name = N'marked_by')
+  )
+BEGIN
+  BEGIN TRY
+    EXEC(N'CREATE NONCLUSTERED INDEX IX_ea_answers_marked_by ON e_assessment_answers (marked_by) INCLUDE (submission_id, marks_awarded, marked_at)');
+    PRINT N'created IX_ea_answers_marked_by';
+  END TRY
+  BEGIN CATCH
+    PRINT N'index skipped IX_ea_answers_marked_by: ' + ERROR_MESSAGE();
+  END CATCH
+END
+
 -- IX_ea_sub_student
 IF OBJECT_ID(N'e_assessment_submissions', N'U') IS NOT NULL
   AND COL_LENGTH(N'e_assessment_submissions', N'student_id') IS NOT NULL

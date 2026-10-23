@@ -424,7 +424,6 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
     // doesn't time out. Each is guarded, and a failure never blocks startup.
     for (const [name, tbl, def] of [
       ["IX_ea_violation_photos_session", "e_assessment_violation_photos", "(session_id)"],
-      ["IX_ea_answers_submission_cover", "e_assessment_answers", "(submission_id) INCLUDE (question_id, selected_answer, marks_awarded)"],
       ["IX_ea_sessions_status_assessment", "e_assessment_exam_sessions", "(status, e_assessment_id) INCLUDE (student_id, last_heartbeat, ended_at, issued_at)"],
       ["IX_ea_sub_assign_teacher", "e_assessment_submission_assignments", "(teacher_id) INCLUDE (submission_id, assigned_at)"],
     ]) {
@@ -437,6 +436,26 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       } catch (e) {
         console.warn(`[ensureSchema] index ${name} skipped:`, e.message);
       }
+    }
+    // The marking leaderboard reads marks_awarded, marked_at and question_id for every answer of
+    // every allocated script. The older IX_ea_answers_submission_cover lacks marked_at, forcing a
+    // key lookup into the (wide, essay-text) answers table per row. Build the wider covering index
+    // and only then drop the narrower one it fully replaces (same leading key, same includes + more).
+    try {
+      await pool.request().query(`
+        IF EXISTS (SELECT * FROM sysobjects WHERE name='e_assessment_answers' AND xtype='U')
+        AND COL_LENGTH(N'e_assessment_answers', N'marked_at') IS NOT NULL
+        AND COL_LENGTH(N'e_assessment_answers', N'marked_by') IS NOT NULL
+        AND NOT EXISTS (SELECT * FROM sys.indexes WHERE name = N'IX_ea_answers_submission_marking' AND object_id = Object_ID(N'e_assessment_answers'))
+        BEGIN
+          CREATE NONCLUSTERED INDEX IX_ea_answers_submission_marking ON e_assessment_answers (submission_id)
+            INCLUDE (question_id, selected_answer, marks_awarded, marked_at, marked_by);
+          IF EXISTS (SELECT * FROM sys.indexes WHERE name = N'IX_ea_answers_submission_cover' AND object_id = Object_ID(N'e_assessment_answers'))
+            DROP INDEX IX_ea_answers_submission_cover ON e_assessment_answers;
+        END
+      `);
+    } catch (e) {
+      console.warn("[ensureSchema] index IX_ea_answers_submission_marking skipped:", e.message);
     }
 
     /* ---------------- exam autosave + resit support ----------------
@@ -833,6 +852,43 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
         WHERE Name = N'createdByName' AND Object_ID = Object_ID(N'ScheduledNotifications')
       )
       ALTER TABLE ScheduledNotifications ADD createdByName NVARCHAR(200) NULL
+    `);
+
+    /* ---------------- NotificationContacts + DirectSmsLog ----------------
+       Back the "Direct SMS" tab on the admin Notifications page:
+       NotificationContacts is a small address book for people who have no
+       Student/Teacher/User account; DirectSmsLog records every SMS sent
+       straight to a typed number or contact (one row per recipient). */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='NotificationContacts' AND xtype='U')
+      CREATE TABLE NotificationContacts (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        name NVARCHAR(150) NOT NULL,
+        phone NVARCHAR(30) NOT NULL,
+        note NVARCHAR(300) NULL,
+        createdBy INT NULL,
+        createdByName NVARCHAR(200) NULL,
+        createdAt DATETIME NOT NULL DEFAULT GETDATE()
+      )
+    `);
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='NotificationContacts' AND xtype='U')
+      AND NOT EXISTS (SELECT * FROM sys.indexes WHERE name='UX_NotificationContacts_phone' AND object_id = OBJECT_ID(N'NotificationContacts'))
+      CREATE UNIQUE INDEX UX_NotificationContacts_phone ON NotificationContacts (phone)
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='DirectSmsLog' AND xtype='U')
+      CREATE TABLE DirectSmsLog (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        recipientName NVARCHAR(150) NULL,
+        phone NVARCHAR(30) NOT NULL,
+        message NVARCHAR(MAX) NOT NULL,
+        status NVARCHAR(20) NOT NULL,
+        reason NVARCHAR(500) NULL,
+        createdBy INT NULL,
+        createdByName NVARCHAR(200) NULL,
+        createdAt DATETIME NOT NULL DEFAULT GETDATE()
+      )
     `);
 
     /* ---------------- NotificationSettings table ----------------
