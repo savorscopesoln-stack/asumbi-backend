@@ -245,6 +245,7 @@ const getMarkingLeaderboard = async (req, res) => {
         teacher_id: c.teacher_id, teacher_name: c.teacher_name,
         assessments: 0, allocated: 0, marked: 0, assigned_marked: 0, open_marked: 0, timed: 0,
         wins: 0, podiums: 0, finished_assessments: 0,
+        seconds: 0, thirds: 0, turnaround_sum: 0, turnaround_n: 0, fastest_turnaround: null, last_win_at: null,
         speed_weight: 0, speed_sum: 0, last_activity: null,
       };
       t.assessments += 1;
@@ -255,6 +256,13 @@ const getMarkingLeaderboard = async (req, res) => {
       if (c.finished) t.finished_assessments += 1;
       if (c.finish_place === 1) t.wins += 1;
       if (c.finish_place && c.finish_place <= 3) t.podiums += 1;
+      if (c.finish_place === 2) t.seconds += 1;
+      if (c.finish_place === 3) t.thirds += 1;
+      if (c.finish_place === 1 && c.finished_at && (!t.last_win_at || ms(c.finished_at) > ms(t.last_win_at))) t.last_win_at = c.finished_at;
+      if (c.turnaround_minutes != null) {
+        t.turnaround_sum += c.turnaround_minutes; t.turnaround_n += 1;
+        if (t.fastest_turnaround == null || c.turnaround_minutes < t.fastest_turnaround) t.fastest_turnaround = c.turnaround_minutes;
+      }
       if (c.items_per_hour != null) { const w = c.timed || c.marked; t.speed_sum += c.items_per_hour * w; t.speed_weight += w; }
       if (c.last_marked_at && (!t.last_activity || ms(c.last_marked_at) > ms(t.last_activity))) t.last_activity = c.last_marked_at;
       byTeacher.set(c.teacher_id, t);
@@ -266,6 +274,10 @@ const getMarkingLeaderboard = async (req, res) => {
       // progress only exists against a fixed allocation; open marking has no "100%"
       percent: t.allocated ? Math.round((t.assigned_marked / t.allocated) * 100) : null,
       finished_assessments: t.finished_assessments, wins: t.wins, podiums: t.podiums,
+      // all-time finishes view: places 1-3 and how fast the teacher finishes (assigned work only)
+      seconds: t.seconds, thirds: t.thirds, last_win_at: t.last_win_at,
+      fastest_turnaround_minutes: t.fastest_turnaround,
+      avg_turnaround_minutes: t.turnaround_n ? Math.round(t.turnaround_sum / t.turnaround_n) : null,
       items_per_hour: t.speed_weight ? Math.round((t.speed_sum / t.speed_weight) * 10) / 10 : null,
       last_activity: t.last_activity,
     }));
