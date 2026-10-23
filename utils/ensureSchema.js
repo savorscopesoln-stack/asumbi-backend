@@ -835,6 +835,43 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       ALTER TABLE ScheduledNotifications ADD createdByName NVARCHAR(200) NULL
     `);
 
+    /* ---------------- NotificationContacts + DirectSmsLog ----------------
+       Back the "Direct SMS" tab on the admin Notifications page:
+       NotificationContacts is a small address book for people who have no
+       Student/Teacher/User account; DirectSmsLog records every SMS sent
+       straight to a typed number or contact (one row per recipient). */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='NotificationContacts' AND xtype='U')
+      CREATE TABLE NotificationContacts (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        name NVARCHAR(150) NOT NULL,
+        phone NVARCHAR(30) NOT NULL,
+        note NVARCHAR(300) NULL,
+        createdBy INT NULL,
+        createdByName NVARCHAR(200) NULL,
+        createdAt DATETIME NOT NULL DEFAULT GETDATE()
+      )
+    `);
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='NotificationContacts' AND xtype='U')
+      AND NOT EXISTS (SELECT * FROM sys.indexes WHERE name='UX_NotificationContacts_phone' AND object_id = OBJECT_ID(N'NotificationContacts'))
+      CREATE UNIQUE INDEX UX_NotificationContacts_phone ON NotificationContacts (phone)
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='DirectSmsLog' AND xtype='U')
+      CREATE TABLE DirectSmsLog (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        recipientName NVARCHAR(150) NULL,
+        phone NVARCHAR(30) NOT NULL,
+        message NVARCHAR(MAX) NOT NULL,
+        status NVARCHAR(20) NOT NULL,
+        reason NVARCHAR(500) NULL,
+        createdBy INT NULL,
+        createdByName NVARCHAR(200) NULL,
+        createdAt DATETIME NOT NULL DEFAULT GETDATE()
+      )
+    `);
+
     /* ---------------- NotificationSettings table ----------------
        Single-row table holding the API credentials for the outbound
        notification channels (email/SMTP, SMS + WhatsApp via Twilio),
