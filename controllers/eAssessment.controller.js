@@ -5096,7 +5096,17 @@ const saveMarkingSession = async (req, res) => {
     // is effectively unbounded, so cap it defensively).
     // Never slice: cutting JSON mid-string leaves an unparseable draft that
     // getMarkingSession silently turns into null. Reject instead.
-    const serialized = JSON.stringify(state);
+    let serialized = JSON.stringify(state);
+    // Diagnostics + safety net: per-answer HTML is the bulk of a draft and is
+    // reconstructible from the original answers, so shed it when the draft is
+    // large (big NVARCHAR(MAX) writes over a remote link are what time out).
+    if (serialized.length > 1_000_000) {
+      const sizes = Object.fromEntries(Object.entries(state).map(([k, v]) => [k, JSON.stringify(v ?? null).length]));
+      console.warn(`MARKING SESSION large draft (assessment ${e_assessmentId}, ${serialized.length} chars):`, sizes);
+      if (state.essayHTML) {
+        serialized = JSON.stringify({ ...state, essayHTML: {} });
+      }
+    }
     if (serialized.length > 15_000_000) {
       return res.status(413).json({ message: "Marking draft too large" });
     }
@@ -5108,6 +5118,7 @@ const saveMarkingSession = async (req, res) => {
       .input("teacherId", sql.Int, teacherId)
       .input("state", sql.NVarChar(sql.MAX), serialized)
       .query(`
+        SET LOCK_TIMEOUT 8000; -- fail fast if an earlier abandoned write still holds the row
         UPDATE e_assessment_marking_sessions
         SET state = @state, updatedAt = GETDATE()
         WHERE e_assessment_id = @e_assessmentId AND teacher_id = @teacherId;
