@@ -5094,36 +5094,27 @@ const saveMarkingSession = async (req, res) => {
     // Guard against a runaway payload (shouldn't happen — this is just
     // scores/remarks/highlights/flags for one batch — but NVARCHAR(MAX)
     // is effectively unbounded, so cap it defensively).
-    const serialized = JSON.stringify(state).slice(0, 8_000_000);
+    // Never slice: cutting JSON mid-string leaves an unparseable draft that
+    // getMarkingSession silently turns into null. Reject instead.
+    const serialized = JSON.stringify(state);
+    if (serialized.length > 15_000_000) {
+      return res.status(413).json({ message: "Marking draft too large" });
+    }
 
-    const existing = await pool.request()
+    // One round trip (the old SELECT-then-write sent the big payload on a
+    // second request and let overlapping autosaves pile up).
+    await pool.request()
       .input("e_assessmentId", sql.Int, e_assessmentId)
       .input("teacherId", sql.Int, teacherId)
+      .input("state", sql.NVarChar(sql.MAX), serialized)
       .query(`
-        SELECT id FROM e_assessment_marking_sessions
-        WHERE e_assessment_id = @e_assessmentId AND teacher_id = @teacherId
-      `);
-
-    if (existing.recordset.length) {
-      await pool.request()
-        .input("e_assessmentId", sql.Int, e_assessmentId)
-        .input("teacherId", sql.Int, teacherId)
-        .input("state", sql.NVarChar(sql.MAX), serialized)
-        .query(`
-          UPDATE e_assessment_marking_sessions
-          SET state = @state, updatedAt = GETDATE()
-          WHERE e_assessment_id = @e_assessmentId AND teacher_id = @teacherId
-        `);
-    } else {
-      await pool.request()
-        .input("e_assessmentId", sql.Int, e_assessmentId)
-        .input("teacherId", sql.Int, teacherId)
-        .input("state", sql.NVarChar(sql.MAX), serialized)
-        .query(`
+        UPDATE e_assessment_marking_sessions
+        SET state = @state, updatedAt = GETDATE()
+        WHERE e_assessment_id = @e_assessmentId AND teacher_id = @teacherId;
+        IF @@ROWCOUNT = 0
           INSERT INTO e_assessment_marking_sessions (e_assessment_id, teacher_id, state)
-          VALUES (@e_assessmentId, @teacherId, @state)
-        `);
-    }
+          VALUES (@e_assessmentId, @teacherId, @state);
+      `);
 
     res.json({ success: true, updatedAt: new Date().toISOString() });
   } catch (err) {
