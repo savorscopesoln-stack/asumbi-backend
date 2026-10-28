@@ -4605,8 +4605,7 @@ const getAllSubmissions = async (req, res) => {
   s.remark_requested, s.remark_status, s.remark_reason, s.admin_comment, s.released_at,
   a.title AS assessment_title, a.subject AS subject_name, a.total_marks AS total_marks,
   st.name AS student_name,
-  (SELECT COUNT(*) FROM e_assessment_violation_photos vp
-    WHERE vp.e_assessment_id = s.e_assessment_id AND vp.student_id = s.student_id) AS photo_count,
+  ISNULL(vpc.n, 0) AS photo_count,
   aa.teacher_id AS assigned_teacher_id, t.name AS assigned_teacher_name,
   -- what still needs a teacher: answered essays with no mark yet (MCQs are graded automatically,
   -- so a score alone does NOT mean the paper has been marked)
@@ -4624,6 +4623,11 @@ LEFT JOIN e_assessments a ON a.id = s.e_assessment_id
 LEFT JOIN Students st ON st.id = s.student_id
 LEFT JOIN e_assessment_submission_assignments aa ON aa.submission_id = s.id
 LEFT JOIN Teachers t ON t.id = aa.teacher_id
+-- aggregated once (one pass) instead of a correlated COUNT that re-scanned the photos table for every submission row
+LEFT JOIN (
+  SELECT e_assessment_id, student_id, COUNT(*) AS n
+  FROM e_assessment_violation_photos GROUP BY e_assessment_id, student_id
+) vpc ON vpc.e_assessment_id = s.e_assessment_id AND vpc.student_id = s.student_id
 LEFT JOIN (
   SELECT an.submission_id, COUNT(*) AS n
   FROM e_assessment_answers an

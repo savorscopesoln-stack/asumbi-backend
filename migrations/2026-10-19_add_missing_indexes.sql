@@ -1077,6 +1077,108 @@ BEGIN
   END CATCH
 END
 
+-- IX_ea_sub_assessment_student
+IF OBJECT_ID(N'e_assessment_submissions', N'U') IS NOT NULL
+  AND COL_LENGTH(N'e_assessment_submissions', N'e_assessment_id') IS NOT NULL
+  AND COL_LENGTH(N'e_assessment_submissions', N'student_id') IS NOT NULL
+  AND COL_LENGTH(N'e_assessment_submissions', N'status') IS NOT NULL
+  AND COL_LENGTH(N'e_assessment_submissions', N'score') IS NOT NULL
+  AND COL_LENGTH(N'e_assessment_submissions', N'submitted_at') IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_ea_sub_assessment_student' AND object_id = OBJECT_ID(N'e_assessment_submissions'))
+  AND NOT EXISTS (
+    SELECT 1 FROM sys.indexes ix
+    WHERE ix.object_id = OBJECT_ID(N'e_assessment_submissions') AND ix.index_id > 0
+      AND EXISTS (SELECT 1 FROM sys.index_columns ic0
+        JOIN sys.columns c0 ON c0.object_id = ic0.object_id AND c0.column_id = ic0.column_id
+        WHERE ic0.object_id = ix.object_id AND ic0.index_id = ix.index_id
+          AND ic0.key_ordinal = 1 AND c0.name = N'e_assessment_id')
+        AND EXISTS (SELECT 1 FROM sys.index_columns ic1
+        JOIN sys.columns c1 ON c1.object_id = ic1.object_id AND c1.column_id = ic1.column_id
+        WHERE ic1.object_id = ix.object_id AND ic1.index_id = ix.index_id
+          AND ic1.key_ordinal = 2 AND c1.name = N'student_id')
+  )
+BEGIN
+  BEGIN TRY
+    EXEC(N'CREATE NONCLUSTERED INDEX IX_ea_sub_assessment_student ON e_assessment_submissions (e_assessment_id, student_id) INCLUDE (status, score, submitted_at)');
+    PRINT N'created IX_ea_sub_assessment_student';
+  END TRY
+  BEGIN CATCH
+    PRINT N'index skipped IX_ea_sub_assessment_student: ' + ERROR_MESSAGE();
+  END CATCH
+END
+
+-- IX_ea_questions_assessment
+IF OBJECT_ID(N'e_assessment_questions', N'U') IS NOT NULL
+  AND COL_LENGTH(N'e_assessment_questions', N'e_assessment_id') IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_ea_questions_assessment' AND object_id = OBJECT_ID(N'e_assessment_questions'))
+  AND NOT EXISTS (
+    SELECT 1 FROM sys.indexes ix
+    WHERE ix.object_id = OBJECT_ID(N'e_assessment_questions') AND ix.index_id > 0
+      AND EXISTS (SELECT 1 FROM sys.index_columns ic0
+        JOIN sys.columns c0 ON c0.object_id = ic0.object_id AND c0.column_id = ic0.column_id
+        WHERE ic0.object_id = ix.object_id AND ic0.index_id = ix.index_id
+          AND ic0.key_ordinal = 1 AND c0.name = N'e_assessment_id')
+  )
+BEGIN
+  BEGIN TRY
+    EXEC(N'CREATE NONCLUSTERED INDEX IX_ea_questions_assessment ON e_assessment_questions (e_assessment_id)');
+    PRINT N'created IX_ea_questions_assessment';
+  END TRY
+  BEGIN CATCH
+    PRINT N'index skipped IX_ea_questions_assessment: ' + ERROR_MESSAGE();
+  END CATCH
+END
+
+-- IX_ea_violation_photos_assessment_student
+IF OBJECT_ID(N'e_assessment_violation_photos', N'U') IS NOT NULL
+  AND COL_LENGTH(N'e_assessment_violation_photos', N'e_assessment_id') IS NOT NULL
+  AND COL_LENGTH(N'e_assessment_violation_photos', N'student_id') IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_ea_violation_photos_assessment_student' AND object_id = OBJECT_ID(N'e_assessment_violation_photos'))
+  AND NOT EXISTS (
+    SELECT 1 FROM sys.indexes ix
+    WHERE ix.object_id = OBJECT_ID(N'e_assessment_violation_photos') AND ix.index_id > 0
+      AND EXISTS (SELECT 1 FROM sys.index_columns ic0
+        JOIN sys.columns c0 ON c0.object_id = ic0.object_id AND c0.column_id = ic0.column_id
+        WHERE ic0.object_id = ix.object_id AND ic0.index_id = ix.index_id
+          AND ic0.key_ordinal = 1 AND c0.name = N'e_assessment_id')
+        AND EXISTS (SELECT 1 FROM sys.index_columns ic1
+        JOIN sys.columns c1 ON c1.object_id = ic1.object_id AND c1.column_id = ic1.column_id
+        WHERE ic1.object_id = ix.object_id AND ic1.index_id = ix.index_id
+          AND ic1.key_ordinal = 2 AND c1.name = N'student_id')
+  )
+BEGIN
+  BEGIN TRY
+    EXEC(N'CREATE NONCLUSTERED INDEX IX_ea_violation_photos_assessment_student ON e_assessment_violation_photos (e_assessment_id, student_id)');
+    PRINT N'created IX_ea_violation_photos_assessment_student';
+  END TRY
+  BEGIN CATCH
+    PRINT N'index skipped IX_ea_violation_photos_assessment_student: ' + ERROR_MESSAGE();
+  END CATCH
+END
+
+-- IX_ea_sub_assign_submission
+IF OBJECT_ID(N'e_assessment_submission_assignments', N'U') IS NOT NULL
+  AND COL_LENGTH(N'e_assessment_submission_assignments', N'submission_id') IS NOT NULL
+  AND COL_LENGTH(N'e_assessment_submission_assignments', N'teacher_id') IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_ea_sub_assign_submission' AND object_id = OBJECT_ID(N'e_assessment_submission_assignments'))
+  AND NOT EXISTS (
+    SELECT 1 FROM sys.indexes ix
+    WHERE ix.object_id = OBJECT_ID(N'e_assessment_submission_assignments') AND ix.index_id > 0
+      AND EXISTS (SELECT 1 FROM sys.index_columns ic0
+        JOIN sys.columns c0 ON c0.object_id = ic0.object_id AND c0.column_id = ic0.column_id
+        WHERE ic0.object_id = ix.object_id AND ic0.index_id = ix.index_id
+          AND ic0.key_ordinal = 1 AND c0.name = N'submission_id')
+  )
+BEGIN
+  BEGIN TRY
+    EXEC(N'CREATE NONCLUSTERED INDEX IX_ea_sub_assign_submission ON e_assessment_submission_assignments (submission_id) INCLUDE (teacher_id)');
+    PRINT N'created IX_ea_sub_assign_submission';
+  END TRY
+  BEGIN CATCH
+    PRINT N'index skipped IX_ea_sub_assign_submission: ' + ERROR_MESSAGE();
+  END CATCH
+END
+
 -- IX_ea_sessions_token
 IF OBJECT_ID(N'e_assessment_exam_sessions', N'U') IS NOT NULL
   AND COL_LENGTH(N'e_assessment_exam_sessions', N'token') IS NOT NULL

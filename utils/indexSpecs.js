@@ -87,6 +87,13 @@ const INDEX_SPECS = [
   // marked_by / marked_at are added at boot; the spec is skipped until the columns exist.
   ["e_assessment_answers", "IX_ea_answers_marked_by", ["marked_by"], ["submission_id", "marks_awarded", "marked_at"]],
   ["e_assessment_submissions", "IX_ea_sub_student", ["student_id"], ["e_assessment_id"]],
+  // Admin "all submissions" and "exam sessions" lists (GET /e-assessments/submissions and /admin/exam-sessions).
+  // These four were only created by the hand-run migrations/2026-10-15 file, so a database that never had it
+  // applied scanned the whole table per row and hit the 45s ETIMEOUT. They are now built at every boot.
+  ["e_assessment_submissions", "IX_ea_sub_assessment_student", ["e_assessment_id", "student_id"], ["status", "score", "submitted_at"]],
+  ["e_assessment_questions", "IX_ea_questions_assessment", ["e_assessment_id"], []],
+  ["e_assessment_violation_photos", "IX_ea_violation_photos_assessment_student", ["e_assessment_id", "student_id"], []],
+  ["e_assessment_submission_assignments", "IX_ea_sub_assign_submission", ["submission_id"], ["teacher_id"]],
   // token is looked up on every heartbeat / autosave / submit.
   ["e_assessment_exam_sessions", "IX_ea_sessions_token", ["token"], []],
   ["e_assessment_exam_sessions", "IX_ea_sessions_student_assessment", ["student_id", "e_assessment_id"], []],
