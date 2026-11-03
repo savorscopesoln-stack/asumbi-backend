@@ -5,6 +5,7 @@ const jwt = require("jsonwebtoken");
 const { sql, poolPromise, getPool, listTenantKeys } = require("../config/db");
 const { protect, requirePage } = require("../middleware/authMiddleware");
 const { verifyToken } = require("../utils/totp");
+const FA = require("../utils/financeAccount");
 
 // Password every admin-reset account is set back to. Kept as one named
 // constant so it's easy to change later without hunting through the file.
@@ -41,6 +42,25 @@ router.post("/login", async (req, res) => {
 
     // ================= NORMALIZE INPUT =================
     username = username.trim();
+
+    /* ================= FINANCE ACCOUNT (environment) =================
+       Doravo Finance is defined by environment variables (utils/financeAccount.js), not by a
+       database row. Its username is reserved: it is answered here and never looked up in any
+       school's tables, so a school cannot shadow it, and a wrong password never falls through. */
+    if (FA.isFinanceUsername(username)) {
+      if (!(await FA.checkPassword(username, password))) {
+        return res.status(401).json({ message: "Invalid username or password" });
+      }
+      const home = FA.homeTenant(listTenantKeys());
+      if (FA.mfaRequired()) {
+        const mfaToken = jwt.sign({ envFinance: true, tenant: home, mfaPending: true }, process.env.JWT_SECRET || "doravo_core_secret", { expiresIn: "5m" });
+        return res.json({ mfaRequired: true, mfaToken });
+      }
+      const fu = FA.financeUser(home);
+      const token = jwt.sign({ id: null, username: fu.username, role: "finance", permissions: [], source: "Env", tenant: home, mustChangePassword: false, profileIncomplete: false },
+        process.env.JWT_SECRET || "doravo_core_secret", { expiresIn: "1d" });
+      return res.json({ token, user: fu });
+    }
 
     let user = null;
     let source = null;
@@ -165,7 +185,11 @@ router.post("/login", async (req, res) => {
       // Deliberately NOT given the authorize() admin bypass anywhere —
       // see middleware/financeAuth.js's financeOnly, which every
       // routes/finance.js endpoint uses instead of authorize("finance").
-      else if (dbRole === "finance") role = "finance";
+      // A Users row with role "finance" is NOT honoured any more: the finance account lives only
+      // in the environment (utils/financeAccount.js), so a database edit can never create one.
+      else if (dbRole === "finance") {
+        return res.status(401).json({ message: "Invalid username or password" });
+      }
 
       if (role === "sub_admin" || role === "sub_admin_2" || role === "module_admin") {
         try {
@@ -175,27 +199,6 @@ router.post("/login", async (req, res) => {
           permissions = [];
         }
       }
-    }
-
-    /* ================= FINANCE MFA CHALLENGE =================
-       If this finance account has MFA enabled (Users.mfaEnabled —
-       ensureSchema.js, set via POST /api/finance/mfa/confirm), a
-       correct username+password is only step one. Instead of the
-       real access token, hand back a short-lived (5 min) pre-auth
-       token that ONLY proves "this password check already passed" —
-       it carries no role/permissions and is rejected by every normal
-       protect-gated route (no matching role) — and the frontend must
-       exchange it at POST /api/auth/finance-mfa/verify along with the
-       current 6-digit code before a real token is ever issued. This
-       never touches student/teacher/admin login at all — the branch
-       is only reachable for role === "finance" && mfaEnabled. */
-    if (role === "finance" && user.mfaEnabled) {
-      const mfaToken = jwt.sign(
-        { id: user.id, tenant, mfaPending: true },
-        process.env.JWT_SECRET || "doravo_core_secret",
-        { expiresIn: "5m" }
-      );
-      return res.json({ mfaRequired: true, mfaToken });
     }
 
     /* ================= TOKEN =================
@@ -369,58 +372,22 @@ router.post("/finance-mfa/verify", async (req, res) => {
     } catch {
       return res.status(401).json({ message: "MFA challenge expired — please log in again" });
     }
-    if (!decoded?.mfaPending || !decoded?.id || !decoded?.tenant) {
+    if (!decoded?.mfaPending || !decoded?.envFinance || !decoded?.tenant || !FA.isConfigured() || !FA.mfaRequired()) {
       return res.status(401).json({ message: "Invalid MFA challenge" });
     }
-
-    const pool = await getPool(decoded.tenant);
-    const userRes = await pool.request()
-      .input("id", sql.Int, decoded.id)
-      .query(`SELECT * FROM Users WHERE id = @id`);
-    const user = userRes.recordset[0];
-    if (!user || user.role?.toLowerCase() !== "finance" || !user.mfaSecret) {
-      return res.status(401).json({ message: "Invalid MFA challenge" });
-    }
-
-    if (!verifyToken(user.mfaSecret, code)) {
+    if (!FA.checkMfaCode(code)) {
       return res.status(401).json({ message: "Incorrect or expired code" });
     }
 
-    // From here on this is exactly the normal finance login response —
-    // same claim shape /login issues for every other role, so nothing
-    // downstream (protect, financeOnly, the frontend) needs to know
-    // this token came via the MFA step rather than straight from
-    // /login.
-    const mustChangePassword = !!user.mustChangePassword;
+    // Same claim shape /login issues for the finance role, so nothing downstream needs to know
+    // this token came via the MFA step.
+    const fu = FA.financeUser(decoded.tenant);
     const token = jwt.sign(
-      {
-        id: user.id,
-        username: user.username,
-        role: "finance",
-        permissions: [],
-        source: "Users",
-        tenant: decoded.tenant,
-        mustChangePassword,
-        profileIncomplete: false,
-      },
+      { id: null, username: fu.username, role: "finance", permissions: [], source: "Env", tenant: fu.tenant, mustChangePassword: false, profileIncomplete: false },
       process.env.JWT_SECRET || "doravo_core_secret",
       { expiresIn: "1d" }
     );
-
-    return res.json({
-      token,
-      user: {
-        id: user.id,
-        username: user.username,
-        name: user.name || "",
-        role: "finance",
-        permissions: [],
-        source: "Users",
-        tenant: decoded.tenant,
-        mustChangePassword,
-        profileIncomplete: false,
-      },
-    });
+    return res.json({ token, user: fu });
   } catch (err) {
     console.log("FINANCE MFA VERIFY ERROR:", err);
     return res.status(500).json({ message: "Server error" });
@@ -447,6 +414,10 @@ router.put("/change-password", protect, async (req, res) => {
       return res.status(400).json({
         message: "New password must be at least 6 characters",
       });
+    }
+
+    if (req.user.source === "Env") {
+      return res.status(403).json({ message: "This account's password is set by the server configuration and cannot be changed here." });
     }
 
     const table = SOURCE_TABLE[req.user.source];
