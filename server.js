@@ -11,6 +11,7 @@ const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 
 const path = require("path");
+const { denyPrivateUploads } = require("./utils/privateUploadGuard");
 
 const { runWithTenant } = require("./utils/uploadPaths");
 const { getReportCardSource } = require("./utils/reportCardSource");
@@ -32,6 +33,9 @@ const { photoUrlFor, deletePhotoByUrl, runPhotoUpload } = require("./middleware/
 // broken when it's really just not ready yet. Each tenant's promise
 // still catches its own error, so one bad tenant can't block the
 // others or crash boot.
+// Doravo Finance account lives in the environment (utils/financeAccount.js): log what is missing, never a secret.
+require("./utils/financeAccount").financeWarnings().forEach((w) => console.warn("⚠️  " + w));
+
 const schemaReadyPromises = listTenantKeys().map((tenantKey) =>
   getPool(tenantKey)
     .then(async (pool) => {
@@ -40,6 +44,9 @@ const schemaReadyPromises = listTenantKeys().map((tenantKey) =>
       // listings below filter on Users.isMaster, so that column must exist.
       // Trial table (set by Doravo Finance) + protected master admin account/trigger; neither throws.
       await require("./utils/tenantLicense").ensureTenantLicenseSchema(pool);
+      await require("./utils/tenantModules").ensureTenantModulesSchema(pool);
+      await require("./utils/tenantPageAccess").ensureTenantPageAccessSchema(pool);
+      await require("./utils/lmsSchema").ensureLmsSchema(pool, tenantKey); // LMS tables (additive, versioned; never throws)
       await require("./utils/masterAdmin").ensureMasterAdmin(pool, sql, tenantKey);
     })
     .catch((err) =>
@@ -235,6 +242,8 @@ const upload = multer({ storage: multer.memoryStorage() });
 // set LEGACY_UPLOADS=off so those shared folders are no longer served.
 const LEGACY_UPLOAD_KINDS = new Set(["photos", "website", "website-files", "website-videos", "cover-pages", "question-images", "violation-photos"]);
 app.use("/uploads", (req, res, next) => {
+  // L5.2b: student submissions (uploads/<school>/lms-private) are served ONLY by the authenticated LMS route, never as static files.
+  if (req.path.toLowerCase().includes("lms-private") || /%/.test(req.path)) return denyPrivateUploads(req, res, next);
   if (String(process.env.LEGACY_UPLOADS || "").toLowerCase() === "off") {
     const first = decodeURIComponent(req.path.split("/")[1] || "");
     if (LEGACY_UPLOAD_KINDS.has(first)) return res.status(404).end();
@@ -356,6 +365,11 @@ app.use("/api/attendance", protect, attendanceRoutes);
 app.use("/api/e-assessments/ai-marking", require("./routes/aiMarkingTeacher"));
 app.use("/api/e-assessments", eAssessmentRoutes); // already protects internally
 app.use("/api/main-exams", mainExamsRoutes); // already protects internally (protect + requirePage("E-Assessments"))
+app.use("/api/lms-verify", require("./routes/lmsVerify")); // PUBLIC certificate check (L7.5a): the code is the credential; rate limited, uniform 404
+app.use("/api/lms-guardian", require("./routes/lmsGuardian")); // PUBLIC read-only guardian view (L9.5a): the secret in the link is the credential; rate limited, uniform 404
+app.use("/api/lms-feed", require("./routes/lmsFeed")); // PUBLIC calendar subscription (L4.5b): the secret in the link is the credential; rate limited, uniform 404
+app.use("/api/lms", require("./routes/lms")); // LMS (L1.4): protects internally (protect -> requireModule('lms') -> requireLmsPermission)
+require("./utils/lmsNotifications").register(); // LMS in-app notices (L4.4b): licence-gated per event, in-process
 app.use("/api/tenant", require("./routes/tenantLicense")); // trial countdown (read-only; protects internally)
 app.use("/api/finance", financeRoutes); // already protects internally (protect + financeOnly — strict, no admin bypass, see middleware/financeAuth.js)
 app.use("/api/ai-marking-analytics", require("./routes/aiMarkingAnalytics")); // Phase 10, read-only; protects internally (protect + exact role check)
@@ -539,7 +553,7 @@ const RECORD_SENSITIVE_COLUMN_PATTERN = /password|secret|token|apikey|api_key/i;
 // Tables the data manager will never expose, even to an admin —
 // pure internal bookkeeping.
 // tenant_license holds the trial period Doravo Finance sets — a school's own admins must not be able to edit it.
-const RECORD_TABLE_BLOCKLIST = new Set(["sysdiagrams", "tenant_license"]);
+const RECORD_TABLE_BLOCKLIST = new Set(["sysdiagrams", "lms_guardian_links", "lms_offline_packs", "lms_offline_pack_lessons", "lms_offline_actions", "lms_paths", "lms_path_items", "lms_path_learners", "lms_help_requests", "lms_office_hours", "tenant_license", "tenant_modules", "tenant_page_access", "lms_user_permissions", "lms_audit_log", "lms_schema_migrations", "lms_settings", "lms_courses", "lms_course_staff", "lms_course_sections", "lms_course_events", "lms_course_enrolments", "lms_enrolment_history", "lms_course_templates", "lms_course_approvals", "lms_lessons", "lms_lesson_blocks", "lms_media_files", "lms_lesson_versions", "lms_lesson_progress", "lms_lesson_prerequisites", "lms_learning_outcomes", "lms_outcome_tags", "lms_announcements", "lms_calendar_feeds", "lms_assignments", "lms_submissions", "lms_submission_files", "lms_rubrics", "lms_rubric_criteria", "lms_rubric_levels", "lms_assignment_rubrics", "lms_submission_grades", "lms_submission_rubric_scores", "lms_assignment_releases", "lms_student_releases", "lms_extensions", "lms_questions", "lms_question_versions", "lms_quizzes", "lms_quiz_questions", "lms_quiz_rules", "lms_flashcard_ratings", "lms_grade_categories", "lms_grade_items", "lms_grades", "lms_grade_history", "lms_quiz_attempts", "lms_quiz_answers", "lms_certificates", "lms_badges", "lms_badge_awards", "lms_forums", "lms_threads", "lms_posts", "lms_post_reports", "lms_groups", "lms_group_members", "lms_peer_review_rounds", "lms_peer_reviews", "lms_peer_review_scores"]); // LMS grants/audit/settings are edited only through validated, audited /api/lms endpoints
 
 const TEXT_COLUMN_TYPES = new Set(["char", "varchar", "nchar", "nvarchar", "text", "ntext"]);
 

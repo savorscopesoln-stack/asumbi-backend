@@ -1,6 +1,18 @@
 const express = require("express");
 const router = express.Router();
 const { authorize } = require("../middleware/authMiddleware");
+const { getDisabledPages } = require("../utils/tenantPageAccess");
+
+/* Pages Doravo Finance switched off for this institution always win over the school's own
+   switches (utils/tenantPageAccess.js). Returned as enabled:false rows flagged finance_locked. */
+const withFinanceLocks = async (req, portal, rows) => {
+  const disabled = (await getDisabledPages(req.pool, req.tenant || req.user?.tenant))[portal] || [];
+  const locked = new Set(disabled);
+  return [
+    ...rows.filter((r) => !locked.has(r.page_key)),
+    ...disabled.map((page_key) => ({ portal, page_key, enabled: false, finance_locked: true })),
+  ];
+};
 
 const VALID_PORTALS = ["student", "teacher"];
 
@@ -33,7 +45,12 @@ module.exports = (poolPromise, sql) => {
     try {
       const pool = req.pool; // tenant-resolved by server.js DB middleware
       const result = await pool.request().query(`SELECT * FROM PortalPageSettings ORDER BY portal, page_key`);
-      res.json(result.recordset || []);
+      const rows = result.recordset || [];
+      const merged = [];
+      for (const portal of VALID_PORTALS) {
+        merged.push(...(await withFinanceLocks(req, portal, rows.filter((r) => r.portal === portal))));
+      }
+      res.json(merged);
     } catch (err) {
       console.log(err);
       res.status(500).json([]);
@@ -56,7 +73,7 @@ module.exports = (poolPromise, sql) => {
         .input("portal", sql.NVarChar, portal)
         .query(`SELECT page_key, enabled FROM PortalPageSettings WHERE portal=@portal`);
 
-      res.json(result.recordset || []);
+      res.json(await withFinanceLocks(req, portal, result.recordset || []));
 
     } catch (err) {
       console.log(err);
@@ -82,6 +99,11 @@ module.exports = (poolPromise, sql) => {
       }
       if (enabled === false && LOCKED.has(`${portalNorm}:${page_key}`)) {
         return res.status(400).json({ message: "This page is the portal's landing page and can't be disabled." });
+      }
+
+      const financeOff = (await getDisabledPages(req.pool, req.tenant || req.user?.tenant))[portalNorm] || [];
+      if (financeOff.includes(page_key)) {
+        return res.status(403).json({ message: "This page has been switched off for your institution by Doravo. Contact Doravo to enable it." });
       }
 
       const pool = req.pool; // tenant-resolved by server.js DB middleware

@@ -11,16 +11,11 @@
    no admin bypass, ever. This is deliberately NOT built on top of
    authorize("finance") for that reason.
 
-   Finance accounts log in through the existing POST /api/auth/login
-   (see routes/auth.js's role-mapping addition) — Doravo has no
-   separate "control database" identity system to build a parallel
-   login around (Phase 1 audit, Option A). The finance role's tenant
-   scoping works exactly like every other role's: the tenant a
-   finance username was found in at login is stamped into the JWT and
-   resolved back to req.pool by server.js's existing DB middleware —
-   a finance officer covering several institutions needs one account
-   (one username) per institution they serve, same as any other role
-   would.
+   The Finance account is defined in the server ENVIRONMENT (utils/financeAccount.js),
+   like the master admin: it logs in through the existing POST /api/auth/login, which
+   answers its reserved username from the env and never from a database. Its token
+   carries role "finance" and a home tenant (only used for req.pool); every finance
+   route then reaches institutions explicitly through :tenantKey.
 ========================================================================= */
 const financeOnly = (req, res, next) => {
   if (!req.user) {

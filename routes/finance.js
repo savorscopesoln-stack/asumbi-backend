@@ -12,8 +12,6 @@ const {
   verifyPayment,
   issueCredits,
   reverseCredits,
-  enrollMfa,
-  confirmMfa,
 } = require("../controllers/finance.controller");
 const {
   createInvoice,
@@ -33,6 +31,8 @@ const {
   reverseAiMarkingEntry,
 } = require("../controllers/aiMarkingFinance.controller");
 const { getTrial, setTrial, clearTrial } = require("../controllers/financeTrial.controller");
+const { getModules, setModule } = require("../controllers/financeModules.controller");
+const { getPages, setPages } = require("../controllers/financePageAccess.controller");
 const analytics = require("../controllers/aiMarkingAnalytics.controller");
 const { finance: aiFinanceLimit } = require("../middleware/aiMarkingRateLimit");
 
@@ -46,10 +46,11 @@ const { finance: aiFinanceLimit } = require("../middleware/aiMarkingRateLimit");
    correct for ordinary tenant capabilities but must never apply to
    credit issuance.
 
-   MFA enrollment routes are also financeOnly (a finance officer
-   managing their own account), but institution-data routes below them
-   are the ones that actually cross tenant boundaries — see
-   finance.controller.js's header comment.
+   The finance ACCOUNT itself (username, password, authenticator secret)
+   is defined in the server environment, not in a database — see
+   utils/financeAccount.js. There are no enrollment/reset routes.
+   Institution-data routes below are the ones that actually cross
+   tenant boundaries — see finance.controller.js's header comment.
 ========================================================================= */
 
 router.use(protect, financeOnly);
@@ -92,7 +93,13 @@ router.get("/institutions/:tenantKey/trial", getTrial);
 router.post("/institutions/:tenantKey/trial", setTrial);
 router.delete("/institutions/:tenantKey/trial", clearTrial);
 
-router.post("/mfa/enroll", enrollMfa);
-router.post("/mfa/confirm", confirmMfa);
+/* Separately licensed modules (LMS ...) — see utils/tenantModules.js. */
+router.get("/institutions/:tenantKey/modules", getModules);
+router.put("/institutions/:tenantKey/modules/:moduleKey", setModule);
+
+/* Which pages each portal (admin / student / teacher) shows this institution (Finance switches them on/off) — utils/tenantPageAccess.js. */
+router.get("/institutions/:tenantKey/pages", getPages);
+router.put("/institutions/:tenantKey/pages", setPages);
+
 
 module.exports = router;

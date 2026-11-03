@@ -34,6 +34,7 @@ const PAGE_KEYS = [
   "Website",
   "School Settings",
   "Wallet",
+  "LMS",
 ];
 
 /* Keep only valid, de-duplicated page keys from whatever was submitted. */

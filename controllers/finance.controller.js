@@ -9,7 +9,6 @@ const {
 } = require("../services/walletLedger.service");
 const { recordPayment } = require("../services/invoicing.service");
 const { logFinanceAudit } = require("../utils/financeAuditLog");
-const { generateSecret, verifyToken, otpauthUri } = require("../utils/totp");
 const { getTrialStatus } = require("../utils/tenantLicense");
 
 /* =========================================================================
@@ -19,14 +18,14 @@ const { getTrialStatus } = require("../utils/tenantLicense");
    controller in this project operates on req.pool — the ONE tenant DB
    the logged-in user's own JWT is scoped to (see server.js's DB
    middleware). Finance is structurally different: a Finance officer's
-   own login account lives in exactly one tenant DB (Option A, Phase 1
-   audit), but their JOB is to act on ANY institution's wallet. So
+   own login account is defined in the server environment, but their JOB is
+   to act on ANY institution's wallet. So
    every function below that touches institution data takes a
    `:tenantKey` route param, validates it against listTenantKeys(),
    and opens THAT tenant's pool directly via getPool(tenantKey) —
    never req.pool. req.pool here is only ever implicitly relevant to
-   the finance ACCOUNT itself (enrollMfa/confirmMfa, which manage the
-   logged-in finance user's own Users row in their own tenant).
+   the finance session itself, whose ACCOUNT lives in the server
+   environment (utils/financeAccount.js), not in any Users row.
 
    Every mutating endpoint here is financeOnly-gated at the route
    level (routes/finance.js) — financeOnly is a strict role check with
@@ -326,65 +325,6 @@ const reverseCredits = async (req, res) => {
   }
 };
 
-/* =========================================================================
-   MFA ENROLLMENT — self-service, for the CURRENTLY LOGGED IN finance
-   user's own account, in their own tenant DB. Uses req.pool (not
-   getPool(tenantKey)) since this is about the account itself, not an
-   institution's wallet.
-
-   No QR code library exists in this project and none can be installed
-   here (no network access) — enrollment returns the Base32 secret as
-   text plus an otpauth:// URI, both of which every mainstream
-   authenticator app accepts via manual entry or "paste a setup key".
-   A QR-rendering step (e.g. drawn client-side with a small JS QR
-   library) can be layered on top later without changing this
-   endpoint's contract.
-========================================================================= */
-const enrollMfa = async (req, res) => {
-  try {
-    const pool = req.pool;
-    const secret = generateSecret();
-    await pool.request()
-      .input("id", sql.Int, req.user.id)
-      .input("secret", sql.NVarChar(100), secret)
-      .query(`UPDATE Users SET mfaSecret = @secret, mfaEnabled = 0 WHERE id = @id`);
-
-    res.json({
-      success: true,
-      secret,
-      otpauthUri: otpauthUri(secret, { accountName: req.user.username || `user${req.user.id}` }),
-      message: "Enter the 6-digit code from your authenticator app to finish enabling MFA.",
-    });
-  } catch (err) {
-    console.error("FINANCE MFA ENROLL ERROR:", err);
-    res.status(500).json({ success: false, message: "Server error starting MFA enrollment" });
-  }
-};
-
-const confirmMfa = async (req, res) => {
-  try {
-    const pool = req.pool;
-    const { code } = req.body || {};
-    const userResult = await pool.request()
-      .input("id", sql.Int, req.user.id)
-      .query(`SELECT mfaSecret FROM Users WHERE id = @id`);
-    const mfaSecret = userResult.recordset[0]?.mfaSecret;
-    if (!mfaSecret) {
-      return res.status(400).json({ success: false, message: "Start MFA enrollment first" });
-    }
-    if (!verifyToken(mfaSecret, code)) {
-      return res.status(400).json({ success: false, message: "Incorrect or expired code" });
-    }
-    await pool.request()
-      .input("id", sql.Int, req.user.id)
-      .query(`UPDATE Users SET mfaEnabled = 1 WHERE id = @id`);
-    res.json({ success: true, mfaEnabled: true });
-  } catch (err) {
-    console.error("FINANCE MFA CONFIRM ERROR:", err);
-    res.status(500).json({ success: false, message: "Server error confirming MFA" });
-  }
-};
-
 module.exports = {
   listInstitutions,
   getInstitutionWallet,
@@ -395,8 +335,6 @@ module.exports = {
   verifyPayment,
   issueCredits,
   reverseCredits,
-  enrollMfa,
-  confirmMfa,
   // shared with financeInvoice.controller.js
   assertValidTenant,
   loadInstitutionProfile,
