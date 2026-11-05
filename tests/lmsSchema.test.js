@@ -86,3 +86,9 @@ test("wiring: runs at boot for each tenant after the module table; CLI exists wi
   assert.ok(server.indexOf("ensureTenantModulesSchema") < server.indexOf("ensureLmsSchema"));
   assert.ok(fs.readFileSync(path.join(__dirname, "..", "scripts", "lmsMigrate.js"), "utf8").includes("--dry-run"));
 });
+
+test("no sized (N)VARCHAR column exceeds the SQL Server limit (4000) — use MAX", () => {
+  for (const stmt of L.STEPS.flatMap((s) => s.sql)) {
+    for (const m of stmt.matchAll(/N?VARCHAR\((\d+)\)/gi)) assert.ok(Number(m[1]) <= 4000, `${m[0]} in: ` + stmt.slice(0, 60));
+  }
+});

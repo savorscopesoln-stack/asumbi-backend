@@ -1136,7 +1136,7 @@ const STEPS = [
          thread_id INT NOT NULL,
          forum_id INT NOT NULL,
          course_id INT NOT NULL,
-         body NVARCHAR(5000) NOT NULL,
+         body NVARCHAR(MAX) NOT NULL,
          is_opening BIT NOT NULL DEFAULT 0,
          author_source NVARCHAR(20) NOT NULL,
          author_id INT NOT NULL,
