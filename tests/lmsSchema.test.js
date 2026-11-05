@@ -60,12 +60,13 @@ test("an edited released step is flagged, not re-run", async () => {
   assert.deepStrictEqual((await L.planLmsSchema(p, steps)).changed, ["001_a"]);
 });
 
-test("failure never throws, stops the sequence, and records nothing for the failed step", async () => {
+test("failure never throws, is recorded per step, and does not block later steps", async () => {
   const steps = [{ id: "001_a", sql: ["SELECT 1"] }, { id: "002_b", sql: ["BAD SQL"] }, { id: "003_c", sql: ["SELECT 3"] }];
   const p = fakePool({ failOn: "BAD SQL" });
   const rep = await L.ensureLmsSchema(p, "t", steps);
-  assert.strictEqual(rep.failed, "boom"); assert.deepStrictEqual(rep.ran, ["001_a"]);
-  assert.ok(!p.rows.has("002_b") && !p.rows.has("003_c"));
+  assert.strictEqual(rep.failed, "boom"); assert.deepStrictEqual(rep.ran, ["001_a", "003_c"]);
+  assert.deepStrictEqual(rep.failedSteps.map((f) => f.id), ["002_b"]);
+  assert.ok(!p.rows.has("002_b") && p.rows.has("003_c"));
 });
 
 test("safety: steps are additive only (no DROP / ALTER / DELETE / TRUNCATE, except a guarded ADD of one NULLable column on an lms_ table), every CREATE is guarded, ids are unique and ordered", () => {

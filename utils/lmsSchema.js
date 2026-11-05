@@ -1514,9 +1514,12 @@ async function planLmsSchema(pool, steps = STEPS) {
   };
 }
 
-/* Applies pending steps in order. Never throws (boot must not die); returns a report. */
+/* Applies pending steps in order. Never throws (boot must not die); returns a report.
+   A failing step is logged (step id + the statement that broke) and left unrecorded so it retries on the next boot,
+   but it no longer blocks the steps after it: every step is additive and guarded, so later tables (peer review, paths…)
+   still get created. A later step that really needs the failed one fails on its own and retries too. */
 async function ensureLmsSchema(pool, tenantKey = "default", steps = STEPS) {
-  const report = { tenantKey, ran: [], skipped: [], failed: null, changed: [] };
+  const report = { tenantKey, ran: [], skipped: [], failed: null, failedSteps: [], changed: [] };
   try {
     await pool.request().query(TRACKING_SQL);
     const applied = await readApplied(pool);
@@ -1526,11 +1529,19 @@ async function ensureLmsSchema(pool, tenantKey = "default", steps = STEPS) {
         if (applied.get(step.id) !== checksum(step)) report.changed.push(step.id); // released step was edited: warn only
         continue;
       }
-      for (const stmt of step.sql) await pool.request().query(stmt);
-      await pool.request().input("id", require("mssql").NVarChar(100), step.id)
-        .input("cs", require("mssql").NVarChar(32), checksum(step))
-        .query(`INSERT INTO lms_schema_migrations (id, checksum) VALUES (@id, @cs)`);
-      report.ran.push(step.id);
+      let stmt = "";
+      try {
+        for (stmt of step.sql) await pool.request().query(stmt);
+        await pool.request().input("id", require("mssql").NVarChar(100), step.id)
+          .input("cs", require("mssql").NVarChar(32), checksum(step))
+          .query(`INSERT INTO lms_schema_migrations (id, checksum) VALUES (@id, @cs)`);
+        report.ran.push(step.id);
+      } catch (err) {
+        const snippet = String(stmt).replace(/\s+/g, " ").trim().slice(0, 140);
+        report.failedSteps.push({ id: step.id, error: err.message });
+        if (report.failed === null) report.failed = err.message;
+        console.error(`⚠️  LMS schema [${tenantKey}] step ${step.id} FAILED: ${err.message} | statement: ${snippet}`);
+      }
     }
     if (report.changed.length) console.error(`⚠️  LMS schema [${tenantKey}]: released step(s) edited after applying: ${report.changed.join(", ")}`);
   } catch (err) {
