@@ -1,3 +1,5 @@
+/* DEPRECATED, NOT MOUNTED (L11.6, D-145). Older copy of the bulk import that server.js serves at /api/upload (adminOnly, mustChangePassword).
+   Do NOT mount: it has no admin check, takes the account role from the uploaded file and uses a fixed password. Guarded by tests/uploadPreview.test.js. */
 const express = require("express");
 const router = express.Router();
 const multer = require("multer");
@@ -5,7 +7,7 @@ const XLSX = require("xlsx");
 const bcrypt = require("bcrypt");
 const { sql } = require("../config/db");
 
-const upload = multer({ storage: multer.memoryStorage() });
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024, files: 1 } });
 
 /* =========================
    UPLOAD ROUTE
@@ -24,9 +26,7 @@ router.post("/", upload.single("file"), async (req, res) => {
       return res.status(400).json({ message: "No file uploaded" });
     }
 
-    const workbook = XLSX.read(req.file.buffer, { type: "buffer" });
-    const sheetName = workbook.SheetNames[0];
-    const data = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName]);
+    const data = require("../utils/safeSpreadsheet").firstSheetRows(req.file.buffer);
 
     if (!data.length) {
       return res.status(400).json({ message: "Empty file" });

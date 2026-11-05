@@ -230,7 +230,7 @@ app.use((req, res, next) => {
 });
 app.use(express.urlencoded({ extended: true }));
 
-const upload = multer({ storage: multer.memoryStorage() });
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024, files: 1 } });
 
 /* ================= PROFILE PHOTOS (static) =================
    Files land on disk via backend/middleware/photoUpload.js under
@@ -1029,6 +1029,7 @@ app.post("/api/promote-years", protect, adminOnly, async (req, res) => {
 /* =========================================================
    UPLOAD (admin only — bulk-inserts accounts with default password)
 ========================================================= */
+app.use("/api/upload/preview", protect, adminOnly, require("./routes/users")); // L11.6 dry run, no DB
 app.post("/api/upload", protect, adminOnly, upload.single("file"), async (req, res) => {
   try {
     const pool = req.pool;
@@ -1038,9 +1039,12 @@ app.post("/api/upload", protect, adminOnly, upload.single("file"), async (req, r
       return res.status(400).json({ message: "No file uploaded" });
     }
 
-    const wb = XLSX.read(req.file.buffer, { type: "buffer" });
-    const sheet = wb.Sheets[wb.SheetNames[0]];
-    const rows = XLSX.utils.sheet_to_json(sheet);
+    let rows;
+    try {
+      rows = require("./utils/safeSpreadsheet").firstSheetRows(req.file.buffer);
+    } catch (e) {
+      return res.status(e.status || 400).json({ code: e.code || "BAD_FILE", message: e.message });
+    }
 
     if (type === "students") {
       for (const row of rows) {

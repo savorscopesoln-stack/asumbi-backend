@@ -1179,6 +1179,18 @@ router.delete("/guardian/links/:linkId", gdGate, gdAdmin, async (req, res) => {
 });
 
 
+/* ---- L11.12 learner data export (D-150): LMS administrator only (`lms.settings.manage`), read-only JSON download for ONE learner, no-store. */
+const dataExport = require("../utils/lmsDataExport");
+router.get("/learners/:studentId/export", requireLmsPermission("lms.settings.manage"), async (req, res) => {
+  try {
+    res.setHeader("Cache-Control", "no-store");
+    const r = await dataExport.exportLearner(req.pool, req.user, req.params.studentId);
+    if (!r.ok) return res.status(404).json({ success: false, code: "NOT_FOUND", message: "Not found" });
+    res.setHeader("Content-Disposition", `attachment; filename="lms-learner-${r.export.learnerId}.json"`);
+    res.json({ success: true, ...r.export });
+  } catch (e) { fail(res, e, "LEARNER EXPORT"); }
+});
+
 /* ---- L10.1a offline resource packs (D-113). Licence flag `lms_offline` FIRST, then `lms.course.manage` + course membership (staff); learners: studentOnly + enrolment. */
 const olGate = requireModule("lms", "lms_offline"), olManage = requireLmsPermission("lms.course.manage");
 const OL = "/courses/:courseId/offline/packs";

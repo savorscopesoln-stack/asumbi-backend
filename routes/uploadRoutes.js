@@ -1,3 +1,5 @@
+/* DEPRECATED, NOT MOUNTED (L11.6, D-145). Older copy of the bulk import that server.js serves at /api/upload (adminOnly, mustChangePassword).
+   Do NOT mount: it has no admin check, takes the account role from the uploaded file and uses a fixed password. Guarded by tests/uploadPreview.test.js. */
 const express = require("express");
 const router = express.Router();
 const XLSX = require("xlsx");

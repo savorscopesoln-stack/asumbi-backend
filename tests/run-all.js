@@ -46,6 +46,8 @@ require("./lmsPermissions.test.js");
 require("./lmsSettings.test.js");
 require("./lmsFoundation.test.js");
 require("./lmsIsolation.test.js");
+require("./safeSpreadsheet.test.js");
+require("./uploadPreview.test.js");
 require("./lmsCourses.test.js");
 require("./lmsCourseParts.test.js");
 require("./lmsEnrolment.test.js");
