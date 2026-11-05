@@ -20,8 +20,8 @@ const world = (o = {}, extra = []) => makeMockPool([
   ["SELECT TOP 1 id FROM lms_post_reports", () => (o.already ? [{ id: 5 }] : [])],
   ["SELECT COUNT(DISTINCT r.post_id) AS n", () => [{ n: o.queueTotal ?? 2 }]],
   ["GROUP BY p.id, p.thread_id", () => o.queue || [
-    { post_id: 2, thread_id: 11, forum_id: 1, is_opening: 0, hidden_at: null, author_source: "Students", author_id: 30, excerpt: "x".repeat(400), thread_title: "Welcome", author_name: "Amina Kamau", report_count: 3, open_count: 2, first_at: ago(50), last_at: ago(5) },
-    { post_id: 1, thread_id: 11, forum_id: 1, is_opening: 1, hidden_at: ago(1), author_source: "Teachers", author_id: 7, excerpt: "Hello", thread_title: "Welcome", author_name: "Mary Wanjiru", report_count: 1, open_count: 0, first_at: ago(80), last_at: ago(70) }]],
+    { post_id: 2, thread_id: 11, forum_id: 1, is_opening: 0, hidden_at: null, author_source: "Students", author_id: 30, excerpt: "x".repeat(400), thread_title: "Welcome", author_name: "Amina Kamau", report_count: 3, open_count: 2, open_report_id: 41, first_at: ago(50), last_at: ago(5) },
+    { post_id: 1, thread_id: 11, forum_id: 1, is_opening: 1, hidden_at: ago(1), author_source: "Teachers", author_id: 7, excerpt: "Hello", thread_title: "Welcome", author_name: "Mary Wanjiru", report_count: 1, open_count: 0, open_report_id: null, first_at: ago(80), last_at: ago(70) }]],
   ["SELECT r.post_id, r.reason FROM lms_post_reports r", () => o.reasons || [{ post_id: 2, reason: "rude" }, { post_id: 2, reason: "spam" }, { post_id: 2, reason: "a" }, { post_id: 2, reason: "b" }, { post_id: 2, reason: "c" }, { post_id: 2, reason: "d" }, { post_id: 1, reason: "odd" }]],
   ["SELECT TOP 1 r.id, r.post_id, r.resolved_at", () => (o.noRep ? [] : [{ id: 9, post_id: 2, resolved_at: o.resolvedAt || null, is_opening: o.opening ? 1 : 0, thread_id: 11 }])],
   ["FROM lms_threads t LEFT JOIN Students st", () => [{ id: 11, title: "Welcome", pinned: 0, locked: 0, hidden_at: null, author_source: "Teachers", author_id: 7, author_name: "Mary Wanjiru", created_at: ago(500), reply_count: 1, last_post_at: ago(10), report_count: 2 }]],
@@ -107,6 +107,7 @@ test("listReports: staff only, status filter in SQL (open default), grouped by p
   assert.ok(/ORDER BY MAX\(r\.created_at\) DESC, p\.id DESC OFFSET @off ROWS FETCH NEXT @ps ROWS ONLY/.test(list) && inOf(m, "GROUP BY p.id, p.thread_id").ps === 50 && inOf(m, "GROUP BY p.id, p.thread_id").off === 50 && /LEFT\(p\.body, 300\)/.test(list));
   assert.ok(!/reporter_id|reporter_source/.test(list) && !/reporter/i.test(JSON.stringify(r)), "reporter identity is not read or returned (Q69)");
   assert.deepStrictEqual([r.items[0].postId, r.items[0].excerpt.length, r.items[0].reportCount, r.items[0].openCount, r.items[0].reasons, r.items[0].author, r.items[1].hidden, r.items[1].isOpening, r.items[1].reasons], [2, 300, 3, 2, ["rude", "spam", "a", "b", "c"], { name: "Amina K.", isStaff: false }, true, true, ["odd"]]);
+  assert.deepStrictEqual([r.items[0].openReportId, r.items[1].openReportId], [41, null]); // S94: the screen needs an open report id to resolve
   assert.deepStrictEqual([r.total, r.page, r.pageSize, r.hasMore, r.status], [2, 2, 50, false, "open"]); assert.ok(!/author_id|authorId|admission/i.test(JSON.stringify(r)));
   const rs = sqlOf(m, "SELECT r.post_id, r.reason"); assert.ok(/OPENJSON\(@ids\)/.test(rs) && /r\.course_id = @c/.test(rs) && /AND r\.resolved_at IS NULL/.test(rs) && inOf(m, "SELECT r.post_id, r.reason").ids === "[2,1]");
   const res = world(); await M.listReports(res.pool, teacher, 5, { status: "resolved" }); assert.ok(/AND r\.resolved_at IS NOT NULL/.test(sqlOf(res, "GROUP BY p.id")) && /AND r\.resolved_at IS NOT NULL/.test(sqlOf(res, "SELECT r.post_id, r.reason")));

@@ -159,7 +159,7 @@ async function listReports(pool, user, courseId, query) {
   const tot = await rq().query(`SELECT COUNT(DISTINCT r.post_id) AS n ${REPORT_FROM} WHERE r.course_id = @c ${sc}`);
   const r = await rq().input("off", sql.Int, pg.offset).input("ps", sql.Int, pg.pageSize).query(`SELECT p.id AS post_id, p.thread_id, p.forum_id, p.is_opening, p.hidden_at, p.author_source, p.author_id,
       MAX(LEFT(p.body, ${EXCERPT})) AS excerpt, MAX(t.title) AS thread_title, MAX(COALESCE(st.name, te.name, us.name)) AS author_name,
-      COUNT(*) AS report_count, SUM(CASE WHEN r.resolved_at IS NULL THEN 1 ELSE 0 END) AS open_count, MIN(r.created_at) AS first_at, MAX(r.created_at) AS last_at
+      COUNT(*) AS report_count, SUM(CASE WHEN r.resolved_at IS NULL THEN 1 ELSE 0 END) AS open_count, MIN(CASE WHEN r.resolved_at IS NULL THEN r.id END) AS open_report_id, MIN(r.created_at) AS first_at, MAX(r.created_at) AS last_at
     ${REPORT_FROM} ${NAME_JOINS("p")}
     WHERE r.course_id = @c ${sc}
     GROUP BY p.id, p.thread_id, p.forum_id, p.is_opening, p.hidden_at, p.author_source, p.author_id
@@ -172,7 +172,7 @@ async function listReports(pool, user, courseId, query) {
   }
   const total = Number(tot.recordset && tot.recordset[0] && tot.recordset[0].n) || 0;
   const items = rows.map((x) => ({ postId: x.post_id, threadId: x.thread_id, forumId: x.forum_id, threadTitle: x.thread_title, isOpening: !!x.is_opening, hidden: !!x.hidden_at, excerpt: String(x.excerpt || "").slice(0, EXCERPT),
-    author: authorOf(x), reportCount: Number(x.report_count) || 0, openCount: Number(x.open_count) || 0, firstReportedAt: iso(x.first_at), lastReportedAt: iso(x.last_at), reasons: reasons[x.post_id] || [] }));
+    author: authorOf(x), reportCount: Number(x.report_count) || 0, openCount: Number(x.open_count) || 0, openReportId: x.open_report_id == null ? null : Number(x.open_report_id), firstReportedAt: iso(x.first_at), lastReportedAt: iso(x.last_at), reasons: reasons[x.post_id] || [] }));
   return { ok: true, status: st, items, total, page: pg.page, pageSize: pg.pageSize, hasMore: pg.offset + items.length < total };
 }
 
