@@ -131,14 +131,12 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
         const scores = exam.subjects.map((s) => Number(s.percentage)).filter((n) => !Number.isNaN(n));
         const average = scores.length ? round2(scores.reduce((a, b) => a + b, 0) / scores.length) : null;
 
-        // Per-subject grade band: `label` (e.g. "Credit") is shown in
-        // BOTH the "Grade" and "Points" table columns — the app has one
-        // grading scale, not the separate letter-grade/points scales a
-        // college transcript like the sample sometimes uses. The
-        // band's own numeric `grade` code (e.g. "4") still exists
-        // underneath and is what the exam's aggregate points total
-        // below is summed from, so that figure means something even
-        // though the two visible columns match.
+        // Per-subject columns, all from the school's Grading System:
+        //   GRADE  = the matched band's grade (e.g. "1".."7")
+        //   POINTS = the matched band's label (e.g. "Distinction")
+        //   RESULT = the result label for that score (overall bands)
+        // The band's numeric grade is also what the exam's aggregate
+        // points total below is summed from.
         const orderedSubjects = [...exam.subjects].sort((a, b) => {
           const ca = a.subjectCode ? String(a.subjectCode).trim() : "";
           const cb = b.subjectCode ? String(b.subjectCode).trim() : "";
@@ -151,7 +149,7 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
           const band = s.percentage != null ? getGradeForScore(s.percentage, gradingSystem) : null;
           return {
             ...s,
-            grade: band ? band.label : "—",
+            grade: band && band.grade !== "" && band.grade != null ? String(band.grade) : "—",
             points: band ? band.label : "—",
             gradePoints: band ? Number(band.grade) : null,
             result: s.percentage != null ? getOverallResultForScore(s.percentage, gradingSystem) : "—",
