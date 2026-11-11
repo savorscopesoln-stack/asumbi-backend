@@ -1,5 +1,5 @@
 const sql = require("mssql");
-const { getInstitutionHeader, getSigningOfficials, sendPdfBuffer } = require("../utils/reportExport");
+const { getInstitutionHeader, getSigningOfficials, getClassTeachers, sendPdfBuffer } = require("../utils/reportExport");
 const { buildTranscriptPdf } = require("../utils/transcriptPdf");
 const { loadGradingSystem, getGradeForScore, getOverallResultForScore } = require("../utils/grading");
 
@@ -139,7 +139,15 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
         // underneath and is what the exam's aggregate points total
         // below is summed from, so that figure means something even
         // though the two visible columns match.
-        const subjects = exam.subjects.map((s) => {
+        const orderedSubjects = [...exam.subjects].sort((a, b) => {
+          const ca = a.subjectCode ? String(a.subjectCode).trim() : "";
+          const cb = b.subjectCode ? String(b.subjectCode).trim() : "";
+          if (ca && !cb) return -1;
+          if (!ca && cb) return 1;
+          return ca.localeCompare(cb, undefined, { numeric: true, sensitivity: "base" })
+            || String(a.subjectName).localeCompare(String(b.subjectName), undefined, { numeric: true });
+        });
+        const subjects = orderedSubjects.map((s) => {
           const band = s.percentage != null ? getGradeForScore(s.percentage, gradingSystem) : null;
           return {
             ...s,
@@ -182,6 +190,7 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
     /* ---------------- 6. Render ---------------- */
     const institution = await getInstitutionHeader(pool);
     const officials = await getSigningOfficials(pool);
+    const classTeachers = await getClassTeachers(pool);
     const title = singleExam ? singleExam.name : "Full Academic Transcript (All Exams)";
     const subtitle = scope === "class" ? `Class: ${className}`
       : scope === "student" ? `Student: ${studentPages[0].student.name}` : "All Students";
@@ -193,7 +202,7 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
       const zip = new JSZip();
       const used = new Set();
       for (const page of studentPages) {
-        const pdf = await buildTranscriptPdf({ institution, officials, title, subtitle: `Student: ${page.student.name}`, students: [page] });
+        const pdf = await buildTranscriptPdf({ institution, officials, classTeachers, title, subtitle: `Student: ${page.student.name}`, students: [page] });
         let base = slug(`${page.student.name}-${page.student.admissionNo || page.student.id}`) || `student-${page.student.id}`;
         while (used.has(base)) base += "-x";
         used.add(base);
@@ -204,7 +213,7 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
       return { ok: true, buffer, filename, contentType: "application/zip" };
     }
 
-    const buffer = await buildTranscriptPdf({ institution, officials, title, subtitle, students: studentPages });
+    const buffer = await buildTranscriptPdf({ institution, officials, classTeachers, title, subtitle, students: studentPages });
     const filenameBase = scope === "class" ? className : scope === "student" ? studentPages[0].student.name : "all-students";
     const filename = `${slug(`Transcripts-${filenameBase}-${examSlug}`)}.pdf`;
     return { ok: true, buffer, filename, contentType: "application/pdf" };

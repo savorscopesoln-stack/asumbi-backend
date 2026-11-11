@@ -111,6 +111,30 @@ async function getSigningOfficials(pool) {
   }
 }
 
+/* Class teachers (ClassTeachers table — same rows School Settings and the
+   on-screen Report Form read), each with their own uploaded signature
+   and stamp resolved to disk so transcriptPdf.js can embed them. */
+async function getClassTeachers(pool) {
+  try {
+    const result = await pool.request().query(`
+      SELECT ct.className, ct.title, ct.name, ct.teacherId, ct.signatureUrl, ct.stampUrl, t.name AS teacherName
+      FROM ClassTeachers ct
+      LEFT JOIN Teachers t ON t.id = ct.teacherId
+      ORDER BY ct.className ASC, ct.sortOrder ASC, ct.id ASC
+    `);
+    return (result.recordset || []).map((c) => ({
+      className: c.className,
+      title: c.title,
+      name: c.teacherId ? (c.teacherName || c.name) : c.name,
+      signatureDiskPath: urlToDiskPath(c.signatureUrl),
+      stampDiskPath: urlToDiskPath(c.stampUrl),
+    }));
+  } catch (err) {
+    console.error("⚠️ Could not load class teachers for report export:", err.message);
+    return [];
+  }
+}
+
 /* =========================================================================
    EXCEL
 ========================================================================= */
@@ -285,71 +309,108 @@ function drawPdfHeader(doc, institution, { examinationName, academicYear, report
   doc.moveDown(0.8);
 }
 
-/* Simple auto-paginating table: repeats the header row on every new
-   page, zebra-stripes data rows, and never lets a row's text overflow
-   past its column (§32 "do not create unreadable giant tables").
+/* Draws one line of text at an exact (x, y) inside a column of width `w`,
+   aligned left/center/right, and NEVER wrapped. pdfkit's own `width`
+   option wraps long text onto extra lines (even with lineBreak:false in
+   0.18), which is what made names and headers like "Position" / "Gender"
+   spill onto a second line and overlap the next row. Here the text is
+   measured and positioned by hand; the column widths chosen in
+   drawPdfTable guarantee it fits, and the ellipsis below is only a last
+   resort for a table too wide to fit even at the smallest font. */
+function drawCellText(doc, text, x, y, w, align) {
+  const PAD = 3;
+  let str = String(text);
+  const avail = Math.max(0, w - PAD * 2);
+  if (doc.widthOfString(str) > avail) {
+    while (str.length > 1 && doc.widthOfString(str + "…") > avail) str = str.slice(0, -1);
+    str += "…";
+  }
+  const tw = doc.widthOfString(str);
+  let tx = x + PAD;
+  if (align === "center") tx = x + (w - tw) / 2;
+  else if (align === "right") tx = x + w - PAD - tw;
+  doc.text(str, tx, y, { lineBreak: false });
+}
 
-   Column widths are measured from the actual content instead of split
-   evenly, so a column like "Name" naturally ends up wider than a short
-   one like "Position" — sized to whichever is longer, the header text
-   or the widest value in that column, then every column is scaled by
-   the same factor so the table still spans the full page edge-to-edge
-   (shrinking proportionally if the content is wider than one page,
-   growing proportionally to fill leftover space if it's narrower). */
+/* Formats a cell value for display (same rounding rules as before). */
+function formatPdfCell(val, c) {
+  if (val == null || val === "") return "-";
+  if (typeof val === "number" && (c.percent || !Number.isInteger(val))) return String(Math.floor(val + 1e-9));
+  return String(val);
+}
+
+/* Auto-paginating table: repeats the header row on every new page,
+   zebra-stripes data rows and keeps every cell on ONE line so nothing
+   wraps, overlaps or gets cut off (§32 "do not create unreadable giant
+   tables").
+
+   Column widths are measured from the real content (the longer of the
+   header or the widest value, plus padding). If that doesn't fit the
+   page, the font is stepped down (7.5pt → 5pt) until it does, so wide
+   reports such as the Nominal Roll (one column per subject) stay fully
+   visible with the full name on one line. Leftover space is shared out
+   proportionally so the table still spans the page edge to edge.
+   Number-like columns are centred, text columns (names…) left-aligned. */
 function drawPdfTable(doc, { columns, rows, theme }) {
   const pageLeft = doc.page.margins.left;
   const pageRight = doc.page.width - doc.page.margins.right;
   const usableWidth = pageRight - pageLeft;
   const rowHeight = 16;
-  const CELL_PADDING = 8;   // ~3px each side plus a little breathing room
-  const MIN_COL_WIDTH = 34; // never let a column collapse to unreadable
+  const CELL_PADDING = 8;
 
-  doc.fontSize(7.5);
-  const natural = columns.map((c) => {
-    doc.font("Helvetica-Bold");
+  const aligns = columns.map((c) => {
+    if (c.align) return c.align;
+    const numeric = rows.length > 0 && rows.every((r) => {
+      const v = r[c.key];
+      return v == null || v === "" || /^[\d.,%\s\-—–]+$/.test(String(v));
+    });
+    return numeric ? "center" : "left";
+  });
+
+  const measure = (fs) => columns.map((c) => {
+    doc.fontSize(fs).font("Helvetica-Bold");
     let max = doc.widthOfString(String(c.header ?? ""));
     doc.font("Helvetica");
     rows.forEach((row) => {
-      const val = row[c.key];
-      const text = val == null || val === "" ? "-" : String(val);
-      const w = doc.widthOfString(text);
+      const w = doc.widthOfString(formatPdfCell(row[c.key], c));
       if (w > max) max = w;
     });
-    return Math.max(MIN_COL_WIDTH, max + CELL_PADDING);
+    return max + CELL_PADDING;
   });
+
+  let fontSize = 7.5;
+  let natural = measure(fontSize);
+  while (natural.reduce((s, w) => s + w, 0) > usableWidth && fontSize > 5) {
+    fontSize = Math.max(5, fontSize - 0.25);
+    natural = measure(fontSize);
+  }
   const naturalTotal = natural.reduce((s, w) => s + w, 0);
-  const scale = naturalTotal > 0 ? usableWidth / naturalTotal : 1;
+  // Small tables (a couple of short columns) would look silly stretched
+  // across a landscape page with the value flung to the far right, so
+  // they get a compact width and are centred; wide ones span the page.
+  const tableWidth = naturalTotal >= usableWidth * 0.7
+    ? usableWidth
+    : Math.min(usableWidth, Math.max(naturalTotal * 1.5, 280));
+  const tableLeft = pageLeft + (usableWidth - tableWidth) / 2;
+  const scale = naturalTotal > 0 ? tableWidth / naturalTotal : 1;
   const colWidths = natural.map((w) => w * scale);
+  const textY = (top) => top + (rowHeight - fontSize) / 2 - 0.5;
 
   let y = doc.y;
 
   const drawHeaderRow = () => {
-    doc.rect(pageLeft, y, usableWidth, rowHeight).fill(theme.primary);
-    doc.fillColor(theme.onPrimary).fontSize(7.5).font("Helvetica-Bold");
-    let x = pageLeft;
+    doc.rect(tableLeft, y, tableWidth, rowHeight).fill(theme.primary);
+    doc.fillColor(theme.onPrimary).fontSize(fontSize).font("Helvetica-Bold");
+    let x = tableLeft;
     columns.forEach((c, i) => {
-      // lineBreak:false + ellipsis — every cell in this table is drawn at
-      // an absolute (x, y) the row loop below computes by hand, on the
-      // assumption every cell is exactly one line tall (rowHeight=16).
-      // Without this, pdfkit wraps any header/value wider than its
-      // column onto extra lines using its OWN auto-pagination — which
-      // silently inserts a page break mid-row when that wrapped text
-      // would run past the bottom margin, leaving the manual row loop's
-      // page-break check below out of sync with the real page count and
-      // producing stray near-blank pages in wide tables (e.g. the
-      // Nominal Roll, with one column per subject). Truncating to a
-      // single line keeps this loop the only thing that ever paginates.
-      doc.text(c.header, x + 3, y + 4, { width: colWidths[i] - 6, align: c.align || "left", lineBreak: false, ellipsis: true });
+      drawCellText(doc, c.header ?? "", x, textY(y), colWidths[i], aligns[i]);
       x += colWidths[i];
     });
     doc.fillColor("#000").font("Helvetica");
     y += rowHeight;
   };
 
-  // Guard against an orphaned header row: if a heading/subtitle drawn
-  // just above (see buildReportPdf) left less than one row's worth of
-  // room at the bottom of the page, start the table on a fresh page
-  // instead of drawing a header row with no data rows visibly under it.
+  // Don't leave an orphaned header row at the bottom of a page.
   if (y + rowHeight > doc.page.height - doc.page.margins.bottom - 20) {
     doc.addPage();
     y = doc.page.margins.top;
@@ -358,8 +419,9 @@ function drawPdfTable(doc, { columns, rows, theme }) {
   drawHeaderRow();
 
   if (!rows.length) {
-    doc.fontSize(9).fillColor("#777").text("No data available.", pageLeft, y + 6);
+    doc.fontSize(9).fillColor("#777").text("No data available.", pageLeft, y + 6, { width: usableWidth, align: "center" });
     doc.fillColor("#000");
+    doc.x = pageLeft;
     doc.y = y + rowHeight + 10;
     return;
   }
@@ -371,27 +433,21 @@ function drawPdfTable(doc, { columns, rows, theme }) {
       drawHeaderRow();
     }
     if (idx % 2 === 1) {
-      doc.rect(pageLeft, y, usableWidth, rowHeight).fill(theme.zebra);
-      doc.fillColor("#000");
+      doc.rect(tableLeft, y, tableWidth, rowHeight).fill(theme.zebra);
     }
-    doc.fontSize(7.5).font("Helvetica");
-    let x = pageLeft;
+    doc.fillColor("#000").fontSize(fontSize).font("Helvetica");
+    let x = tableLeft;
     columns.forEach((c, i) => {
-      const val = row[c.key];
-      // Same lineBreak:false / ellipsis reasoning as drawHeaderRow above —
-      // keep every value cell to the single line rowHeight already
-      // budgets for it, so pdfkit never auto-paginates mid-row.
-      const shown = val == null || val === ""
-        ? "-"
-        : (typeof val === "number" && (c.percent || !Number.isInteger(val)))
-          ? String(Math.floor(val + 1e-9))
-          : String(val);
-      doc.text(shown, x + 3, y + 4, { width: colWidths[i] - 6, align: c.align || "left", lineBreak: false, ellipsis: true });
+      drawCellText(doc, formatPdfCell(row[c.key], c), x, textY(y), colWidths[i], aligns[i]);
       x += colWidths[i];
     });
     y += rowHeight;
   });
 
+  // pdfkit's text cursor is left at the last cell's x; put it back at the
+  // left margin so whatever is drawn next (a section heading, a note)
+  // starts where the page starts instead of in the far-right column.
+  doc.x = pageLeft;
   doc.y = y + 10;
 }
 
@@ -561,19 +617,31 @@ function buildReportPdf({ institution, examinationName, academicYear, reportTitl
       if (section.heading && doc.y + 60 > doc.page.height - doc.page.margins.bottom) {
         doc.addPage();
       }
+      // Always draw from the left margin across the full content width:
+      // pdfkit keeps its text cursor wherever the last cell/column left
+      // it, which used to push headings into a narrow strip at the far
+      // right of the page.
+      const left = doc.page.margins.left;
+      const fullWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
+      doc.x = left;
       if (section.heading) {
-        doc.fontSize(10).font("Helvetica-Bold").text(section.heading);
+        doc.fontSize(10).font("Helvetica-Bold").fillColor("#000").text(section.heading, left, doc.y, { width: fullWidth, align: "center" });
         doc.moveDown(0.3);
       }
       if (section.text) {
-        doc.fontSize(9).font("Helvetica").text(section.text);
+        doc.fontSize(9).font("Helvetica").fillColor("#555").text(section.text, left, doc.y, { width: fullWidth, align: "center" });
+        doc.fillColor("#000");
         doc.moveDown(0.3);
       }
+      doc.x = left;
       if (section.timetable) {
         drawTimetablePdf(doc, section.timetable, theme);
-      } else if (section.columns) {
+      } else if (section.columns && !(section.text && !(section.rows || []).length)) {
+        // a section that already says why it's empty (e.g. "Unavailable —
+        // no grading scale…") doesn't also need an empty table under it
         drawPdfTable(doc, { columns: section.columns, rows: section.rows || [], theme });
       }
+      doc.x = left;
     });
 
     addPageNumbers(doc);
@@ -590,6 +658,7 @@ function sendPdfBuffer(res, buffer, filename) {
 module.exports = {
   getInstitutionHeader,
   getSigningOfficials,
+  getClassTeachers,
   buildReportWorkbook,
   sendExcelBuffer,
   buildReportPdf,

@@ -48,6 +48,15 @@ async function loadExamHeaderInfo(pool, mainExamId) {
   return result.recordset[0] || { name: "", academic_year: "" };
 }
 
+/* "Total marks" cell for a candidate: marks obtained out of the marks
+   possible across the papers they sat, e.g. "1400/1700". Shown just
+   before the mean/average so the percentage can be checked at a glance. */
+function fmtTotal(obtained, possible) {
+  if (obtained == null || possible == null || !(possible > 0)) return "—";
+  const f = (n) => String(Math.round(Number(n) * 100) / 100);
+  return `${f(obtained)}/${f(possible)}`;
+}
+
 const slug = (s) => String(s || "report").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
 
 /* Per-subject mark columns/values, shared by every report that lines a
@@ -121,7 +130,38 @@ function buildTimetableDays(list) {
   });
 }
 
+/* Subject Analysis columns/rows — shared by the Summary export and the
+   standalone Subject Analysis report so the two can never drift apart. */
+const subjectAnalysisCols = [
+  { header: "Rank", key: "rank", width: 7 },
+  { header: "Code", key: "code", width: 10 },
+  { header: "Subject", key: "subject", width: 24 },
+  { header: "Registered", key: "registered", width: 11 },
+  { header: "Sat", key: "sat", width: 7 },
+  { header: "Absent", key: "absent", width: 8 },
+  { header: "Mean (%)", key: "mean", width: 10, percent: true },
+  { header: "Median (%)", key: "median", width: 10, percent: true },
+  { header: "Highest (%)", key: "highest", width: 11, percent: true },
+  { header: "Top Student", key: "highest_student", width: 28 },
+  { header: "Lowest (%)", key: "lowest", width: 10, percent: true },
+  { header: "Lowest Student", key: "lowest_student", width: 28 },
+  { header: "Std Dev", key: "std_dev", width: 8 },
+  { header: "Pass Rate (%)", key: "pass_rate", width: 12, percent: true },
+  { header: "Best Class", key: "best_class", width: 14 },
+];
+const subjectAnalysisRows = (list) => (list || []).map((r) => ({ ...r, rank: r.rank ?? "—" }));
+
 const SHAPES = {
+  subjectAnalysis(data) {
+    const rows = subjectAnalysisRows(data.subject_analysis);
+    const note = !rows.length ? "No subjects with an attached assessment yet." : null;
+    return {
+      title: "Subject Analysis",
+      excelSheets: [{ name: "Subject Analysis", title: "Subject Analysis — Subjects Ranked by Mean", columns: subjectAnalysisCols, rows, note }],
+      pdfSections: [{ columns: subjectAnalysisCols, rows, text: note || undefined }],
+    };
+  },
+
   summary(data) {
     const cs = data.candidate_stats || {};
     const perf = data.performance || {};
@@ -171,6 +211,7 @@ const SHAPES = {
       // table is what makes that unambiguous — never ship the codes
       // without it (§51).
       ...nominalSubjects.map((s, i) => ({ header: s.code || s.subject, key: `subj_${i}`, width: 12 })),
+      { header: "Total", key: "total_marks", width: 14 },
       { header: "Average %", key: "average_percentage", width: 10, percent: true },
     ];
     const nominalRows = (nr.rows || []).map((r) => subjectMarkValues(r.marks, {
@@ -178,6 +219,7 @@ const SHAPES = {
       admission_no: r.admission_no,
       gender: r.gender || "—",
       name: r.name,
+      total_marks: fmtTotal(r.total_obtained, r.total_possible),
       average_percentage: r.average_percentage,
     }));
 
@@ -198,6 +240,7 @@ const SHAPES = {
       { header: "Name", key: "name", width: 26 },
       { header: "Class", key: "class", width: 14 },
       ...subjectMarkColumns(nominalSubjects),
+      { header: "Total", key: "total_marks", width: 14 },
       { header: "Mean (%)", key: "average_percentage", width: 12, percent: true },
     ];
     const overallRows = (data.overall_ranking || []).map((r) => subjectMarkValues(r.marks, {
@@ -205,6 +248,7 @@ const SHAPES = {
       admission_no: r.admission_no,
       name: r.name,
       class: r.class,
+      total_marks: fmtTotal(r.total_obtained, r.total_possible),
       average_percentage: r.average_percentage,
     }));
 
@@ -249,6 +293,7 @@ const SHAPES = {
       { header: "Name", key: "name", width: 26 },
       { header: "Class", key: "class", width: 14 },
       ...subjectMarkColumns(nominalSubjects),
+      { header: "Total", key: "total_marks", width: 14 },
       { header: "Mean (%)", key: "average_percentage", width: 12, percent: true },
     ];
     const classRankingRows = (data.class_ranking || []).map((r) => subjectMarkValues(r.marks, {
@@ -256,6 +301,7 @@ const SHAPES = {
       admission_no: r.admission_no,
       name: r.name,
       class: r.class,
+      total_marks: fmtTotal(r.total_obtained, r.total_possible),
       average_percentage: r.average_percentage,
     }));
 
@@ -265,6 +311,7 @@ const SHAPES = {
         { name: "Candidate Stats", title: "Candidate Statistics", columns: overviewCols, rows: overviewRows },
         { name: "Performance", title: "Overall Performance", columns: overviewCols, rows: perfRows },
         { name: "Subject Summary", title: "Performance by Subject", columns: subjectCols, rows: subjectRows },
+        { name: "Subject Analysis", title: "Subject Analysis — Subjects Ranked by Mean", columns: subjectAnalysisCols, rows: subjectAnalysisRows(data.subject_analysis), note: !(data.subject_analysis || []).length ? "No subjects with an attached assessment yet." : null },
         { name: "Class Performance", title: "Class Performance", columns: classCols, rows: classRows, note: !classRows.length ? "No registered candidates found." : null },
         { name: "Gender Analysis", title: "Gender Analysis", columns: genderCols, rows: genderRows, note: !genderRows.length ? "No registered candidates found." : null },
         { name: "Class Ranking", title: "Class Performance Ranking", columns: classRankingCols, rows: classRankingRows, note: !classRankingRows.length ? "No candidates have been scored yet." : null },
@@ -277,6 +324,7 @@ const SHAPES = {
         { heading: "Candidate Statistics", columns: overviewCols, rows: overviewRows },
         { heading: "Overall Performance", columns: overviewCols, rows: perfRows },
         { heading: "Performance by Subject", columns: subjectCols, rows: subjectRows },
+        { heading: "Subject Analysis — Subjects Ranked by Mean", columns: subjectAnalysisCols, rows: subjectAnalysisRows(data.subject_analysis), text: !(data.subject_analysis || []).length ? "No subjects with an attached assessment yet." : undefined },
         { heading: "Class Performance", columns: classCols, rows: classRows },
         { heading: "Gender Analysis", columns: genderCols, rows: genderRows },
         { heading: "Class Performance Ranking", columns: classRankingCols, rows: classRankingRows },
@@ -315,6 +363,9 @@ const SHAPES = {
     const infoRows = [
       { label: "Student", value: data.student?.name },
       { label: "Admission No", value: data.student?.admission_no },
+      { label: "Total Marks", value: fmtTotal(
+          (data.subjects || []).filter((x) => x.score != null).reduce((a, x) => a + Number(x.score), 0),
+          (data.subjects || []).filter((x) => x.score != null).reduce((a, x) => a + Number(x.total_marks || 0), 0)) },
       { label: "Overall Average", value: data.overall_average != null ? `${data.overall_average}%` : "Not enough data" },
       { label: "Subjects Completed", value: data.subjects_completed },
       { label: "Subjects Absent", value: data.subjects_absent },
@@ -346,11 +397,11 @@ const SHAPES = {
       { header: "Admission No", key: "admission_no", width: 16 },
       { header: "Name", key: "name", width: 24 },
       ...subjectList.map((s, i) => ({ header: s.subject, key: `subj_${i}`, width: 14 })),
-      { header: "Total", key: "total_marks_obtained", width: 10 },
+      { header: "Total", key: "total_marks_obtained", width: 14 },
       { header: "Average %", key: "average_percentage", width: 12, percent: true },
     ];
     const rows = (data.rows || []).map((r) => {
-      const flat = { admission_no: r.admission_no, name: r.name, total_marks_obtained: r.total_marks_obtained, average_percentage: r.average_percentage };
+      const flat = { admission_no: r.admission_no, name: r.name, total_marks_obtained: fmtTotal(r.total_marks_obtained, r.total_marks_possible), average_percentage: r.average_percentage };
       (r.subjects || []).forEach((s, i) => { flat[`subj_${i}`] = s.score ?? "-"; });
       return flat;
     });
@@ -477,6 +528,7 @@ const SHAPES = {
       { header: "Name", key: "name", width: 26 },
       { header: "Class", key: "class", width: 14 },
       ...subjectMarkColumns(nominalSubjects),
+      { header: "Total", key: "total_marks", width: 14 },
       { header: "Mean (%)", key: "average_percentage", width: 12, percent: true },
     ];
     const rows = (data.class_ranking || []).map((r) => subjectMarkValues(r.marks, {
@@ -484,6 +536,7 @@ const SHAPES = {
       admission_no: r.admission_no,
       name: r.name,
       class: r.class,
+      total_marks: fmtTotal(r.total_obtained, r.total_possible),
       average_percentage: r.average_percentage,
     }));
     return {
@@ -505,6 +558,7 @@ const SHAPES = {
       { header: "Name", key: "name", width: 26 },
       { header: "Class", key: "class", width: 14 },
       ...subjectMarkColumns(nominalSubjects),
+      { header: "Total", key: "total_marks", width: 14 },
       { header: "Mean (%)", key: "average_percentage", width: 12, percent: true },
     ];
     const rows = (data.overall_ranking || []).map((r) => subjectMarkValues(r.marks, {
@@ -512,6 +566,7 @@ const SHAPES = {
       admission_no: r.admission_no,
       name: r.name,
       class: r.class,
+      total_marks: fmtTotal(r.total_obtained, r.total_possible),
       average_percentage: r.average_percentage,
     }));
     return {
@@ -530,6 +585,7 @@ const SHAPES = {
 ------------------------------------------------------------------------- */
 const REPORTS = {
   summary: { handler: getSummaryReport, params: ["mainExamId"], shape: SHAPES.summary },
+  "subject-analysis": { handler: getSummaryReport, params: ["mainExamId"], shape: SHAPES.subjectAnalysis },
   "class-ranking": { handler: getSummaryReport, params: ["mainExamId"], shape: SHAPES.classRanking },
   "overall-performance": { handler: getSummaryReport, params: ["mainExamId"], shape: SHAPES.overallPerformance },
   "subject-results": { handler: getSubjectResultsReport, params: ["mainExamId", "subjectId"], shape: SHAPES.subjectResults },

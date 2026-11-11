@@ -6,6 +6,7 @@ const {
   loadNominalRoll,
   computeClassPerformance,
   computeGenderPerformance,
+  computeSubjectAnalysis,
 } = require("./mainExamAnalytics.controller");
 
 /* =========================================================================
@@ -98,6 +99,8 @@ const getSummaryReport = async (req, res) => {
         admission_no: r.admission_no,
         name: r.name,
         class: r.class,
+        total_obtained: r.total_obtained,
+        total_possible: r.total_possible,
         average_percentage: r.average_percentage,
         marks: r.marks,
       }))
@@ -109,6 +112,10 @@ const getSummaryReport = async (req, res) => {
     // exam-wide pass rate shown above it.
     const classPerformance = computeClassPerformance(nominalRoll.rows || [], data.performance.pass_mark);
     const genderPerformance = computeGenderPerformance(nominalRoll.rows || [], data.performance.pass_mark);
+    // Subject Analysis — every subject ranked by its mean, with highest /
+    // lowest candidate and the other relevant stats, from the same Nominal
+    // Roll rows (§51).
+    const subjectAnalysis = computeSubjectAnalysis(nominalRoll, data.performance.pass_mark);
 
     // Class Performance Ranking — every scored candidate, ranked WITHIN
     // their own class/stream (class_position, from loadNominalRoll's
@@ -129,6 +136,8 @@ const getSummaryReport = async (req, res) => {
         admission_no: r.admission_no,
         name: r.name,
         class: r.class,
+        total_obtained: r.total_obtained,
+        total_possible: r.total_possible,
         average_percentage: r.average_percentage,
         marks: r.marks,
       }))
@@ -151,6 +160,7 @@ const getSummaryReport = async (req, res) => {
       overall_ranking: overallRanking,
       class_performance: classPerformance,
       gender_performance: genderPerformance,
+      subject_analysis: subjectAnalysis,
       class_ranking: classRanking,
       nominal_roll: nominalRoll,
     });

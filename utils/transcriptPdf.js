@@ -270,81 +270,117 @@ function drawCumulativeSummary(doc, page, theme) {
   doc.y += 26;
 }
 
-/* Signature / official-stamp block, the same "Signed / Dean of
-   Curriculum / For: Chief Principal" + stamp shape the sample
-   transcript closes with, drawn once per student record (not per
-   exam) since the whole page is that student's one signed document.
-   Officials come from SchoolOfficials (isSignatory rows only, in
-   sortOrder) so this never hand-codes a name/title. */
-function drawSignatureBlock(doc, officials, institution, theme) {
+/* Signature / stamp block — mirrors the on-screen Report Form's
+   authorisation section (frontend/src/pages/reports.jsx) so every stamp
+   and signature shown there also appears on the downloaded transcript:
+     1. one "Class Teacher's Remarks" row per class teacher of THIS
+        student's class (name, own uploaded signature, own stamp);
+     2. one "Approval & Authentication" row per signatory (name, title,
+        own uploaded signature, own stamp).
+   A stamp falls back to the school-wide stamp when the person hasn't
+   uploaded their own (same fallback as the form), and a plain dashed
+   placeholder is drawn only when no stamp exists anywhere. */
+function drawImageFit(doc, diskPath, x, y, w, h) {
+  if (!diskPath) return false;
+  try {
+    doc.image(diskPath, x, y, { fit: [w, h], align: "left", valign: "center" });
+    return true;
+  } catch (err) {
+    console.error("⚠️ Could not embed image in transcript PDF:", err.message);
+    return false;
+  }
+}
+
+function drawStampOrPlaceholder(doc, diskPath, x, y, size) {
+  if (drawImageFit(doc, diskPath, x, y, size, size)) return;
+  const cx = x + size / 2;
+  const cy = y + size / 2;
+  doc.circle(cx, cy, size / 2 - 1).dash(3, { space: 2 }).strokeColor("#bbb").stroke();
+  doc.undash();
+  doc.fontSize(7).font("Helvetica-Bold").fillColor("#bbb")
+    .text("OFFICIAL\nSTAMP", x, cy - 8, { width: size, align: "center" });
+  doc.fillColor("#000");
+}
+
+function drawSignatureBlock(doc, officials, institution, theme, classTeachers = []) {
   const pageLeft = doc.page.margins.left;
   const pageRight = doc.page.width - doc.page.margins.right;
   const usableWidth = pageRight - pageLeft;
-  const blockH = 90;
-  if (doc.y + blockH > doc.page.height - doc.page.margins.bottom) doc.addPage();
+  const stampSize = 74;
+  const sigBoxW = 150;
+  const sigBoxH = 34;
+  const schoolStamp = institution.stampDiskPath;
+  const bottomLimit = () => doc.page.height - doc.page.margins.bottom;
+  const stampX = pageRight - stampSize;
+
+  const ensureRoom = (h) => { if (doc.y + h > bottomLimit()) doc.addPage(); };
 
   doc.moveDown(0.4);
+  ensureRoom(40);
   doc.moveTo(pageLeft, doc.y).lineTo(pageRight, doc.y).strokeColor(theme.rule).stroke();
   doc.moveDown(0.6);
 
-  const sigX = pageLeft;
-  const sigWidth = usableWidth * 0.62;
-  const stampX = pageLeft + sigWidth + 20;
-  const stampSize = 70;
-  const topY = doc.y;
+  // One row: label, name, optional title, signature image over a line,
+  // date, and the stamp at the right-hand edge.
+  const drawRow = ({ label, name, title, signatureDiskPath, stampDiskPath, remarks }) => {
+    const rowH = remarks ? 118 : 88;
+    ensureRoom(rowH);
+    const topY = doc.y;
+    const lineW = usableWidth - stampSize - 24;
 
-  // Signing officials — first is the primary signature line, any
-  // further ones ("For: <title>") listed underneath, matching the
-  // sample's "SIGNED: ... / Kaunda, K.M / Dean of Curriculum / For:
-  // Chief Principal" stack.
-  doc.fontSize(7.5).font("Helvetica-Bold").fillColor("#777").text("SIGNED", sigX, topY);
-  let sy = topY + 12;
-  doc.moveTo(sigX, sy + 14).lineTo(sigX + sigWidth * 0.5, sy + 14).strokeColor("#999").stroke();
-  sy += 22;
+    doc.fontSize(7.5).font("Helvetica-Bold").fillColor("#777").text(label.toUpperCase(), pageLeft, topY, { width: lineW, lineBreak: false });
+    let y = topY + 12;
+    if (remarks) {
+      doc.rect(pageLeft, y, lineW, 26).dash(3, { space: 2 }).strokeColor("#cbd5e1").stroke();
+      doc.undash();
+      doc.fontSize(7.5).font("Helvetica").fillColor("#999")
+        .text("Remarks and recommendations.", pageLeft + 6, y + 8, { width: lineW - 12, lineBreak: false });
+      y += 34;
+    }
+    doc.fontSize(9.5).font("Helvetica-Bold").fillColor("#000").text(name || "—", pageLeft, y, { width: lineW * 0.55, lineBreak: false });
+    if (title) doc.fontSize(8).font("Helvetica").fillColor("#555").text(title, pageLeft, y + 12, { width: lineW * 0.55, lineBreak: false });
+
+    // signature image sits on the line, to the right of the name
+    const sigX = pageLeft + lineW * 0.58;
+    const lineY = y + 34;
+    drawImageFit(doc, signatureDiskPath, sigX, lineY - sigBoxH - 1, sigBoxW, sigBoxH);
+    doc.moveTo(sigX, lineY).lineTo(sigX + sigBoxW, lineY).strokeColor("#999").stroke();
+    doc.fontSize(7).font("Helvetica").fillColor("#777").text("Signature", sigX, lineY + 2, { width: sigBoxW, lineBreak: false });
+
+    doc.fontSize(7).font("Helvetica").fillColor("#777").text("Date", pageLeft, lineY + 2, { lineBreak: false });
+    doc.moveTo(pageLeft + 24, lineY).lineTo(pageLeft + 24 + 90, lineY).strokeColor("#999").stroke();
+
+    drawStampOrPlaceholder(doc, stampDiskPath || schoolStamp, stampX, topY + 4, stampSize);
+    doc.fillColor("#000");
+    doc.x = pageLeft;
+    doc.y = topY + rowH;
+  };
+
+  classTeachers.forEach((ct) => drawRow({
+    label: ct.title ? `${ct.title}'s Remarks` : "Class Teacher's Remarks",
+    name: ct.name,
+    signatureDiskPath: ct.signatureDiskPath,
+    stampDiskPath: ct.stampDiskPath,
+    remarks: true,
+  }));
 
   if (officials.length) {
-    officials.forEach((o, i) => {
-      doc.fontSize(9.5).font("Helvetica-Bold").fillColor("#000")
-        .text(i === 0 ? (o.name || "—") : `For: ${o.title || "—"}`, sigX, sy, { width: sigWidth });
-      if (i === 0 && o.title) {
-        sy += 12;
-        doc.fontSize(8).font("Helvetica").fillColor("#555").text(o.title, sigX, sy, { width: sigWidth });
-      }
-      sy += 13;
-    });
+    officials.forEach((o) => drawRow({
+      label: "Approval & Authentication",
+      name: o.name,
+      title: o.title,
+      signatureDiskPath: o.signatureDiskPath,
+      stampDiskPath: o.stampDiskPath,
+    }));
   } else {
-    doc.fontSize(8).font("Helvetica").fillColor("#777").text("—", sigX, sy, { width: sigWidth });
+    drawRow({ label: "Approval & Authentication", name: "—", stampDiskPath: schoolStamp });
   }
 
-  doc.fontSize(7.5).font("Helvetica-Bold").fillColor("#777")
-    .text("DATE", sigX, topY, { width: sigWidth, align: "right" });
-  doc.fontSize(9).font("Helvetica").fillColor("#000")
-    .text(new Date().toLocaleDateString(), sigX, topY + 12, { width: sigWidth, align: "right" });
-
-  // Official stamp — prefer the primary signer's OWN uploaded stamp
-  // (SchoolOfficials.stampUrl, set in School Settings), falling back to
-  // the single school-wide stamp (SchoolSettings.stampUrl) for officials
-  // who haven't uploaded a personal one, and finally to the same plain
-  // dashed-circle placeholder convention the on-screen transcript/report
-  // views already use rather than leaving the space blank.
-  const stampDiskPath = officials[0]?.stampDiskPath || institution.stampDiskPath;
-  if (stampDiskPath) {
-    try {
-      doc.image(stampDiskPath, stampX, topY, { width: stampSize, height: stampSize });
-    } catch (err) {
-      console.error("⚠️ Could not embed stamp in transcript PDF:", err.message);
-    }
-  } else {
-    const cx = stampX + stampSize / 2;
-    const cy = topY + stampSize / 2;
-    doc.circle(cx, cy, stampSize / 2).dash(3, { space: 2 }).strokeColor("#bbb").stroke();
-    doc.undash();
-    doc.fontSize(7).font("Helvetica-Bold").fillColor("#bbb")
-      .text("OFFICIAL\nSTAMP", stampX, cy - 8, { width: stampSize, align: "center" });
-  }
+  doc.fontSize(7).font("Helvetica").fillColor("#777")
+    .text(`Date: ${new Date().toLocaleDateString()}`, pageLeft, doc.y, { width: usableWidth, align: "right", lineBreak: false });
   doc.fillColor("#000");
-
-  doc.y = topY + Math.max(sy - topY, stampSize) + 8;
+  doc.x = pageLeft;
+  doc.y += 10;
 }
 
 function addPageNumbers(doc) {
@@ -371,9 +407,11 @@ function addPageNumbers(doc) {
    transcript.controller.js; `title`/`subtitle` describe the exam
    scope and class/audience scope for the header on every page.
    `officials` is the school's signing officials (see file header). */
-function buildTranscriptPdf({ institution, officials, title, subtitle, students }) {
+function buildTranscriptPdf({ institution, officials, classTeachers, title, subtitle, students }) {
   const theme = resolveReportTheme(institution?.reportTheme);
   const signers = Array.isArray(officials) ? officials : [];
+  const allClassTeachers = Array.isArray(classTeachers) ? classTeachers : [];
+  const norm = (v) => String(v || "").trim().toLowerCase();
   return new Promise((resolve, reject) => {
     const doc = new PDFDocument({ layout: "portrait", margin: PAGE_MARGIN, size: "A4", bufferPages: true });
     const chunks = [];
@@ -388,7 +426,8 @@ function buildTranscriptPdf({ institution, officials, title, subtitle, students 
       drawStudentInfo(doc, page.student);
       page.exams.forEach((exam) => drawExamTable(doc, exam, theme));
       drawCumulativeSummary(doc, page, theme);
-      drawSignatureBlock(doc, signers, institution, theme);
+      const classTeachersForStudent = allClassTeachers.filter((c) => norm(c.className) === norm(page.student.studentClass));
+      drawSignatureBlock(doc, signers, institution, theme, classTeachersForStudent);
       doc.fontSize(7).fillColor("#999").text(`Generated: ${new Date().toLocaleString()}`, { align: "right" });
       doc.fillColor("#000");
     });

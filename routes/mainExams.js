@@ -155,6 +155,7 @@ router.get("/:mainExamId/reports/summary", getSummaryReport);
 // overall_ranking — §51, one computation, never a second query) so
 // these can be viewed/downloaded as their own reports without
 // duplicating getSummaryReport's SQL.
+router.get("/:mainExamId/reports/subject-analysis", getSummaryReport);
 router.get("/:mainExamId/reports/class-ranking", getSummaryReport);
 router.get("/:mainExamId/reports/overall-performance", getSummaryReport);
 router.get("/:mainExamId/reports/timetable", getTimetable);
@@ -174,6 +175,8 @@ router.get("/:mainExamId/reports/students/:studentId/schedule", getCandidateSche
    so a downloaded file is always consistent with the on-screen report. */
 router.get("/:mainExamId/reports/summary/excel", buildExportHandler("summary", "excel"));
 router.get("/:mainExamId/reports/summary/pdf", buildExportHandler("summary", "pdf"));
+router.get("/:mainExamId/reports/subject-analysis/excel", buildExportHandler("subject-analysis", "excel"));
+router.get("/:mainExamId/reports/subject-analysis/pdf", buildExportHandler("subject-analysis", "pdf"));
 router.get("/:mainExamId/reports/class-ranking/excel", buildExportHandler("class-ranking", "excel"));
 router.get("/:mainExamId/reports/class-ranking/pdf", buildExportHandler("class-ranking", "pdf"));
 router.get("/:mainExamId/reports/overall-performance/excel", buildExportHandler("overall-performance", "excel"));

@@ -109,7 +109,25 @@ async function loadSubjectsWithAssessment(pool, mainExaminationId) {
       WHERE ess.main_examination_id = @mainExaminationId
       ORDER BY ess.start_time ASC, ess.id ASC
     `);
-  return result.recordset;
+  // Every report lists subjects by subject code, lowest to highest. Codes
+  // are derived from the subjects that have a paper attached (exactly the
+  // subset every report uses), then the whole list is ordered by them;
+  // subjects with no paper (no code) follow, alphabetically.
+  const rows = result.recordset;
+  const codes = assignSubjectCodes(rows.filter((s) => s.e_assessment_id));
+  return rows
+    .map((s, i) => ({ s, i, code: codes.get(s.session_id) || null }))
+    .sort((a, b) => compareSubjectCodes(a.code, b.code) || String(a.s.subject || "").localeCompare(String(b.s.subject || ""), undefined, { numeric: true }) || a.i - b.i)
+    .map((x) => x.s);
+}
+
+// Ascending by code; numbers compare as numbers ("9811" < "9812" < "9822E"
+// < "9824A"); a missing code sorts last.
+function compareSubjectCodes(a, b) {
+  if (a && !b) return -1;
+  if (!a && b) return 1;
+  if (!a && !b) return 0;
+  return String(a).localeCompare(String(b), undefined, { numeric: true, sensitivity: "base" });
 }
 
 /* =========================================================================
@@ -409,6 +427,92 @@ function computeClassPerformance(rows, passMark) {
   return out;
 }
 
+// Subject Analysis — one row per subject, ranked best mean first. Built
+// from the SAME Nominal Roll rows every other roll-up uses (§51), so a
+// subject's figures here always match the marks shown in the roll. Uses
+// each candidate's exact score / total_marks (not the already-rounded
+// percentage) so the mean isn't biased low by rounding, then rounds the
+// results down to whole numbers like every other figure in the reports.
+// `passMark` is the exam's configured pass mark (same as the summary's).
+// Ties share a rank (1, 2, 2, 4); subjects nobody has been scored in yet
+// are listed last, unranked.
+function computeSubjectAnalysis(roll, passMark) {
+  const subjects = (roll && roll.subjects) || [];
+  const rows = (roll && roll.rows) || [];
+  const namesOf = (list) => {
+    const names = list.map((x) => x.r.name).filter(Boolean);
+    return names.length > 2 ? `${names.slice(0, 2).join(", ")} +${names.length - 2} more` : names.join(", ");
+  };
+  const out = subjects.map((subj, i) => {
+    const entered = rows.filter((r) => r.marks && r.marks[i] && !r.marks[i].not_registered);
+    const scored = entered
+      .filter((r) => r.marks[i].score != null && r.marks[i].total_marks > 0)
+      .map((r) => ({ r, score: Number(r.marks[i].score), p: (Number(r.marks[i].score) / r.marks[i].total_marks) * 100 }));
+    const n = scored.length;
+    const ps = scored.map((x) => x.p).sort((a, b) => a - b);
+    const mean = n ? ps.reduce((s, v) => s + v, 0) / n : null;
+    const median = n ? (n % 2 ? ps[(n - 1) / 2] : (ps[n / 2 - 1] + ps[n / 2]) / 2) : null;
+    const std = n > 1 ? Math.sqrt(ps.reduce((s, v) => s + (v - mean) ** 2, 0) / (n - 1)) : null;
+    const maxP = n ? ps[n - 1] : null;
+    const minP = n ? ps[0] : null;
+    const top = scored.filter((x) => x.p === maxP);
+    const bottom = scored.filter((x) => x.p === minP);
+
+    // Best-performing class in this subject (by that class's mean).
+    const byClass = new Map();
+    scored.forEach((x) => {
+      if (!x.r.class) return;
+      if (!byClass.has(x.r.class)) byClass.set(x.r.class, []);
+      byClass.get(x.r.class).push(x.p);
+    });
+    let bestClass = null, bestClassMean = null;
+    byClass.forEach((list, cls) => {
+      const m = list.reduce((s, v) => s + v, 0) / list.length;
+      if (bestClassMean == null || m > bestClassMean) { bestClass = cls; bestClassMean = m; }
+    });
+
+    return {
+      session_id: subj.session_id,
+      code: subj.code,
+      subject: subj.subject,
+      total_marks: subj.total_marks,
+      registered: entered.length,
+      sat: n,
+      absent: entered.length - n,
+      mean: round2(mean),
+      median: round2(median),
+      highest: round2(maxP),
+      highest_score: top.length ? top[0].score : null,
+      highest_student: top.length ? namesOf(top) : null,
+      lowest: round2(minP),
+      lowest_score: bottom.length ? bottom[0].score : null,
+      lowest_student: bottom.length ? namesOf(bottom) : null,
+      range: n ? round2(maxP - minP) : null,
+      std_dev: std != null ? round2(std) : null,
+      pass_rate: n ? pct(ps.filter((v) => v >= passMark).length, n) : null,
+      best_class: bestClass,
+      best_class_mean: round2(bestClassMean),
+      _mean_exact: mean,
+    };
+  });
+  out.sort((a, b) => {
+    if (a._mean_exact == null && b._mean_exact == null) return 0; // keep code order
+    if (a._mean_exact == null) return 1;
+    if (b._mean_exact == null) return -1;
+    return b._mean_exact - a._mean_exact;
+  });
+  let rank = 0, prev = null, seen = 0;
+  out.forEach((r) => {
+    if (r._mean_exact == null) { r.rank = null; return; }
+    seen += 1;
+    if (prev === null || r.mean !== prev) rank = seen;
+    prev = r.mean;
+    r.rank = rank;
+  });
+  out.forEach((r) => { delete r._mean_exact; });
+  return out;
+}
+
 // Gender analysis — same per-candidate average_percentage as every other
 // roll-up (§51). Returns one row per gender for the whole exam
 // (class = "All classes") followed by one row per class × gender, using
@@ -474,7 +578,12 @@ function assignSubjectCodes(subjects, { ignoreOverrides = false } = {}) {
       if (c && !taken.has(c)) { taken.add(c); codeBySessionId.set(s.session_id, c); }
     });
   }
-  subjects.forEach((s) => {
+  // Generated codes are handed out in the exam's schedule order (start
+  // time, then id) whatever order the caller's list is in, so sorting a
+  // list by code can never change which subject gets which code.
+  const scheduled = [...subjects].sort((a, b) =>
+    (new Date(a.start_time || 0) - new Date(b.start_time || 0)) || (a.session_id - b.session_id));
+  scheduled.forEach((s) => {
     if (codeBySessionId.has(s.session_id)) return;
     const clean = String(s.subject || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
     const base = clean.slice(0, 4) || "SUBJ";
@@ -951,8 +1060,8 @@ const getMainExamStudentAnalytics = async (req, res) => {
         r.student_id, st.name, st.admissionNo,
         COUNT(DISTINCT r.session_id) AS subjects_registered,
         COUNT(DISTINCT sub.id) AS subjects_completed,
-        AVG(CASE WHEN sub.score IS NOT NULL AND ea2.total_marks > 0
-                  THEN CAST(sub.score AS FLOAT) * 100.0 / ea2.total_marks END) AS overall_average
+        SUM(CASE WHEN sub.score IS NOT NULL AND ea2.total_marks > 0 THEN CAST(sub.score AS FLOAT) END) AS total_obtained,
+        SUM(CASE WHEN sub.score IS NOT NULL AND ea2.total_marks > 0 THEN CAST(ea2.total_marks AS FLOAT) END) AS total_possible
       FROM registered r
       JOIN Students st ON st.id = r.student_id
       LEFT JOIN e_assessment_submissions sub ON sub.e_assessment_id = r.e_assessment_id AND sub.student_id = r.student_id
@@ -969,7 +1078,11 @@ const getMainExamStudentAnalytics = async (req, res) => {
       subjects_registered: r.subjects_registered,
       subjects_completed: r.subjects_completed,
       subjects_incomplete: Math.max(0, r.subjects_registered - r.subjects_completed),
-      overall_average: round2(r.overall_average),
+      // total obtained / total possible across the papers sat, and the
+      // average is that same ratio — identical to the Nominal Roll's.
+      total_obtained: r.total_obtained,
+      total_possible: r.total_possible,
+      overall_average: r.total_possible > 0 ? round2((r.total_obtained / r.total_possible) * 100) : null,
     }));
 
     res.json({ success: true, students });
@@ -1032,11 +1145,17 @@ const getStudentExaminationProfile = async (req, res) => {
     });
 
     const scored = subjects.filter((s) => s.percentage != null);
-    const overallAverage = scored.length ? round2(scored.reduce((a, s) => a + s.percentage, 0) / scored.length) : null;
+    const withMarks = subjects.filter((s) => s.score != null && s.total_marks > 0);
+    const totalObtained = withMarks.length ? withMarks.reduce((a, s) => a + Number(s.score), 0) : null;
+    const totalPossible = withMarks.length ? withMarks.reduce((a, s) => a + Number(s.total_marks), 0) : null;
+    // same ratio the Nominal Roll uses: total obtained / total possible
+    const overallAverage = totalPossible > 0 ? round2((totalObtained / totalPossible) * 100) : null;
 
     res.json({
       success: true,
       student: { id: student.id, name: student.name, admission_no: student.admissionNo, class: student.studentClass, year_of_study: student.yearOfStudy },
+      total_obtained: totalObtained,
+      total_possible: totalPossible,
       overall_average: overallAverage,
       subjects_completed: scored.length,
       subjects_absent: subjects.filter((s) => s.status === "absent").length,
@@ -1059,6 +1178,7 @@ module.exports = {
   // "Grade Distribution" reports can never disagree (§51).
   computeMainExaminationSummary,
   computeClassPerformance,
+  computeSubjectAnalysis,
   computeGenderPerformance,
   loadSubjectsWithAssessment,
   loadNominalRoll,
