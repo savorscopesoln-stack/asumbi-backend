@@ -1225,6 +1225,104 @@ app.get("/api/student/marks", protect, async (req, res) => {
 });
 
 /* =========================================================
+   STUDENT REPORT-CARD POSITIONS
+   Calculates rankings from marks belonging to ALL students in the
+   currently selected report-card source. The student marks endpoint
+   above intentionally returns only one student's marks, so it must
+   not be used to rank the rest of the cohort.
+   Ties share the same competition rank (1, 1, 3).
+========================================================= */
+app.get("/api/student/positions", protect, async (req, res) => {
+  try {
+    const pool = req.pool;
+    const studentId = toInt(req.query.studentId);
+    if (!studentId) {
+      return res.status(400).json({ success: false, message: "studentId required" });
+    }
+
+    const source = await getReportCardSource(pool);
+    if (source.mode === "none") {
+      return res.json({
+        success: true,
+        classPosition: null,
+        overallPosition: null,
+        classRankedCount: 0,
+        overallRankedCount: 0,
+      });
+    }
+
+    const scope = source.mode === "assessment"
+      ? "a.sourceRefId = @sourceId"
+      : `a.sourceRefId IN (
+           SELECT ess.e_assessment_id
+           FROM exam_subject_sessions ess
+           WHERE ess.main_examination_id = @sourceId
+             AND ess.e_assessment_id IS NOT NULL
+         )`;
+
+    const result = await pool.request()
+      .input("studentId", sql.Int, studentId)
+      .input("sourceId", sql.Int, source.id)
+      .query(`
+        WITH StudentAverages AS (
+          SELECT
+            st.id AS studentId,
+            st.studentClass,
+            AVG(CAST(m.percentage AS FLOAT)) AS averageScore
+          FROM Students st
+          INNER JOIN Marks m ON m.studentId = st.id
+          INNER JOIN Assessments a
+            ON a.id = m.assessmentId
+           AND a.sourceSystem = 'e_assessment'
+           AND ${scope}
+          WHERE ISNULL(st.status, '') <> 'graduated'
+            AND m.percentage IS NOT NULL
+          GROUP BY st.id, st.studentClass
+        ),
+        RankedStudents AS (
+          SELECT
+            studentId,
+            studentClass,
+            averageScore,
+            RANK() OVER (ORDER BY averageScore DESC) AS overallPosition,
+            RANK() OVER (
+              PARTITION BY studentClass
+              ORDER BY averageScore DESC
+            ) AS classPosition
+          FROM StudentAverages
+        )
+        SELECT
+          currentStudent.studentId,
+          currentStudent.studentClass,
+          currentStudent.averageScore,
+          currentStudent.classPosition,
+          currentStudent.overallPosition,
+          (SELECT COUNT(*) FROM StudentAverages cohort
+            WHERE cohort.studentClass = currentStudent.studentClass) AS classRankedCount,
+          (SELECT COUNT(*) FROM StudentAverages) AS overallRankedCount
+        FROM RankedStudents currentStudent
+        WHERE currentStudent.studentId = @studentId
+      `);
+
+    const row = result.recordset?.[0];
+    return res.json({
+      success: true,
+      classPosition: row ? Number(row.classPosition) : null,
+      overallPosition: row ? Number(row.overallPosition) : null,
+      classRankedCount: row ? Number(row.classRankedCount) : 0,
+      overallRankedCount: row ? Number(row.overallRankedCount) : 0,
+      averageScore: row ? Number(row.averageScore) : null,
+    });
+  } catch (err) {
+    console.error("STUDENT REPORT-CARD POSITIONS ERROR:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Could not calculate student positions",
+    });
+  }
+});
+
+/* =========================================================
    STUDENT PROFILE — CLASS LIST
    The classes a student can pick from on the "complete your profile"
    screen. Lives under /api/student/profile on purpose: authMiddleware
