@@ -49,6 +49,7 @@ const {
 } = require("../controllers/mainExamReports.controller");
 
 const { buildExportHandler } = require("../controllers/mainExamExports.controller");
+const { getSubjectCodes, updateSubjectCodes } = require("../controllers/mainExamSubjectCodes.controller");
 
 const { protect, requirePage } = require("../middleware/authMiddleware");
 const { requireFundableExamination } = require("../middleware/examWalletGuard");
@@ -117,6 +118,10 @@ router.post("/:mainExamId/subjects/:id/replay", grantReplay);
 router.post("/:mainExamId/subjects/:id/replay/cancel", cancelReplay);
 // Add minutes to an exam that is currently running.
 router.post("/:mainExamId/subjects/:id/extend", extendActiveExam);
+
+/* ---------------- Subject codes + key shown on the reports ---------------- */
+router.get("/:mainExamId/subject-codes", getSubjectCodes);
+router.put("/:mainExamId/subject-codes", updateSubjectCodes);
 
 /* ---------------- Timetable (§5-§6) ---------------- */
 router.get("/:mainExamId/timetable", getTimetable);

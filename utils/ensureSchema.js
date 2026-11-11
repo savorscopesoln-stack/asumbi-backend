@@ -2276,6 +2276,20 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       )
     `);
 
+    /* ---------------- exam_subject_sessions.report_code / report_key ----------------
+       Admin-editable overrides for the short subject code and the "key"
+       wording printed on the Main Examination reports (Nominal Roll
+       column headers + "Subject Code Key", on screen, Excel and PDF).
+       NULL = fall back to the generated code / the subject name. */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sys.columns WHERE Name = N'report_code' AND Object_ID = Object_ID(N'exam_subject_sessions'))
+      ALTER TABLE exam_subject_sessions ADD report_code NVARCHAR(20) NULL
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sys.columns WHERE Name = N'report_key' AND Object_ID = Object_ID(N'exam_subject_sessions'))
+      ALTER TABLE exam_subject_sessions ADD report_key NVARCHAR(150) NULL
+    `);
+
     /* ---------------- exam_audit_log ----------------
        Factual event trail for Main Examination actions (§53) —
        created/scheduled/activated/ended/results-published/etc.

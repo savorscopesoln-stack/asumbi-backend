@@ -100,6 +100,7 @@ async function loadSubjectsWithAssessment(pool, mainExaminationId) {
       SELECT
         ess.id AS session_id, ess.subject, ess.status AS session_status,
         ess.exam_date, ess.start_time, ess.end_time, ess.e_assessment_id,
+        ess.report_code, ess.report_key,
         ea.title AS assessment_title, ea.total_marks, ea.class_id, ea.year_of_study,
         c.name AS class_name
       FROM exam_subject_sessions ess
@@ -461,10 +462,20 @@ function computeGenderPerformance(rows, passMark) {
 // clashing prefix is added/removed later in the same exam, which is
 // why the roll always ships a code→name key alongside it (§51 — never
 // show a code without also showing what it means).
-function assignSubjectCodes(subjects) {
+function assignSubjectCodes(subjects, { ignoreOverrides = false } = {}) {
   const taken = new Set();
   const codeBySessionId = new Map();
+  const norm = (c) => String(c || "").trim().toUpperCase();
+  // Admin-entered codes (Reports tab → Subject codes & key) win and are
+  // reserved first, so a generated code can never clash with one.
+  if (!ignoreOverrides) {
+    subjects.forEach((s) => {
+      const c = norm(s.report_code);
+      if (c && !taken.has(c)) { taken.add(c); codeBySessionId.set(s.session_id, c); }
+    });
+  }
   subjects.forEach((s) => {
+    if (codeBySessionId.has(s.session_id)) return;
     const clean = String(s.subject || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
     const base = clean.slice(0, 4) || "SUBJ";
     let code = base;
@@ -478,6 +489,9 @@ function assignSubjectCodes(subjects) {
   });
   return codeBySessionId;
 }
+
+// What the key says a code means: the admin's wording, else the subject name.
+const subjectKeyText = (s) => String(s.report_key || "").trim() || s.subject;
 
 async function loadNominalRoll(pool, mainExaminationId) {
   const allSubjects = await loadSubjectsWithAssessment(pool, mainExaminationId);
@@ -510,7 +524,7 @@ async function loadNominalRoll(pool, mainExaminationId) {
     )
   `);
   const candidates = candidatesResult.recordset;
-  if (!candidates.length) return { subjects: subjects.map((s) => ({ session_id: s.session_id, subject: s.subject, code: subjectCodes.get(s.session_id), total_marks: s.total_marks })), rows: [] };
+  if (!candidates.length) return { subjects: subjects.map((s) => ({ session_id: s.session_id, subject: s.subject, code: subjectCodes.get(s.session_id), key: subjectKeyText(s), total_marks: s.total_marks })), rows: [] };
 
   const idParams = eAssessmentIds.map((_, i) => `@eid${i}`).join(",");
   const subReq = pool.request();
@@ -568,7 +582,7 @@ async function loadNominalRoll(pool, mainExaminationId) {
   });
 
   return {
-    subjects: subjects.map((s) => ({ session_id: s.session_id, subject: s.subject, code: subjectCodes.get(s.session_id), total_marks: s.total_marks })),
+    subjects: subjects.map((s) => ({ session_id: s.session_id, subject: s.subject, code: subjectCodes.get(s.session_id), key: subjectKeyText(s), total_marks: s.total_marks })),
     rows,
   };
 }
@@ -1048,6 +1062,7 @@ module.exports = {
   computeGenderPerformance,
   loadSubjectsWithAssessment,
   loadNominalRoll,
+  assignSubjectCodes,
   // Exported so the Overview dashboard (mainExam.controller.js's
   // getMainExaminationDashboard) reads the pass mark from the exact
   // same place Analytics does, instead of a second copy of this

@@ -182,7 +182,7 @@ const SHAPES = {
     }));
 
     const keyCols = [{ header: "Code", key: "code", width: 10 }, { header: "Subject", key: "subject", width: 30 }];
-    const keyRows = nominalSubjects.map((s) => ({ code: s.code || "—", subject: s.subject }));
+    const keyRows = nominalSubjects.map((s) => ({ code: s.code || "—", subject: s.key || s.subject }));
 
     // Overall Performance ranking — every scored candidate, ranked
     // exam-wide by the mean (average_percentage), from
