@@ -195,41 +195,4 @@ router.post("/profile", async (req, res) => {
   }
 });
 
-/* ------------------------------------------------------------ transcript */
-// The student's own transcript PDF, for someone holding a report-only session (from /report-download or a /r/ link).
-// Re-checks the open/close window and the mode on every request, so closing downloads takes effect at once.
-router.get("/transcript", async (req, res) => {
-  try {
-    if (tooMany(req)) return res.status(429).json({ message: "Too many attempts. Please wait a minute and try again." });
-    const header = req.headers.authorization || "";
-    let session;
-    try { session = verifyReportSession(header.startsWith("Bearer ") ? header.slice(7) : ""); }
-    catch (e) {
-      return res.status(401).json({ message: e.name === "TokenExpiredError" ? "Your session timed out. Please open the page again." : "Please open the page again." });
-    }
-    const pool = await getPool(session.tenant || "default");
-    const r = await pool.request().input("id", sql.Int, Number(session.id)).query(`SELECT id, status FROM Students WHERE id = @id`);
-    const student = r.recordset[0];
-    if (!student) return res.status(404).json({ message: "This student record could not be found." });
-    if (!isActiveStudent(student.status)) return res.status(403).json({ message: "Your account isn't active. Please contact the school office." });
-
-    const gate = await checkDownload(pool, "transcript");
-    if (!gate.ok) return res.status(gate.status).json({ code: gate.code, message: gate.message });
-
-    const { buildTranscripts } = require("../controllers/transcript.controller");
-    const { sendPdfBuffer } = require("../utils/reportExport");
-    const result = await buildTranscripts(pool, { scope: "student", studentId: Number(student.id), examId: null, requirePhoto: true });
-    if (!result.ok) {
-      return res.status(result.status).json({
-        code: result.code,
-        message: result.status === 404 ? "Your transcript isn't available yet — no released marks were found." : result.message,
-      });
-    }
-    return sendPdfBuffer(res, result.buffer, result.filename);
-  } catch (err) {
-    console.log("REPORT ACCESS TRANSCRIPT ERROR:", err);
-    res.status(500).json({ message: "Could not prepare your transcript. Please try again." });
-  }
-});
-
 module.exports = router;
