@@ -12,6 +12,7 @@ const { summarize } = require("./helpers/tinytest");
 
 require("./mainExamCrud.test.js");
 require("./scheduling.test.js");
+require("./splitPaperTotals.test.js");
 require("./scheduler.test.js");
 require("./studentDashboard.test.js");
 require("./reportExport.test.js");
