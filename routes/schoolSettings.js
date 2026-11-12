@@ -55,6 +55,8 @@ async function ensureSchoolSettingsStorage(pool, sql, tenant) {
       ALTER TABLE SchoolSettings ADD reportTheme NVARCHAR(30) NULL;
     IF NOT EXISTS (SELECT * FROM sys.columns WHERE Name = N'stampUrl' AND Object_ID = Object_ID(N'SchoolSettings'))
       ALTER TABLE SchoolSettings ADD stampUrl NVARCHAR(500) NULL;
+    IF NOT EXISTS (SELECT * FROM sys.columns WHERE Name = N'governmentLogoUrl' AND Object_ID = Object_ID(N'SchoolSettings'))
+      ALTER TABLE SchoolSettings ADD governmentLogoUrl NVARCHAR(500) NULL;
     IF NOT EXISTS (SELECT * FROM sys.columns WHERE Name = N'reportSubjects' AND Object_ID = Object_ID(N'SchoolSettings'))
       ALTER TABLE SchoolSettings ADD reportSubjects NVARCHAR(MAX) NULL;
   `);
@@ -154,7 +156,7 @@ module.exports = (poolPromise, sql) => {
       const pool = req.pool; // tenant-resolved by server.js DB middleware
       const {
         schoolName, shortName, motto, centreCode,
-        address, phone, email, website, numberOfClasses, logoUrl, stampUrl,
+        address, phone, email, website, numberOfClasses, logoUrl, governmentLogoUrl, stampUrl,
         reportTheme, reportSubjects,
       } = req.body || {};
 
@@ -190,6 +192,7 @@ module.exports = (poolPromise, sql) => {
         .input("website", sql.NVarChar, website || null)
         .input("numberOfClasses", sql.Int, numberOfClasses ? parseInt(numberOfClasses, 10) : null)
         .input("logoUrl", sql.NVarChar, logoUrl || null)
+        .input("governmentLogoUrl", sql.NVarChar, governmentLogoUrl || null)
         .input("stampUrl", sql.NVarChar, stampUrl || null)
         .input("reportTheme", sql.NVarChar, cleanReportTheme)
         .input("reportSubjects", sql.NVarChar(sql.MAX), cleanReportSubjects)
@@ -206,6 +209,7 @@ module.exports = (poolPromise, sql) => {
             website = @website,
             numberOfClasses = @numberOfClasses,
             logoUrl = @logoUrl,
+            governmentLogoUrl = @governmentLogoUrl,
             stampUrl = @stampUrl,
             reportTheme = @reportTheme,
             reportSubjects = @reportSubjects,
@@ -261,6 +265,31 @@ module.exports = (poolPromise, sql) => {
       res.json({ url });
     } catch (err) {
       console.log("SCHOOL LOGO UPLOAD ERROR:", err.message);
+      res.status(400).json({ message: err.message || "Upload failed" });
+    }
+  });
+
+  /* ================= GOVERNMENT LOGO UPLOAD (admin) =================
+     The government / ministry emblem printed at the TOP RIGHT of every
+     downloadable document, balancing the school logo at the top left.
+     Same two-step upload-then-save pattern as the school logo above. */
+  router.post("/government-logo", protect, requirePage("School Settings"), async (req, res) => {
+    try {
+      const pool = req.pool; // tenant-resolved by server.js DB middleware
+      await ensureSchoolSettingsStorage(pool, sql, req.tenant);
+      await runWebsiteImageUpload(req, res);
+      if (!req.file) return res.status(400).json({ message: "No image file received" });
+
+      const url = websiteImageUrlFor(req.file.filename);
+
+      // Best-effort cleanup of the previous government logo file.
+      const prev = await pool.request().query(`SELECT governmentLogoUrl FROM SchoolSettings WHERE id = 1`);
+      const prevUrl = prev.recordset[0]?.governmentLogoUrl;
+      if (prevUrl && prevUrl !== url) deleteWebsiteImageByUrl(prevUrl);
+
+      res.json({ url });
+    } catch (err) {
+      console.log("SCHOOL GOVERNMENT LOGO UPLOAD ERROR:", err.message);
       res.status(400).json({ message: err.message || "Upload failed" });
     }
   });

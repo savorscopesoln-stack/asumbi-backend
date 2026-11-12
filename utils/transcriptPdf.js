@@ -73,11 +73,20 @@ function drawInstitutionHeader(doc, institution, { title, subtitle }, theme, m) 
       console.error("⚠️ Could not embed logo in transcript PDF:", err.message);
     }
   }
-  // Centre on the FULL page width: the logo sits at the far left and the same
-  // room is reserved on both sides, so the school name, address and contact
-  // line stay central like the title lines below (they used to be centred in
-  // the space right of the logo and drifted to the right).
-  const inset = logoDrawn ? LOGO_SIZE + 10 : 0;
+  // Government emblem at the far RIGHT, balancing the school logo on the left.
+  let govDrawn = false;
+  if (institution.governmentLogoDiskPath) {
+    try {
+      doc.image(institution.governmentLogoDiskPath, startX + fullWidth - LOGO_SIZE, topY, { fit: [LOGO_SIZE, LOGO_SIZE], align: "right", valign: "top" });
+      govDrawn = true;
+    } catch (err) {
+      console.error("⚠️ Could not embed government logo in transcript PDF:", err.message);
+    }
+  }
+  // Centre on the FULL page width: the school logo sits at the far left, the
+  // government logo at the far right, and the same room is reserved on both
+  // sides, so the school name, address and contact line stay central.
+  const inset = logoDrawn || govDrawn ? LOGO_SIZE + 10 : 0;
   const textX = startX + inset;
   const textWidth = fullWidth - inset * 2;
   const centre = (text, size, font, color, x = startX, width = fullWidth) =>
@@ -94,7 +103,7 @@ function drawInstitutionHeader(doc, institution, { title, subtitle }, theme, m) 
   if (contactParts.length) centre(contactParts.join("   |   "), 8, "Helvetica", "#555", textX, textWidth);
   doc.fillColor("#000");
   // never let the title lines draw over the logo
-  if (logoDrawn) doc.y = Math.max(doc.y, topY + LOGO_SIZE);
+  if (logoDrawn || govDrawn) doc.y = Math.max(doc.y, topY + LOGO_SIZE);
   doc.x = startX;
   doc.moveDown(0.4);
   centre("STUDENT ACADEMIC TRANSCRIPT", 11, "Helvetica-Bold", "#000");

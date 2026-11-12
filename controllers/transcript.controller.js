@@ -5,7 +5,7 @@ const { splitGroupKey } = require("../utils/splitPapers");
 const { countedWithoutSplitDuplicates, loadOptionalMatcher, isSessionOver } = require("../utils/examPercentages");
 const { buildGeneralRemarks } = require("../utils/generalRemarks");
 const { buildTranscriptPdf } = require("../utils/transcriptPdf");
-const { loadGradingSystem, getGradeForScore, getOverallResultForScore } = require("../utils/grading");
+const { loadGradingSystem, getGradeForScore, getOverallResultForScore, countFailedSubjects, getOverallResultWithFails } = require("../utils/grading");
 
 const toInt = (v) => { const n = parseInt(v, 10); return Number.isNaN(n) ? null : n; };
 const round2 = (n) => (n == null ? null : Math.floor(Number(n) + 1e-9));
@@ -210,6 +210,8 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
         const counted = countedWithoutSplitDuplicates(exam.subjects.map((s) => ({ percentage: s.percentage == null ? null : Number(s.percentage), group: s.split_group, key: s.subjectId, sat: true })));
         const scores = counted.map((x) => x.percentage).filter((n) => n != null && !Number.isNaN(n));
         const average = scores.length ? round2(scores.reduce((a, b) => a + b, 0) / scores.length) : null;
+        // Grading System rule: failing N or more subjects makes the overall result a fail.
+        const failedCount = countFailedSubjects(scores, gradingSystem);
 
         // Per-subject columns, all from the school's Grading System:
         //   GRADE  = the matched band's grade (e.g. "1".."7")
@@ -246,7 +248,8 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
           ...exam,
           subjects,
           average,
-          overallResult: average != null ? getOverallResultForScore(average, gradingSystem) : "—",
+          failedCount,
+          overallResult: average != null ? getOverallResultWithFails(average, failedCount, gradingSystem) : "—",
           aggregatePoints,
         };
       });
@@ -272,7 +275,10 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
         generalRemarks: remarkParts.join("\n"),
         exams,
         cumulativeAverage,
-        cumulativeResult: cumulativeAverage != null ? getOverallResultForScore(cumulativeAverage, gradingSystem) : "—",
+        // Failing in any one examination under the minimum-fails rule makes the cumulative result a fail too.
+        cumulativeResult: cumulativeAverage != null
+          ? getOverallResultWithFails(cumulativeAverage, Math.max(0, ...exams.map((e) => e.failedCount || 0)), gradingSystem)
+          : "—",
       });
     });
 

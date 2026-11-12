@@ -1904,6 +1904,7 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
           website NVARCHAR(200) NULL,
           numberOfClasses INT NULL,
           logoUrl NVARCHAR(500) NULL,
+          governmentLogoUrl NVARCHAR(500) NULL,
           updatedAt DATETIME NOT NULL DEFAULT GETDATE(),
           updatedBy INT NULL
         )
@@ -1955,6 +1956,18 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
         WHERE Name = N'stampUrl' AND Object_ID = Object_ID(N'SchoolSettings')
       )
       ALTER TABLE SchoolSettings ADD stampUrl NVARCHAR(500) NULL
+    `);
+
+    /* SchoolSettings.governmentLogoUrl — government / ministry emblem uploaded in
+       School Settings; printed top-right on downloadable documents, opposite the
+       school logo (top-left). NULL = none uploaded, headers look as before. */
+    await pool.request().query(`
+      IF EXISTS (SELECT * FROM sysobjects WHERE name='SchoolSettings' AND xtype='U')
+      AND NOT EXISTS (
+        SELECT * FROM sys.columns
+        WHERE Name = N'governmentLogoUrl' AND Object_ID = Object_ID(N'SchoolSettings')
+      )
+      ALTER TABLE SchoolSettings ADD governmentLogoUrl NVARCHAR(500) NULL
     `);
 
     /* ---------------- SchoolSettings.reportSubjects ----------------
@@ -2184,6 +2197,24 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
         WHERE Name = N'totalMarks' AND Object_ID = Object_ID(N'GradingSystem')
       )
       ALTER TABLE GradingSystem ADD totalMarks INT NULL
+    `);
+
+    /* GradingSystem.minFailsForOverallFail / failOverallLabel — "if a student fails
+       this many subjects (below the pass mark) the overall result becomes
+       failOverallLabel" (e.g. 4 → FAIL). NULL / 0 = rule switched off. */
+    await pool.request().query(`
+      IF NOT EXISTS (
+        SELECT * FROM sys.columns
+        WHERE Name = N'minFailsForOverallFail' AND Object_ID = Object_ID(N'GradingSystem')
+      )
+      ALTER TABLE GradingSystem ADD minFailsForOverallFail INT NULL
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (
+        SELECT * FROM sys.columns
+        WHERE Name = N'failOverallLabel' AND Object_ID = Object_ID(N'GradingSystem')
+      )
+      ALTER TABLE GradingSystem ADD failOverallLabel NVARCHAR(50) NULL
     `);
 
     /* =========================================================

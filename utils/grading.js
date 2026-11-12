@@ -19,6 +19,8 @@ const DEFAULT_GRADING_SYSTEM = {
   systemName: "KNEC Standard",
   passMark: 40,
   totalMarks: null,
+  minFailsForOverallFail: null,
+  failOverallLabel: "FAIL",
   gradeBands: [
     { minScore: 80, grade: "1", label: "Distinction", remark: "Excellent Performance" },
     { minScore: 75, grade: "2", label: "Distinction", remark: "Good Performance" },
@@ -77,6 +79,8 @@ async function loadGradingSystem(pool) {
       systemName: row.systemName,
       passMark: row.passMark,
       totalMarks: row.totalMarks ?? null,
+      minFailsForOverallFail: row.minFailsForOverallFail ?? null,
+      failOverallLabel: row.failOverallLabel || "FAIL",
       gradeBands: gradeBands.length ? gradeBands : DEFAULT_GRADING_SYSTEM.gradeBands,
       overallBands: overallBands.length ? overallBands : DEFAULT_GRADING_SYSTEM.overallBands,
     };
@@ -85,6 +89,24 @@ async function loadGradingSystem(pool) {
     // other "no grading system configured" path in the app.
     return DEFAULT_GRADING_SYSTEM;
   }
+}
+
+/** How many of these subject percentages are below the pass mark (null/absent ignored). */
+function countFailedSubjects(percentages, gradingSystem) {
+  const pm = Number.isFinite(Number(gradingSystem?.passMark)) ? Number(gradingSystem.passMark) : DEFAULT_GRADING_SYSTEM.passMark;
+  return (percentages || []).filter((p) => p != null && !Number.isNaN(Number(p)) && Number(p) < pm).length;
+}
+
+/** Overall result for a student: when the Grading System has a "minimum failed subjects"
+    rule and the student failed that many subjects or more, the result is the configured
+    fail label (default "FAIL") whatever the average says; otherwise the normal overall band.
+    Mirrors getOverallResult in frontend/src/utils/grading.js. */
+function getOverallResultWithFails(avg, failedCount, gradingSystem) {
+  const min = Number(gradingSystem?.minFailsForOverallFail);
+  if (Number.isInteger(min) && min > 0 && Number(failedCount) >= min) {
+    return String(gradingSystem?.failOverallLabel || "FAIL").trim() || "FAIL";
+  }
+  return getOverallResultForScore(avg, gradingSystem);
 }
 
 /** Total marks that can be achieved on a report: the Grading System's "Total
@@ -96,4 +118,4 @@ function getTotalMarksPossible(gradingSystem, countedSubjects) {
   return (Number(countedSubjects) || 0) * 100;
 }
 
-module.exports = { DEFAULT_GRADING_SYSTEM, getGradeForScore, getOverallResultForScore, loadGradingSystem, getTotalMarksPossible };
+module.exports = { DEFAULT_GRADING_SYSTEM, getGradeForScore, getOverallResultForScore, countFailedSubjects, getOverallResultWithFails, loadGradingSystem, getTotalMarksPossible };

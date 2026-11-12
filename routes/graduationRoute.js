@@ -139,12 +139,16 @@ router.get("/certificate/:id", async (req, res) => {
     if (institution.logoDiskPath) {
       try { doc.image(institution.logoDiskPath, left, topY, { width: 52, height: 52 }); textX = left + 62; } catch { /* skip an unreadable logo */ }
     }
-    const textW = doc.page.width - doc.page.margins.right - textX;
+    let rightX = left + fullW;
+    if (institution.governmentLogoDiskPath) {
+      try { doc.image(institution.governmentLogoDiskPath, left + fullW - 52, topY, { fit: [52, 52], align: "right", valign: "top" }); rightX = left + fullW - 62; } catch { /* skip an unreadable logo */ }
+    }
+    const textW = rightX - textX;
     doc.fontSize(16).font("Helvetica-Bold").text((institution.schoolName || "").toUpperCase(), textX, topY, { width: textW, align: "center" });
     const contact = [institution.address, institution.phone && `Tel: ${institution.phone}`, institution.email && `Email: ${institution.email}`, institution.website].filter(Boolean).join("  |  ");
     if (contact) doc.fontSize(9).font("Helvetica").fillColor("#555").text(contact, textX, doc.y, { width: textW, align: "center" });
     doc.fillColor("#000");
-    if (institution.logoDiskPath) doc.y = Math.max(doc.y, topY + 56);
+    if (institution.logoDiskPath || institution.governmentLogoDiskPath) doc.y = Math.max(doc.y, topY + 56);
     doc.moveTo(left, doc.y + 4).lineTo(left + fullW, doc.y + 4).strokeColor("#800000").stroke();
     doc.strokeColor("#000");
     doc.x = left;

@@ -80,6 +80,8 @@ async function getInstitutionHeader(pool) {
     const result = await pool.request().query(`SELECT TOP 1 * FROM SchoolSettings WHERE id = 1`);
     const settings = result.recordset[0] || {};
     const logoDiskPath = urlToDiskPath(settings.logoUrl);
+    // Government / ministry emblem — drawn top-RIGHT, opposite the school logo.
+    const governmentLogoDiskPath = urlToDiskPath(settings.governmentLogoUrl);
     // Same resolve-to-disk-path pattern as the logo, for the school-wide
     // stamp a transcript falls back to when a signing official hasn't
     // uploaded their own (see utils/transcriptPdf.js).
@@ -91,6 +93,7 @@ async function getInstitutionHeader(pool) {
       email: settings.email || "",
       website: settings.website || "",
       logoDiskPath,
+      governmentLogoDiskPath,
       stampDiskPath,
       // Raw stored key (may be null/unrecognized) — buildReportPdf
       // resolves it to an actual palette via resolveReportTheme() so
@@ -100,7 +103,7 @@ async function getInstitutionHeader(pool) {
     };
   } catch (err) {
     console.error("⚠️ Could not load institution header for report export:", err.message);
-    return { schoolName: "", address: "", phone: "", email: "", website: "", logoDiskPath: null, stampDiskPath: null, reportTheme: null };
+    return { schoolName: "", address: "", phone: "", email: "", website: "", logoDiskPath: null, governmentLogoDiskPath: null, stampDiskPath: null, reportTheme: null };
   }
 }
 
@@ -327,11 +330,20 @@ function drawPdfHeader(doc, institution, { examinationName, academicYear, report
       console.error("⚠️ Could not embed logo in PDF report:", err.message);
     }
   }
-  // Centre on the FULL page width. The logo sits at the far left and the same
-  // room is reserved on BOTH sides, so the school name block stays truly
-  // central (it used to be centred in the space right of the logo, which
-  // pushed the name, address and contact line to the right).
-  const inset = logoDrawn ? LOGO_SIZE + 10 : 0;
+  // Government emblem at the far RIGHT, balancing the school logo on the left.
+  let govDrawn = false;
+  if (institution.governmentLogoDiskPath) {
+    try {
+      doc.image(institution.governmentLogoDiskPath, startX + fullWidth - LOGO_SIZE, topY, { fit: [LOGO_SIZE, LOGO_SIZE], align: "right", valign: "top" });
+      govDrawn = true;
+    } catch (err) {
+      console.error("⚠️ Could not embed government logo in PDF report:", err.message);
+    }
+  }
+  // Centre on the FULL page width. The school logo sits at the far left, the
+  // government logo at the far right, and the same room is reserved on BOTH
+  // sides, so the school name block stays truly central.
+  const inset = logoDrawn || govDrawn ? LOGO_SIZE + 10 : 0;
   const textX = startX + inset;
   const textWidth = fullWidth - inset * 2;
   const centre = (text, size, font, color, x = startX, width = fullWidth) =>
@@ -343,7 +355,7 @@ function drawPdfHeader(doc, institution, { examinationName, academicYear, report
   const contact = [institution.phone && `Tel: ${institution.phone}`, institution.email && `Email: ${institution.email}`, institution.website].filter(Boolean).join("  |  ");
   if (contact) centre(contact, 8, "Helvetica", "#555", textX, textWidth);
   // clear the logo's bottom edge so the exam name never draws over it
-  if (logoDrawn) doc.y = Math.max(doc.y, topY + LOGO_SIZE + 2);
+  if (logoDrawn || govDrawn) doc.y = Math.max(doc.y, topY + LOGO_SIZE + 2);
   doc.x = startX;
   doc.moveDown(0.4);
   centre(examinationName || "", 11, "Helvetica-Bold", "#000");

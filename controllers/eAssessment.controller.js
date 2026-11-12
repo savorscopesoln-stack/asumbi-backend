@@ -5865,6 +5865,8 @@ const getGradingSystem = async (req, res) => {
         systemName: "KNEC Standard",
         passMark: 40,
         totalMarks: null,
+        minFailsForOverallFail: null,
+        failOverallLabel: "FAIL",
         gradeBands: [
           { minScore: 80, grade: "1", label: "Distinction", remark: "Excellent Performance" },
           { minScore: 75, grade: "2", label: "Distinction", remark: "Good Performance" },
@@ -5893,6 +5895,8 @@ const getGradingSystem = async (req, res) => {
       systemName: row.systemName,
       passMark: row.passMark,
       totalMarks: row.totalMarks ?? null,
+      minFailsForOverallFail: row.minFailsForOverallFail ?? null,
+      failOverallLabel: row.failOverallLabel || "FAIL",
       gradeBands,
       overallBands,
       updatedAt: row.updatedAt,
@@ -5906,7 +5910,7 @@ const getGradingSystem = async (req, res) => {
 const updateGradingSystem = async (req, res) => {
   try {
     const pool = req.pool;
-    const { systemName, passMark, totalMarks, gradeBands, overallBands } = req.body || {};
+    const { systemName, passMark, totalMarks, gradeBands, overallBands, minFailsForOverallFail, failOverallLabel } = req.body || {};
 
     if (!Array.isArray(gradeBands) || gradeBands.length === 0) {
       return res.status(400).json({ message: "At least one grade band is required" });
@@ -5949,8 +5953,23 @@ const updateGradingSystem = async (req, res) => {
       cleanTotalMarks = n;
     }
 
+    // "Minimum number of failed subjects" rule: when a student fails this many
+    // subjects (below the pass mark) the overall result becomes failOverallLabel,
+    // whatever the average. Blank / 0 = rule off.
+    let cleanMinFails = null;
+    if (minFailsForOverallFail !== undefined && minFailsForOverallFail !== null && String(minFailsForOverallFail).trim() !== "") {
+      const n = Number(minFailsForOverallFail);
+      if (!Number.isInteger(n) || n < 0 || n > 100) {
+        return res.status(400).json({ message: "Minimum failed subjects must be a whole number (or left blank to switch the rule off)" });
+      }
+      cleanMinFails = n > 0 ? n : null;
+    }
+    const cleanFailLabel = String(failOverallLabel ?? "").trim().slice(0, 50) || "FAIL";
+
     await pool.request()
       .input("systemName", sql.NVarChar, systemName || "Standard Grading")
+      .input("minFailsForOverallFail", sql.Int, cleanMinFails)
+      .input("failOverallLabel", sql.NVarChar, cleanFailLabel)
       .input("totalMarks", sql.Int, cleanTotalMarks)
       .input("passMark", sql.Int, Number.isFinite(Number(passMark)) ? parseInt(passMark, 10) : 40)
       .input("gradeBandsJson", sql.NVarChar(sql.MAX), JSON.stringify(cleanGradeBands))
@@ -5962,14 +5981,16 @@ const updateGradingSystem = async (req, res) => {
             systemName = @systemName,
             passMark = @passMark,
             totalMarks = @totalMarks,
+            minFailsForOverallFail = @minFailsForOverallFail,
+            failOverallLabel = @failOverallLabel,
             gradeBandsJson = @gradeBandsJson,
             overallBandsJson = @overallBandsJson,
             updatedAt = GETDATE(),
             updatedBy = @updatedBy
           WHERE id = 1
         ELSE
-          INSERT INTO GradingSystem (id, systemName, passMark, totalMarks, gradeBandsJson, overallBandsJson, updatedBy)
-          VALUES (1, @systemName, @passMark, @totalMarks, @gradeBandsJson, @overallBandsJson, @updatedBy)
+          INSERT INTO GradingSystem (id, systemName, passMark, totalMarks, minFailsForOverallFail, failOverallLabel, gradeBandsJson, overallBandsJson, updatedBy)
+          VALUES (1, @systemName, @passMark, @totalMarks, @minFailsForOverallFail, @failOverallLabel, @gradeBandsJson, @overallBandsJson, @updatedBy)
       `);
 
     const result = await pool.request().query(`SELECT TOP 1 * FROM GradingSystem WHERE id = 1`);
@@ -5980,6 +6001,8 @@ const updateGradingSystem = async (req, res) => {
       systemName: row.systemName,
       passMark: row.passMark,
       totalMarks: row.totalMarks ?? null,
+      minFailsForOverallFail: row.minFailsForOverallFail ?? null,
+      failOverallLabel: row.failOverallLabel || "FAIL",
       gradeBands: JSON.parse(row.gradeBandsJson),
       overallBands: JSON.parse(row.overallBandsJson),
       updatedAt: row.updatedAt,
