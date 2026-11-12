@@ -1,5 +1,6 @@
 const sql = require("mssql");
-const { getInstitutionHeader, getSigningOfficials, getClassTeachers, sendPdfBuffer } = require("../utils/reportExport");
+const { getInstitutionHeader, getSigningOfficials, getClassTeachers, getFooterStampDiskPath, sendPdfBuffer } = require("../utils/reportExport");
+const { getReportFormConfig } = require("../utils/reportFormSubjects");
 const { buildTranscriptPdf } = require("../utils/transcriptPdf");
 const { loadGradingSystem, getGradeForScore, getOverallResultForScore } = require("../utils/grading");
 
@@ -79,7 +80,7 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
       SELECT
         m.studentId,
         me.id AS mainExaminationId, me.name AS examName, me.academic_year, me.term, me.start_date,
-        sub.name AS subjectName, sub.code AS subjectCode,
+        m.subjectId, sub.name AS subjectName, sub.code AS subjectCode,
         m.percentage
       FROM Marks m
       INNER JOIN Assessments a ON a.id = m.assessmentId AND a.sourceSystem = 'e_assessment'
@@ -103,6 +104,12 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
 
     /* ---------------- 4. Group rows: studentId → examId → subjects[] ---------------- */
     const gradingSystem = await loadGradingSystem(pool);
+    // Report Form Subjects: an optional subject counts toward the averages only
+    // when the student actually has a mark in it (a student who didn't take it
+    // just doesn't have it listed — never a CRNM), so the transcript always
+    // agrees with the report form.
+    const optionalSubjectIds = new Set((await getReportFormConfig(pool)).optionalIds.map(Number));
+    const isOptionalSubject = (s) => s.subjectId != null && optionalSubjectIds.has(Number(s.subjectId));
     const byStudent = new Map();
     marksRows.forEach((row) => {
       if (!byStudent.has(row.studentId)) byStudent.set(row.studentId, new Map());
@@ -113,6 +120,7 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
         });
       }
       examsMap.get(row.mainExaminationId).subjects.push({
+        subjectId: row.subjectId,
         subjectCode: row.subjectCode || null,
         subjectName: row.subjectName || row.subjectCode || "Subject",
         percentage: row.percentage,
@@ -149,6 +157,7 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
           const band = s.percentage != null ? getGradeForScore(s.percentage, gradingSystem) : null;
           return {
             ...s,
+            optional: isOptionalSubject(s),
             grade: band && band.grade !== "" && band.grade != null ? String(band.grade) : "—",
             points: band ? band.label : "—",
             gradePoints: band ? Number(band.grade) : null,
@@ -189,6 +198,7 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
     const institution = await getInstitutionHeader(pool);
     const officials = await getSigningOfficials(pool);
     const classTeachers = await getClassTeachers(pool);
+    institution.footerStampDiskPath = await getFooterStampDiskPath(pool);
     const title = singleExam ? singleExam.name : "Full Academic Transcript (All Exams)";
     const subtitle = scope === "class" ? `Class: ${className}`
       : scope === "student" ? `Student: ${studentPages[0].student.name}` : "All Students";

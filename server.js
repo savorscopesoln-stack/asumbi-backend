@@ -15,6 +15,7 @@ const { denyPrivateUploads } = require("./utils/privateUploadGuard");
 
 const { runWithTenant } = require("./utils/uploadPaths");
 const { getReportCardSource } = require("./utils/reportCardSource");
+const { applyReportFormSubjects, countedSubjectsClause } = require("./utils/reportFormSubjects");
 const { poolPromise, sql, getPool, listTenantKeys, hasTenant } = require("./config/db");
 const { resolveTenantKey } = require("./config/tenants");
 const { protect, authorize, adminOnly, requirePage } = require("./middleware/authMiddleware");
@@ -1170,7 +1171,8 @@ app.get("/api/marks/:assessmentId", protect, async (req, res) => {
 /* What the report card may show right now: { mode: none|assessment|exam, id, name, subjects[] } */
 app.get("/api/report-card-source", protect, async (req, res) => {
   try {
-    res.json(await getReportCardSource(req.pool));
+    // + the admin's "Report Form Subjects" list (which subjects show, which are optional)
+    res.json(await applyReportFormSubjects(req.pool, await getReportCardSource(req.pool)));
   } catch (err) {
     console.log("REPORT CARD SOURCE ERROR:", err.message);
     res.status(500).json({ mode: "none", id: null, name: null, subjects: [] });
@@ -1263,6 +1265,11 @@ app.get("/api/student/positions", protect, async (req, res) => {
              AND ess.e_assessment_id IS NOT NULL
          )`;
 
+    // Report Form Subjects: optional subjects (and subjects not on the report
+    // form) never count toward the average the positions are ranked on, so a
+    // student's position always matches the average printed on their report.
+    const countedClause = await countedSubjectsClause(pool, source, "m.subjectId");
+
     const result = await pool.request()
       .input("studentId", sql.Int, studentId)
       .input("sourceId", sql.Int, source.id)
@@ -1280,6 +1287,7 @@ app.get("/api/student/positions", protect, async (req, res) => {
            AND ${scope}
           WHERE ISNULL(st.status, '') <> 'graduated'
             AND m.percentage IS NOT NULL
+            ${countedClause}
           GROUP BY st.id, st.studentClass
         ),
         RankedStudents AS (

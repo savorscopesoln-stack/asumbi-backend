@@ -60,54 +60,51 @@ const metricsFor = (s) => ({
 
 function drawInstitutionHeader(doc, institution, { title, subtitle }, theme, m) {
   const startX = doc.page.margins.left;
+  const fullWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
   const LOGO_SIZE = m.logo;
-  let textX = startX;
+  const topY = doc.y;
   let logoDrawn = false;
   if (institution.logoDiskPath) {
     try {
-      doc.image(institution.logoDiskPath, startX, doc.y, { width: LOGO_SIZE, height: LOGO_SIZE });
-      textX = startX + 52;
+      doc.image(institution.logoDiskPath, startX, topY, { width: LOGO_SIZE, height: LOGO_SIZE });
       logoDrawn = true;
     } catch (err) {
       console.error("⚠️ Could not embed logo in transcript PDF:", err.message);
     }
   }
-  const textWidth = doc.page.width - doc.page.margins.right - textX;
-  const topY = doc.y;
-  doc.fontSize(13).font("Helvetica-Bold").fillColor("#000")
-    .text(institution.schoolName || "Institution", textX, topY, { width: textWidth, align: "center" });
-  if (institution.address) {
-    doc.fontSize(8).font("Helvetica").fillColor("#555").text(institution.address, textX, doc.y, { width: textWidth, align: "center" });
-  }
-  // Telephone / Email / Website contact line — same three facts the
-  // sample college transcript prints under its address, pulled from
-  // the same SchoolSettings row the address itself comes from.
+  // Centre on the FULL page width: the logo sits at the far left and the same
+  // room is reserved on both sides, so the school name, address and contact
+  // line stay central like the title lines below (they used to be centred in
+  // the space right of the logo and drifted to the right).
+  const inset = logoDrawn ? LOGO_SIZE + 10 : 0;
+  const textX = startX + inset;
+  const textWidth = fullWidth - inset * 2;
+  const centre = (text, size, font, color, x = startX, width = fullWidth) =>
+    doc.fontSize(size).font(font).fillColor(color).text(text, x, doc.y, { width, align: "center" });
+
+  doc.y = topY;
+  centre(institution.schoolName || "Institution", 13, "Helvetica-Bold", "#000", textX, textWidth);
+  if (institution.address) centre(institution.address, 8, "Helvetica", "#555", textX, textWidth);
   const contactParts = [
     institution.phone ? `Tel: ${institution.phone}` : null,
     institution.email ? `Email: ${institution.email}` : null,
     institution.website ? institution.website : null,
   ].filter(Boolean);
-  if (contactParts.length) {
-    doc.fontSize(8).font("Helvetica").fillColor("#555")
-      .text(contactParts.join("   |   "), textX, doc.y, { width: textWidth, align: "center" });
-  }
+  if (contactParts.length) centre(contactParts.join("   |   "), 8, "Helvetica", "#555", textX, textWidth);
   doc.fillColor("#000");
-  // The name/address/contact block can be shorter than the logo (e.g.
-  // when address/contact details are missing), which previously let
-  // doc.y creep back up above the logo's bottom edge — the next
-  // (full-width, centered) title lines would then render on top of
-  // the logo image instead of below it. Clamp the cursor to clear the
-  // logo's bottom edge before anything else is drawn.
+  // never let the title lines draw over the logo
   if (logoDrawn) doc.y = Math.max(doc.y, topY + LOGO_SIZE);
   doc.x = startX;
   doc.moveDown(0.4);
-  doc.fontSize(11).font("Helvetica-Bold").text("STUDENT ACADEMIC TRANSCRIPT", startX, doc.y, { width: doc.page.width - startX - doc.page.margins.right, align: "center" });
-  doc.fontSize(9).font("Helvetica-Bold").fillColor(theme.primary).text(title, startX, doc.y, { width: doc.page.width - startX - doc.page.margins.right, align: "center" });
-  if (subtitle) doc.fontSize(8).font("Helvetica").fillColor("#555").text(subtitle, startX, doc.y, { width: doc.page.width - startX - doc.page.margins.right, align: "center" });
+  centre("STUDENT ACADEMIC TRANSCRIPT", 11, "Helvetica-Bold", "#000");
+  centre(title, 9, "Helvetica-Bold", theme.primary);
+  if (subtitle) centre(subtitle, 8, "Helvetica", "#555");
   doc.fillColor("#000");
+  doc.x = startX;
   doc.moveDown(0.6);
   doc.moveTo(startX, doc.y).lineTo(doc.page.width - doc.page.margins.right, doc.y).strokeColor(theme.rule).stroke();
   doc.moveDown(0.6);
+  doc.x = startX;
 }
 
 /* Short confirming sentence, the same role the sample transcript's
@@ -148,7 +145,13 @@ function drawStudentInfo(doc, student, m) {
     // it, a long value (e.g. a long student name) silently wraps onto
     // a second line instead of truncating, and that second line then
     // overlaps the next row of fields below it.
-    doc.fontSize(10).font("Helvetica-Bold").fillColor("#000").text(value ?? "—", x, y + 11, { width: colWidth - 6, height: 13, ellipsis: true });
+    // Shrink the font until the whole value fits on its single line, so a
+    // long student name is shown in full instead of being cut with "…".
+    const shown = value == null || value === "" ? "—" : String(value);
+    let size = 10;
+    doc.font("Helvetica-Bold");
+    while (size > 6 && doc.fontSize(size).widthOfString(shown) > colWidth - 6) size -= 0.5;
+    doc.fillColor("#000").text(shown, x, y + 11 + (10 - size) / 2, { width: colWidth - 4, lineBreak: false });
   };
   field("Student Name", student.name, 0, 0);
   field("Gender", student.gender, 1, 0);
@@ -216,7 +219,11 @@ function drawExamTable(doc, exam, theme, m) {
   exam.subjects.forEach((s, idx) => {
     const cells = [
       s.subjectCode || "—",
-      s.subjectName || "-",
+      (() => {
+        const nm = String(s.subjectName || "-").replace(/\s+/g, " ").trim();
+        // optional subjects are labelled; they count toward the average when listed (i.e. the student took them)
+        return s.optional && !/\(\s*optional\s*\)/i.test(nm) ? `${nm} (Optional)` : nm;
+      })(),
       s.percentage != null && !Number.isNaN(Number(s.percentage)) ? `${Math.floor(Number(s.percentage) + 1e-9)}%` : "—",
       s.grade || "—",
       s.points || "—",
@@ -347,7 +354,7 @@ function drawSignatureBlock(doc, officials, institution, theme, classTeachers = 
   // One row: label, name, optional title, signature image over a line,
   // date, and the stamp at the right-hand edge. Row height is derived from
   // its contents (and the stamp) so nothing overlaps at any scale.
-  const drawRow = ({ label, name, title, signatureDiskPath, stampDiskPath, remarks }) => {
+  const drawRow = ({ label, name, title, signatureDiskPath, stampDiskPath, remarks, noStamp }) => {
     const remarksBlock = remarks ? m.remarksBoxH + 8 : 0;
     const rowH = Math.max(stampSize + 10, 12 + remarksBlock + m.lineOff + 14);
     ensureRoom(rowH);
@@ -363,8 +370,20 @@ function drawSignatureBlock(doc, officials, institution, theme, classTeachers = 
         .text("Remarks and recommendations.", pageLeft + 6, y + (m.remarksBoxH - 9) / 2, { width: lineW - 12, lineBreak: false });
       y += remarksBlock;
     }
-    doc.fontSize(9.5).font("Helvetica-Bold").fillColor("#000").text(name || "—", pageLeft, y, { width: lineW * 0.55, lineBreak: false, ellipsis: true });
-    if (title) doc.fontSize(8).font("Helvetica").fillColor("#555").text(title, pageLeft, y + 12, { width: lineW * 0.55, lineBreak: false, ellipsis: true });
+    // Name and title are shown in full: the font shrinks to fit the column.
+    const fitText = (text, font, startSize, maxW, floor) => {
+      let size = startSize;
+      doc.font(font);
+      while (size > floor && doc.fontSize(size).widthOfString(text) > maxW) size -= 0.5;
+      return size;
+    };
+    const nameText = name || "—";
+    const nameSize = fitText(nameText, "Helvetica-Bold", 9.5, lineW * 0.55, 6);
+    doc.fontSize(nameSize).font("Helvetica-Bold").fillColor("#000").text(nameText, pageLeft, y, { width: lineW * 0.57, lineBreak: false });
+    if (title) {
+      const titleSize = fitText(String(title), "Helvetica", 8, lineW * 0.55, 6);
+      doc.fontSize(titleSize).font("Helvetica").fillColor("#555").text(String(title), pageLeft, y + 12, { width: lineW * 0.57, lineBreak: false });
+    }
 
     // signature image sits on the line, to the right of the name
     const sigX = pageLeft + lineW * 0.58;
@@ -376,19 +395,25 @@ function drawSignatureBlock(doc, officials, institution, theme, classTeachers = 
     doc.fontSize(7).font("Helvetica").fillColor("#777").text("Date", pageLeft, lineY + 2, { lineBreak: false });
     doc.moveTo(pageLeft + 24, lineY).lineTo(pageLeft + 24 + 90, lineY).strokeColor("#999").stroke();
 
-    drawStampOrPlaceholder(doc, stampDiskPath || schoolStamp, stampX, topY + 4, stampSize);
+    if (!noStamp) drawStampOrPlaceholder(doc, stampDiskPath || schoolStamp, stampX, topY + 4, stampSize);
     doc.fillColor("#000");
     doc.x = pageLeft;
     doc.y = topY + rowH;
   };
 
-  classTeachers.forEach((ct) => drawRow({
-    label: ct.title ? `${ct.title}'s Remarks` : "Class Teacher's Remarks",
-    name: ct.name,
-    signatureDiskPath: ct.signatureDiskPath,
-    stampDiskPath: ct.stampDiskPath,
-    remarks: true,
-  }));
+  // The Report Form always shows a class-teacher card — a blank hand-signed
+  // one when nobody is assigned to the class — so the transcript does too.
+  if (classTeachers.length) {
+    classTeachers.forEach((ct) => drawRow({
+      label: ct.title ? `${ct.title}'s Remarks` : "Class Teacher's Remarks",
+      name: ct.name,
+      signatureDiskPath: ct.signatureDiskPath,
+      stampDiskPath: ct.stampDiskPath,
+      remarks: true,
+    }));
+  } else {
+    drawRow({ label: "Class Teacher's Remarks", name: "—", remarks: true, noStamp: true });
+  }
 
   if (officials.length) {
     officials.forEach((o) => drawRow({
@@ -402,11 +427,18 @@ function drawSignatureBlock(doc, officials, institution, theme, classTeachers = 
     drawRow({ label: "Approval & Authentication", name: "—", stampDiskPath: schoolStamp });
   }
 
+  // Footer "Official stamp" — the Report Form's footer stamp (Dean's, else
+  // Principal's, else first signatory's), shown bottom-left with the date.
+  const footerStamp = institution.footerStampDiskPath || schoolStamp;
+  const footerSize = Math.max(40, Math.round(stampSize * 0.85));
+  ensureRoom(footerSize + 6);
+  const footTop = doc.y + 2;
+  drawStampOrPlaceholder(doc, footerStamp, pageLeft, footTop, footerSize);
   doc.fontSize(7).font("Helvetica").fillColor("#777")
-    .text(`Date: ${new Date().toLocaleDateString()}`, pageLeft, doc.y, { width: usableWidth, align: "right", lineBreak: false });
+    .text(`Date: ${new Date().toLocaleDateString()}`, pageLeft, footTop + footerSize - 8, { width: usableWidth, align: "right", lineBreak: false });
   doc.fillColor("#000");
   doc.x = pageLeft;
-  doc.y += Math.max(4, 10 * m.s);
+  doc.y = footTop + footerSize + Math.max(4, 8 * m.s);
 }
 
 function addPageNumbers(doc) {

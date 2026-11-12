@@ -293,8 +293,14 @@ router.post("/report-link", async (req, res) => {
     const student = r.recordset[0];
     if (!student) return res.status(404).json({ message: "This student record could not be found." });
 
+    // Report Download Link → "When can students download?": window + what is on offer.
+    const { checkDownload, publicView } = require("../utils/downloadAccess");
+    const gate = await checkDownload(pool, "any");
+    if (!gate.ok) return res.status(gate.status).json({ code: gate.code, message: gate.message });
+
     return res.json({
-      token: signReportSession({ student, tenant }),
+      token: signReportSession({ student, tenant, mode: gate.access.mode }),
+      downloads: publicView(gate.access),
       user: {
         id: student.id, username: student.username, name: student.name || "", role: "student",
         source: "Students", tenant, photoUrl: student.photoUrl || null, reportLinkSession: true,
@@ -337,6 +343,10 @@ router.get("/transcript-link", async (req, res) => {
     const { buildTranscripts } = require("../controllers/transcript.controller");
     const { sendPdfBuffer } = require("../utils/reportExport");
     const pool = await getPool(link.tenant || "default");
+    const { checkDownload } = require("../utils/downloadAccess");
+    // A link the school sent for ONE student's transcript obeys the open/close window only (not the "what is offered" button).
+    const gate = await checkDownload(pool, "any");
+    if (!gate.ok) return res.status(gate.status).json({ code: gate.code, message: gate.message });
     const result = await buildTranscripts(pool, { scope: "student", studentId: Number(link.sid), examId: link.exam || null });
     if (!result.ok) {
       return res.status(result.status).json({

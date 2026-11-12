@@ -1,3 +1,4 @@
+const examPct = require("../utils/examPercentages");
 const sql = require("mssql");
 const {
   getMainExamAnalytics,
@@ -212,13 +213,18 @@ const getSubjectResultsReport = async (req, res) => {
       `);
 
     const ended = ["ended", "marking", "completed"].includes(String(session.session_status || "").toLowerCase());
+    const optionalSubject = (await examPct.loadOptionalMatcher(pool))(session.subject);
     const rows = rowsResult.recordset.map((r) => ({
       student_id: r.student_id,
       name: r.name,
       admission_no: r.admissionNo,
       marks: r.score,
       total_marks: session.total_marks,
-      percentage: r.score != null && session.total_marks > 0 ? round2((r.score / session.total_marks) * 100) : null,
+      // Reports show the % mark. A compulsory paper not sat (exam over) is
+      // included as 0; an optional paper not sat stays blank.
+      percentage: r.score != null && session.total_marks > 0
+        ? round2((r.score / session.total_marks) * 100)
+        : (r.score == null && ended && !optionalSubject ? 0 : null),
       grade: null, // §16 — no grading scale configured in this system yet
       status: r.score != null ? "Completed" : (ended ? "Absent" : "Scheduled"),
     }));
@@ -299,7 +305,7 @@ const getClassResultsReport = async (req, res) => {
     const subjectsResult = await pool.request()
       .input("mainExamId", sql.Int, mainExamId).input("classId", sql.Int, classId).input("year", sql.Int, classYear)
       .query(`
-        SELECT ess.id AS session_id, ess.subject, ess.e_assessment_id, ea.total_marks
+        SELECT ess.id AS session_id, ess.subject, ess.status AS session_status, ess.e_assessment_id, ea.total_marks
         FROM exam_subject_sessions ess
         JOIN e_assessments ea ON ea.id = ess.e_assessment_id
         WHERE ess.main_examination_id = @mainExamId
@@ -328,22 +334,29 @@ const getClassResultsReport = async (req, res) => {
     const subMap = {}; // `${studentId}:${eAssessmentId}` -> score
     submissions.forEach((s) => { subMap[`${s.student_id}:${s.e_assessment_id}`] = s.score; });
 
+    const gradingSystem = await examPct.loadGradingSystem(pool);
+    const isOptional = await examPct.loadOptionalMatcher(pool);
     const rows = students.map((st) => {
-      let totalObtained = 0, totalPossible = 0, scoredCount = 0;
+      const counted = [];
       const subjectMarks = subjects.map((sub) => {
         const score = subMap[`${st.id}:${sub.e_assessment_id}`];
-        const percentage = score != null && sub.total_marks > 0 ? round2((score / sub.total_marks) * 100) : null;
-        if (score != null) { totalObtained += score; totalPossible += sub.total_marks || 0; scoredCount += 1; }
-        return { subject: sub.subject, score: score ?? null, total_marks: sub.total_marks, percentage, grade: null };
+        let percentage = score != null && sub.total_marks > 0 ? round2((score / sub.total_marks) * 100) : null;
+        const optional = isOptional(sub.subject);
+        let absent = false;
+        // Not sat: a compulsory paper counts as 0 once its session is over; an optional one is left out.
+        if (score == null && !optional && examPct.isSessionOver(sub.session_status)) { percentage = 0; absent = true; }
+        if (percentage != null) counted.push({ percentage });
+        return { subject: sub.subject, score: score ?? null, total_marks: sub.total_marks, percentage, absent, optional, grade: null };
       });
+      const sum = examPct.summarisePercentages(counted, gradingSystem);
       return {
         student_id: st.id,
         name: st.name,
         admission_no: st.admissionNo,
         subjects: subjectMarks,
-        total_marks_obtained: scoredCount ? totalObtained : null,
-        total_marks_possible: scoredCount ? totalPossible : null,
-        average_percentage: scoredCount && totalPossible > 0 ? round2((totalObtained / totalPossible) * 100) : null,
+        total_marks_obtained: sum.total,
+        total_marks_possible: sum.possible,
+        average_percentage: sum.average,
         grade: null,
       };
     });

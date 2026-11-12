@@ -111,6 +111,26 @@ async function getSigningOfficials(pool) {
   }
 }
 
+/* The big "Official stamp" the on-screen Report Form prints in its footer:
+   the Dean's stamp, else the Principal's, else the first signatory's (the
+   last official when nobody is flagged as a signatory) — resolved to disk. */
+async function getFooterStampDiskPath(pool) {
+  try {
+    const result = await pool.request().query(`
+      SELECT title, stampUrl, isSignatory FROM SchoolOfficials ORDER BY sortOrder ASC, id ASC
+    `);
+    const rows = result.recordset || [];
+    const byTitle = (needle) => rows.find((o) => String(o.title || "").toLowerCase().includes(needle));
+    const dean = byTitle("dean");
+    const principal = byTitle("principal");
+    const signatory = rows.find((o) => o.isSignatory) || rows[rows.length - 1] || null;
+    return urlToDiskPath(dean?.stampUrl || principal?.stampUrl || signatory?.stampUrl);
+  } catch (err) {
+    console.error("⚠️ Could not load footer stamp for report export:", err.message);
+    return null;
+  }
+}
+
 /* Class teachers (ClassTeachers table — same rows School Settings and the
    on-screen Report Form read), each with their own uploaded signature
    and stamp resolved to disk so transcriptPdf.js can embed them. */
@@ -269,44 +289,50 @@ function sendExcelBuffer(res, buffer, filename) {
    already signals which school's report this is. */
 function drawPdfHeader(doc, institution, { examinationName, academicYear, reportTitle, subtitle }, theme) {
   const startX = doc.page.margins.left;
-  let textX = startX;
+  const fullWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
+  const LOGO_SIZE = 42;
+  const topY = doc.y;
+  let logoDrawn = false;
   if (institution.logoDiskPath) {
     try {
-      doc.image(institution.logoDiskPath, startX, doc.y, { width: 42, height: 42 });
-      textX = startX + 52;
+      doc.image(institution.logoDiskPath, startX, topY, { width: LOGO_SIZE, height: LOGO_SIZE });
+      logoDrawn = true;
     } catch (err) {
       console.error("⚠️ Could not embed logo in PDF report:", err.message);
     }
   }
-  const textWidth = doc.page.width - doc.page.margins.right - textX;
-  const topY = doc.y;
-  doc.fontSize(13).font("Helvetica-Bold").text(institution.schoolName || "Institution", textX, topY, { width: textWidth, align: "center" });
-  if (institution.address) {
-    doc.fontSize(8).font("Helvetica").fillColor("#555").text(institution.address, textX, doc.y, { width: textWidth, align: "center" });
-  }
+  // Centre on the FULL page width. The logo sits at the far left and the same
+  // room is reserved on BOTH sides, so the school name block stays truly
+  // central (it used to be centred in the space right of the logo, which
+  // pushed the name, address and contact line to the right).
+  const inset = logoDrawn ? LOGO_SIZE + 10 : 0;
+  const textX = startX + inset;
+  const textWidth = fullWidth - inset * 2;
+  const centre = (text, size, font, color, x = startX, width = fullWidth) =>
+    doc.fontSize(size).font(font).fillColor(color).text(text, x, doc.y, { width, align: "center" });
+
+  doc.y = topY;
+  centre(institution.schoolName || "Institution", 13, "Helvetica-Bold", "#000", textX, textWidth);
+  if (institution.address) centre(institution.address, 8, "Helvetica", "#555", textX, textWidth);
   const contact = [institution.phone && `Tel: ${institution.phone}`, institution.email && `Email: ${institution.email}`, institution.website].filter(Boolean).join("  |  ");
-  if (contact) {
-    doc.fontSize(8).font("Helvetica").fillColor("#555").text(contact, textX, doc.y, { width: textWidth, align: "center" });
-  }
-  doc.fillColor("#000");
+  if (contact) centre(contact, 8, "Helvetica", "#555", textX, textWidth);
   // clear the logo's bottom edge so the exam name never draws over it
-  if (institution.logoDiskPath) doc.y = Math.max(doc.y, topY + 44);
+  if (logoDrawn) doc.y = Math.max(doc.y, topY + LOGO_SIZE + 2);
   doc.x = startX;
   doc.moveDown(0.4);
-  doc.fontSize(11).font("Helvetica-Bold").text(examinationName || "", startX, doc.y, { width: doc.page.width - doc.page.margins.left - doc.page.margins.right, align: "center" });
-  if (academicYear) doc.fontSize(9).font("Helvetica").text(`Academic Year: ${academicYear}`, { align: "center" });
+  centre(examinationName || "", 11, "Helvetica-Bold", "#000");
+  if (academicYear) centre(`Academic Year: ${academicYear}`, 9, "Helvetica", "#000");
   doc.moveDown(0.6);
-  doc.fontSize(12).font("Helvetica-Bold").text(reportTitle, { align: "center" });
-  if (subtitle) doc.fontSize(9).font("Helvetica").text(subtitle, { align: "center" });
-  doc.fontSize(8).font("Helvetica").fillColor("#777").text(`Generated: ${new Date().toLocaleString()}`, { align: "center" });
+  centre(reportTitle, 12, "Helvetica-Bold", "#000");
+  if (subtitle) centre(subtitle, 9, "Helvetica", "#000");
+  centre(`Generated: ${new Date().toLocaleString()}`, 8, "Helvetica", "#777");
   doc.fillColor("#000");
+  doc.x = startX;
   doc.moveDown(1);
-  // A rule under the header keeps every report visually consistent and
-  // clearly separates it from the table that follows — themed to the
-  // school's chosen report color rather than a fixed gray, so it (and
-  // every table header bar drawn later) reads as one consistent brand.
+  // Rule under the header, themed to the school's report colour.
   doc.moveTo(startX, doc.y).lineTo(doc.page.width - doc.page.margins.right, doc.y).strokeColor(theme.rule).stroke();
   doc.moveDown(0.8);
+  doc.x = startX;
 }
 
 /* Draws one line of text at an exact (x, y) inside a column of width `w`,
@@ -321,6 +347,15 @@ function drawCellText(doc, text, x, y, w, align) {
   const PAD = 3;
   let str = String(text);
   const avail = Math.max(0, w - PAD * 2);
+  // A value that is still too wide (e.g. a long candidate name in a wide
+  // table) shrinks its OWN font until the whole text fits — it is only cut
+  // with an ellipsis if it cannot fit even at the 4.5pt floor.
+  const baseSize = doc._fontSize;
+  let size = baseSize;
+  while (doc.widthOfString(str) > avail && size > 4.5) {
+    size = Math.max(4.5, size - 0.25);
+    doc.fontSize(size);
+  }
   if (doc.widthOfString(str) > avail) {
     while (str.length > 1 && doc.widthOfString(str + "…") > avail) str = str.slice(0, -1);
     str += "…";
@@ -329,7 +364,8 @@ function drawCellText(doc, text, x, y, w, align) {
   let tx = x + PAD;
   if (align === "center") tx = x + (w - tw) / 2;
   else if (align === "right") tx = x + w - PAD - tw;
-  doc.text(str, tx, y, { lineBreak: false });
+  doc.text(str, tx, y + (baseSize - size) / 2, { lineBreak: false });
+  if (size !== baseSize) doc.fontSize(baseSize);
 }
 
 /* Formats a cell value for display (same rounding rules as before). */
@@ -658,6 +694,7 @@ function sendPdfBuffer(res, buffer, filename) {
 module.exports = {
   getInstitutionHeader,
   getSigningOfficials,
+  getFooterStampDiskPath,
   getClassTeachers,
   buildReportWorkbook,
   sendExcelBuffer,
