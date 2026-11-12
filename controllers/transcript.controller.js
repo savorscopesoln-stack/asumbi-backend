@@ -1,6 +1,5 @@
 const sql = require("mssql");
 const { getInstitutionHeader, getSigningOfficials, getClassTeachers, getFooterStampDiskPath, sendPdfBuffer } = require("../utils/reportExport");
-const { getReportFormConfig } = require("../utils/reportFormSubjects");
 const { buildTranscriptPdf } = require("../utils/transcriptPdf");
 const { loadGradingSystem, getGradeForScore, getOverallResultForScore } = require("../utils/grading");
 
