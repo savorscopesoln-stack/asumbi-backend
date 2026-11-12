@@ -5,7 +5,7 @@ const { splitGroupKey } = require("../utils/splitPapers");
 const { countedWithoutSplitDuplicates, loadOptionalMatcher, isSessionOver } = require("../utils/examPercentages");
 const { buildGeneralRemarks } = require("../utils/generalRemarks");
 const { buildTranscriptPdf } = require("../utils/transcriptPdf");
-const { loadGradingSystem, getGradeForScore, getOverallResultForScore, countFailedSubjects, getOverallResultWithFails } = require("../utils/grading");
+const { loadGradingSystem, getGradeForScore, getOverallResultForScore, countFailedSubjects, getOverallResultWithFails, getTotalMarksPossible } = require("../utils/grading");
 
 const toInt = (v) => { const n = parseInt(v, 10); return Number.isNaN(n) ? null : n; };
 const round2 = (n) => (n == null ? null : Math.floor(Number(n) + 1e-9));
@@ -78,6 +78,16 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
       else allowed = usable;
     }
     const subsetOfExams = !examId && !!allowed;
+    // Names of the chosen exams (Report Download Link dropdown / ticked exams), so the transcript title can show them.
+    let subsetNames = [];
+    if (subsetOfExams && allowed.length) {
+      try {
+        const nreq = pool.request();
+        const ph = allowed.map((id, i) => { nreq.input(`en${i}`, sql.Int, id); return `@en${i}`; });
+        const nr = await nreq.query(`SELECT name FROM main_examinations WHERE id IN (${ph.join(",")}) ORDER BY start_date ASC, id ASC`);
+        subsetNames = nr.recordset.map((r) => r.name).filter(Boolean);
+      } catch (_) { subsetNames = []; }
+    }
     if (allowed && examId && !allowed.includes(Number(examId))) {
       return fail(404, "That exam is not available on transcripts.");
     }
@@ -212,6 +222,9 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
         const average = scores.length ? round2(scores.reduce((a, b) => a + b, 0) / scores.length) : null;
         // Grading System rule: failing N or more subjects makes the overall result a fail.
         const failedCount = countFailedSubjects(scores, gradingSystem);
+        // Total marks (sum of the counted subject percentages) out of the Grading System's total.
+        const totalMarks = scores.length ? round2(scores.reduce((a, b) => a + b, 0)) : null;
+        const totalPossible = getTotalMarksPossible(gradingSystem, scores.length);
 
         // Per-subject columns, all from the school's Grading System:
         //   GRADE  = the matched band's grade (e.g. "1".."7")
@@ -249,6 +262,8 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
           subjects,
           average,
           failedCount,
+          totalMarks,
+          totalPossible,
           overallResult: average != null ? getOverallResultWithFails(average, failedCount, gradingSystem) : "—",
           aggregatePoints,
         };
@@ -298,7 +313,7 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
     const officials = await getSigningOfficials(pool);
     const classTeachers = await getClassTeachers(pool);
     institution.footerStampDiskPath = await getFooterStampDiskPath(pool);
-    const title = singleExam ? singleExam.name : subsetOfExams ? "Academic Transcript (Selected Exams)" : "Full Academic Transcript (All Exams)";
+    const title = singleExam ? singleExam.name : subsetOfExams ? (subsetNames.length && subsetNames.length <= 3 ? subsetNames.join(" & ") : "Academic Transcript (Selected Exams)") : "Full Academic Transcript (All Exams)";
     const subtitle = scope === "class" ? `Class: ${className}`
       : scope === "student" ? `Student: ${studentPages[0].student.name}` : "All Students";
     const examSlug = singleExam ? singleExam.name : subsetOfExams ? "selected-exams" : "all-exams";

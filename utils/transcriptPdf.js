@@ -196,9 +196,9 @@ function drawStudentInfo(doc, student, m) {
   doc.moveDown(0.3);
 }
 
-/* One exam's subject table: Subject | Marks % | Grade | Points |
-   Description, plus an average row. A paper the student missed shows AB.
-     GRADE  = the grade of the score's band in the Grading System (e.g. 1-7)
+/* One exam's subject table: Subject | Marks % | Points | Description,
+   plus a total-marks row and an average row. A paper the student missed shows AB.
+     (the numeric grade column was removed — only the band label is shown)
      POINTS = the band's label from the Grading System (e.g. Distinction)
      DESCRIPTION = the result label for the score (overall bands, e.g. CREDIT)
    Row height is MEASURED per row: a long subject code or name wraps (up to
@@ -208,7 +208,7 @@ function drawExamTable(doc, exam, theme, m) {
   const pageLeft = doc.page.margins.left;
   const pageRight = doc.page.width - doc.page.margins.right;
   const usableWidth = pageRight - pageLeft;
-  const colW = [0.38, 0.14, 0.12, 0.16, 0.20].map((w) => usableWidth * w);
+  const colW = [0.44, 0.16, 0.20, 0.20].map((w) => usableWidth * w);
   const colX = [];
   colW.reduce((x, w) => { colX.push(x); return x + w; }, pageLeft);
   const bottomLimit = () => doc.page.height - doc.page.margins.bottom - 20;
@@ -227,8 +227,8 @@ function drawExamTable(doc, exam, theme, m) {
   doc.moveDown(0.2);
 
   let y = doc.y;
-  const headers = ["SUBJECT", "MARKS %", "GRADE", "POINTS", "DESCRIPTION"];
-  const aligns = ["left", "center", "center", "center", "center"];
+  const headers = ["SUBJECT", "MARKS %", "POINTS", "DESCRIPTION"];
+  const aligns = ["left", "center", "center", "center"];
   const drawHeaderRow = () => {
     doc.rect(pageLeft, y, usableWidth, m.headH).fill(theme.primary);
     doc.fillColor(theme.onPrimary).fontSize(m.headFont).font("Helvetica-Bold");
@@ -249,7 +249,6 @@ function drawExamTable(doc, exam, theme, m) {
         return s.optional && !/\(\s*optional\s*\)/i.test(nm) ? `${nm} (Optional)` : nm;
       })(),
       s.absent ? "AB" : (s.percentage != null && !Number.isNaN(Number(s.percentage)) ? `${Math.floor(Number(s.percentage) + 1e-9)}%` : "—"),
-      s.grade || "—",
       s.points || "—",
       s.result || "—",
     ].map(String);
@@ -281,6 +280,24 @@ function drawExamTable(doc, exam, theme, m) {
     y += rowH;
   });
 
+  // Total marks row — sits directly above the average (mean) row.
+  if (exam.totalMarks != null) {
+    if (y + m.minRowH * 2 > bottomLimit()) {
+      doc.addPage();
+      y = doc.page.margins.top;
+    }
+    doc.rect(pageLeft, y, usableWidth, m.minRowH).fill(theme.zebra);
+    doc.fillColor("#000").fontSize(m.font).font("Helvetica-Bold");
+    const ty = y + (m.minRowH - doc.currentLineHeight(true)) / 2;
+    doc.text("TOTAL MARKS", pageLeft + 4, ty, { width: colW[0] - 8, lineBreak: false });
+    doc.text(
+      `${Math.floor(Number(exam.totalMarks) + 1e-9)}${exam.totalPossible ? ` / ${exam.totalPossible}` : ""}`,
+      colX[1] + 4, ty, { width: colW[1] - 8, align: "center", lineBreak: false }
+    );
+    doc.font("Helvetica");
+    y += m.minRowH;
+  }
+
   // Exam average row — theme-filled so it reads as a total.
   if (y + m.minRowH > bottomLimit()) {
     doc.addPage();
@@ -291,7 +308,7 @@ function drawExamTable(doc, exam, theme, m) {
   const ay = y + (m.minRowH - doc.currentLineHeight(true)) / 2;
   doc.text("EXAM AVERAGE", pageLeft + 4, ay, { width: colW[0] - 8, lineBreak: false });
   doc.text(exam.average != null ? `${Math.floor(Number(exam.average) + 1e-9)}%` : "—", colX[1] + 4, ay, { width: colW[1] - 8, align: "center", lineBreak: false });
-  doc.text(exam.overallResult || "—", colX[2], ay, { width: colW[2] + colW[3] + colW[4] - 4, align: "center", lineBreak: false });
+  doc.text(exam.overallResult || "—", colX[2], ay, { width: colW[2] + colW[3] - 4, align: "center", lineBreak: false });
   doc.fillColor("#000").font("Helvetica");
   y += m.minRowH;
 
