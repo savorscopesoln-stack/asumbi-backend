@@ -187,11 +187,11 @@ function drawStudentInfo(doc, student, m) {
   doc.moveDown(0.3);
 }
 
-/* One exam's subject table: Code | Subject | Marks % | Grade | Points |
-   Result, plus an average row.
+/* One exam's subject table: Subject | Marks % | Grade | Points |
+   Description, plus an average row. A paper the student missed shows AB.
      GRADE  = the grade of the score's band in the Grading System (e.g. 1-7)
      POINTS = the band's label from the Grading System (e.g. Distinction)
-     RESULT = the result label for the score (overall bands, e.g. CREDIT)
+     DESCRIPTION = the result label for the score (overall bands, e.g. CREDIT)
    Row height is MEASURED per row: a long subject code or name wraps (up to
    MAX_CELL_LINES lines) and the row grows to hold it, so text can never
    spill over the row below. Everything is sized from the metrics `m`. */
@@ -199,7 +199,7 @@ function drawExamTable(doc, exam, theme, m) {
   const pageLeft = doc.page.margins.left;
   const pageRight = doc.page.width - doc.page.margins.right;
   const usableWidth = pageRight - pageLeft;
-  const colW = [0.13, 0.33, 0.11, 0.09, 0.15, 0.19].map((w) => usableWidth * w);
+  const colW = [0.38, 0.14, 0.12, 0.16, 0.20].map((w) => usableWidth * w);
   const colX = [];
   colW.reduce((x, w) => { colX.push(x); return x + w; }, pageLeft);
   const bottomLimit = () => doc.page.height - doc.page.margins.bottom - 20;
@@ -218,8 +218,8 @@ function drawExamTable(doc, exam, theme, m) {
   doc.moveDown(0.2);
 
   let y = doc.y;
-  const headers = ["CODE", "SUBJECT", "MARKS %", "GRADE", "POINTS", "RESULT"];
-  const aligns = ["center", "left", "center", "center", "center", "center"];
+  const headers = ["SUBJECT", "MARKS %", "GRADE", "POINTS", "DESCRIPTION"];
+  const aligns = ["left", "center", "center", "center", "center"];
   const drawHeaderRow = () => {
     doc.rect(pageLeft, y, usableWidth, m.headH).fill(theme.primary);
     doc.fillColor(theme.onPrimary).fontSize(m.headFont).font("Helvetica-Bold");
@@ -234,13 +234,12 @@ function drawExamTable(doc, exam, theme, m) {
 
   exam.subjects.forEach((s, idx) => {
     const cells = [
-      s.subjectCode || "—",
       (() => {
         const nm = String(s.subjectName || "-").replace(/\s+/g, " ").trim();
         // optional subjects are labelled; they count toward the average when listed (i.e. the student took them)
         return s.optional && !/\(\s*optional\s*\)/i.test(nm) ? `${nm} (Optional)` : nm;
       })(),
-      s.percentage != null && !Number.isNaN(Number(s.percentage)) ? `${Math.floor(Number(s.percentage) + 1e-9)}%` : "—",
+      s.absent ? "AB" : (s.percentage != null && !Number.isNaN(Number(s.percentage)) ? `${Math.floor(Number(s.percentage) + 1e-9)}%` : "—"),
       s.grade || "—",
       s.points || "—",
       s.result || "—",
@@ -250,7 +249,7 @@ function drawExamTable(doc, exam, theme, m) {
     doc.fontSize(m.font).font("Helvetica");
     const lh = doc.currentLineHeight(true);
     const maxH = lh * MAX_CELL_LINES + 0.5;
-    const heights = cells.map((val, i) => (i < 2
+    const heights = cells.map((val, i) => (i < 1
       ? Math.min(maxH, Math.max(lh, doc.heightOfString(val, { width: colW[i] - 8 })))
       : lh));
     const rowH = Math.max(m.minRowH, Math.max(...heights) + 2 * m.pad);
@@ -267,7 +266,7 @@ function drawExamTable(doc, exam, theme, m) {
     cells.forEach((val, i) => {
       const textY = y + (rowH - heights[i]) / 2;
       const opts = { width: colW[i] - 8, align: aligns[i], ellipsis: true };
-      if (i < 2) doc.text(val, colX[i] + 4, textY, { ...opts, height: maxH });
+      if (i < 1) doc.text(val, colX[i] + 4, textY, { ...opts, height: maxH });
       else doc.text(val, colX[i] + 4, textY, { ...opts, lineBreak: false });
     });
     y += rowH;
@@ -281,9 +280,9 @@ function drawExamTable(doc, exam, theme, m) {
   doc.rect(pageLeft, y, usableWidth, m.minRowH).fill(theme.primary);
   doc.fillColor(theme.onPrimary).fontSize(m.font).font("Helvetica-Bold");
   const ay = y + (m.minRowH - doc.currentLineHeight(true)) / 2;
-  doc.text("EXAM AVERAGE", pageLeft + 4, ay, { width: colW[0] + colW[1] - 8, lineBreak: false });
-  doc.text(exam.average != null ? `${Math.floor(Number(exam.average) + 1e-9)}%` : "—", colX[2] + 4, ay, { width: colW[2] - 8, align: "center", lineBreak: false });
-  doc.text(exam.overallResult || "—", colX[3], ay, { width: colW[3] + colW[4] + colW[5] - 4, align: "center", lineBreak: false });
+  doc.text("EXAM AVERAGE", pageLeft + 4, ay, { width: colW[0] - 8, lineBreak: false });
+  doc.text(exam.average != null ? `${Math.floor(Number(exam.average) + 1e-9)}%` : "—", colX[1] + 4, ay, { width: colW[1] - 8, align: "center", lineBreak: false });
+  doc.text(exam.overallResult || "—", colX[2], ay, { width: colW[2] + colW[3] + colW[4] - 4, align: "center", lineBreak: false });
   doc.fillColor("#000").font("Helvetica");
   y += m.minRowH;
 
@@ -378,7 +377,7 @@ function applyMultiplyBlend(doc, opacity) {
   }
 }
 
-function drawSignatureBlock(doc, officials, institution, theme, classTeachers = [], m) {
+function drawSignatureBlock(doc, officials, institution, theme, generalRemarks = "", m) {
   const sc = Math.max(0.6, m.s);
   const u = 0.75 * sc; // one Report Form CSS px, in PDF points
   const px = (n) => n * u;
@@ -427,19 +426,10 @@ function drawSignatureBlock(doc, officials, institution, theme, classTeachers = 
   const minForStamp = (c) => (c.stamp ? BORDER * 2 + px(2) + 72 * sc + 5 * sc : 0);
 
   /* ---- layout: natural height of each card ---- */
-  const layoutTeacher = (c) => {
-    const nameSize = fsz(11.5);
-    const items = [
-      labelH() + (c.name ? textH(c.name, nameSize, "Helvetica-Bold", cellW) : BORDER),
-      labelH() + (c.signatureDiskPath && sigDisplay(c.signatureDiskPath) ? sigDisplay(c.signatureDiskPath).h : BORDER),
-      labelH() + BORDER,
-    ];
-    const gridH = Math.max(...items);
-    const remarksH = px(22) + px(16) + 2 * BORDER;
-    return Math.max(
-      BORDER + PAD_Y + titleHeight(c.title) + TITLE.mb + remarksH + px(6) + gridH + PAD_Y + BORDER,
-      minForStamp(c)
-    );
+  const REMARK_SIZE = fsz(10);
+  const layoutRemarks = (c) => {
+    const textBlock = textH(c.text || " ", REMARK_SIZE, "Helvetica", innerW);
+    return BORDER + PAD_Y + titleHeight(c.title) + TITLE.mb + textBlock + PAD_Y + BORDER;
   };
 
   const layoutApprover = (c) => {
@@ -511,29 +501,11 @@ function drawSignatureBlock(doc, officials, institution, theme, classTeachers = 
     return y + titleHeight(str) + TITLE.mb;
   };
 
-  const paintTeacher = (c, x, y, h) => {
+  const paintRemarks = (c, x, y, h) => {
     paintCardFrame(x, y, h);
     const ix = x + BORDER + PAD_X;
-    let cy = paintTitle(c.title, ix, y + BORDER + PAD_Y);
-    // remarks box: dashed #cbd5e1, radius 8, #f8fafc fill
-    const remarksH = px(22) + px(16) + 2 * BORDER;
-    doc.roundedRect(ix, cy, innerW, remarksH, px(8)).fill("#f8fafc");
-    doc.roundedRect(ix + BORDER / 2, cy + BORDER / 2, innerW - BORDER, remarksH - BORDER, px(8))
-      .lineWidth(BORDER).dash(px(3), { space: px(3) }).strokeColor("#cbd5e1").stroke();
-    doc.undash();
-    cy += remarksH + px(6);
-    // Name / Signature / Date
-    const cols = [0, 1, 2].map((i) => ix + i * (cellW + GAP));
-    let ty = paintLabel("Name", cols[0], cy, cellW);
-    if (c.name) {
-      doc.font("Helvetica-Bold").fontSize(fsz(11.5)).fillColor("#0f172a")
-        .text(c.name, cols[0], ty, { width: cellW, align: "center" });
-    } else paintSigLine(cols[0], ty, cellW);
-    ty = paintLabel("Signature", cols[1], cy, cellW);
-    if (!(c.signatureDiskPath && paintSigImage(c.signatureDiskPath, cols[1], ty, cellW))) paintSigLine(cols[1], ty, cellW);
-    ty = paintLabel("Date", cols[2], cy, cellW);
-    paintSigLine(cols[2], ty, cellW);
-    paintStamp(c.stamp, x, y, colW);
+    const cy = paintTitle(c.title, ix, y + BORDER + PAD_Y);
+    doc.font("Helvetica").fontSize(REMARK_SIZE).fillColor("#334155").text(c.text || "", ix, cy, { width: innerW });
   };
 
   const paintApprover = (c, x, y, h) => {
@@ -569,17 +541,8 @@ function drawSignatureBlock(doc, officials, institution, theme, classTeachers = 
 
   /* ---- build the cards in the Report Form's order ---- */
   const cards = [];
-  if (classTeachers.length) {
-    classTeachers.forEach((ct) => cards.push({
-      kind: "teacher",
-      title: ct.title ? `${ct.title}'s Remarks` : "Class Teacher / Lecturer's Remarks",
-      name: ct.name,
-      signatureDiskPath: ct.signatureDiskPath,
-      stamp: ct.stampDiskPath || schoolStamp,
-    }));
-  } else {
-    cards.push({ kind: "teacher", title: "Class Teacher / Lecturer's Remarks", name: null, signatureDiskPath: null, stamp: null });
-  }
+  // General remarks (automatic) replace the class teacher's remarks.
+  cards.push({ kind: "remarks", title: "General Remarks", text: generalRemarks || "No remarks." });
   if (officials.length) {
     officials.forEach((o) => cards.push({
       kind: "approver",
@@ -610,7 +573,7 @@ function drawSignatureBlock(doc, officials, institution, theme, classTeachers = 
   const rows = [];
   for (let i = 0; i < cards.length; i += 2) {
     const pair = cards.slice(i, i + 2);
-    const hs = pair.map((c) => (c.kind === "teacher" ? layoutTeacher(c) : layoutApprover(c)));
+    const hs = pair.map((c) => (c.kind === "remarks" ? layoutRemarks(c) : layoutApprover(c)));
     rows.push({ pair, h: Math.max(...hs) });
   }
   ensureRoom(barH + px(8) + rows[0].h);
@@ -626,7 +589,7 @@ function drawSignatureBlock(doc, officials, institution, theme, classTeachers = 
     const y = doc.y;
     row.pair.forEach((c, ci) => {
       const x = pageLeft + ci * (colW + GAP);
-      if (c.kind === "teacher") paintTeacher(c, x, y, row.h);
+      if (c.kind === "remarks") paintRemarks(c, x, y, row.h);
       else paintApprover(c, x, y, row.h);
     });
     doc.y = y + row.h + GAP;
@@ -664,9 +627,7 @@ function renderStudentPage(doc, page, ctx, m) {
   drawStudentInfo(doc, page.student, m);
   page.exams.forEach((exam) => drawExamTable(doc, exam, ctx.theme, m));
   drawCumulativeSummary(doc, page, ctx.theme);
-  const norm = (v) => String(v || "").trim().toLowerCase();
-  const classTeachersForStudent = ctx.classTeachers.filter((c) => norm(c.className) === norm(page.student.studentClass));
-  drawSignatureBlock(doc, ctx.signers, ctx.institution, ctx.theme, classTeachersForStudent, m);
+  drawSignatureBlock(doc, ctx.signers, ctx.institution, ctx.theme, page.generalRemarks, m);
   doc.fontSize(7).fillColor("#999").text(`Generated: ${new Date().toLocaleString()}`, { align: "right" });
   doc.fillColor("#000");
 }

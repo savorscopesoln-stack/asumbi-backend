@@ -20,6 +20,7 @@ require("./studentDashboard.test.js");
 require("./reportExport.test.js");
 require("./optionalSubjects.test.js");
 require("./downloadAccess.test.js");
+require("./generalRemarks.test.js");
 require("./regression.test.js");
 require("./walletLedger.test.js");
 require("./walletController.test.js");

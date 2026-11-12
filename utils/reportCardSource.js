@@ -13,6 +13,8 @@
 ========================================================================= */
 const sql = require("mssql");
 
+// Session statuses after which a missing submission means "did not sit" (same list as utils/examPercentages.js).
+const OVER = new Set(["ended", "completed", "done", "closed"]);
 const ensured = new WeakSet();
 async function ensureColumn(pool) {
   if (ensured.has(pool)) return;
@@ -50,8 +52,17 @@ async function getReportCardSource(pool) {
     `SELECT TOP 1 id, name FROM main_examinations WHERE is_report_exam = 1`)).recordset[0];
   if (e) {
     const subs = (await pool.request().input("id", sql.Int, e.id).query(
-      `SELECT subject FROM exam_subject_sessions WHERE main_examination_id = @id`)).recordset;
-    return { mode: "exam", id: e.id, name: e.name, subjects: await subjectsByNames(pool, subs.map((s) => s.subject)) };
+      `SELECT subject, status FROM exam_subject_sessions WHERE main_examination_id = @id`)).recordset;
+    // over = every paper of the subject has finished, so a missing mark means the student was absent (AB), not "not marked yet" (CRNM).
+    const overBy = new Map();
+    subs.forEach((r) => {
+      const k = String(r.subject || "").trim().toLowerCase();
+      const done = OVER.has(String(r.status || "").toLowerCase());
+      overBy.set(k, overBy.has(k) ? overBy.get(k) && done : done);
+    });
+    const subjects = (await subjectsByNames(pool, subs.map((s) => s.subject)))
+      .map((s) => ({ ...s, over: !!overBy.get(String(s.name || "").trim().toLowerCase()) }));
+    return { mode: "exam", id: e.id, name: e.name, subjects };
   }
   return { mode: "none", id: null, name: null, subjects: [] };
 }

@@ -2,7 +2,8 @@ const sql = require("mssql");
 const { getInstitutionHeader, getSigningOfficials, getClassTeachers, getFooterStampDiskPath, sendPdfBuffer, urlToDiskPath, loadPdfImage } = require("../utils/reportExport");
 const { getReportFormConfig } = require("../utils/reportFormSubjects");
 const { splitGroupKey } = require("../utils/splitPapers");
-const { countedWithoutSplitDuplicates } = require("../utils/examPercentages");
+const { countedWithoutSplitDuplicates, loadOptionalMatcher, isSessionOver } = require("../utils/examPercentages");
+const { buildGeneralRemarks } = require("../utils/generalRemarks");
 const { buildTranscriptPdf } = require("../utils/transcriptPdf");
 const { loadGradingSystem, getGradeForScore, getOverallResultForScore } = require("../utils/grading");
 
@@ -153,6 +154,49 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
       });
     });
 
+    /* ---------------- 4b. Absent papers (AB) ----------------
+       A compulsory paper of an exam the student has marks in, scheduled for the student's class or year,
+       whose session is over and that the student has no mark for, is listed as AB (absent) instead of
+       being left out or shown as 0%. Optional subjects are never listed as AB. AB has no percentage, so it
+       never changes an average. */
+    const examIdsInPlay = [...new Set([...byStudent.values()].flatMap((m) => [...m.keys()]).map(Number))].filter(Number.isFinite);
+    const isOptionalByName = await loadOptionalMatcher(pool);
+    const nm = (v) => String(v || "").replace(/\(\s*optional\s*\)/gi, "").replace(/\s+/g, " ").trim().toLowerCase();
+    if (examIdsInPlay.length) {
+      try {
+        const sessions = (await pool.request().query(`
+          SELECT ess.main_examination_id AS examId, ess.subject, ess.paper_label, ess.allow_concurrent, ess.status AS session_status,
+                 c.name AS className, ea.year_of_study
+          FROM exam_subject_sessions ess
+          JOIN e_assessments ea ON ea.id = ess.e_assessment_id
+          LEFT JOIN Classes c ON c.id = ea.class_id
+          WHERE ess.main_examination_id IN (${examIdsInPlay.join(",")})`)).recordset;
+        const codes = new Map((await pool.request().query(`SELECT name, code FROM Subjects`)).recordset.map((r) => [nm(r.name), r.code]));
+        students.forEach((st) => {
+          const examsMap = byStudent.get(st.id);
+          if (!examsMap) return;
+          examsMap.forEach((exam, examId) => {
+            const have = new Set(exam.subjects.map((x) => nm(x.subjectName)));
+            const haveGroups = new Set(exam.subjects.map((x) => x.split_group).filter(Boolean));
+            sessions.filter((ss) => Number(ss.examId) === Number(examId)).forEach((ss) => {
+              const forThem = (ss.className && ss.className === st.studentClass) || (Number(st.yearOfStudy) > 0 && Number(ss.year_of_study) === Number(st.yearOfStudy));
+              if (!forThem || !isSessionOver(ss.session_status) || isOptionalByName(ss.subject)) return;
+              const key = nm(ss.subject);
+              const group = splitGroupKey({ subject: ss.subject, paper_label: ss.paper_label, allow_concurrent: ss.allow_concurrent });
+              if (have.has(key) || (group && haveGroups.has(group))) return;
+              have.add(key);
+              exam.subjects.push({
+                subjectId: null, subjectCode: codes.get(key) || null, subjectName: ss.subject,
+                percentage: null, absent: true, split_group: group,
+              });
+            });
+          });
+        });
+      } catch (err) {
+        console.error("TRANSCRIPT ABSENT LOOKUP ERROR (AB rows skipped):", err.message);
+      }
+    }
+
     /* ---------------- 5. Shape into buildTranscriptPdf's expected format ----------------
        Students in scope with no released marks at all are skipped
        (rather than drawing a blank page for them). */
@@ -182,6 +226,7 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
             || String(a.subjectName).localeCompare(String(b.subjectName), undefined, { numeric: true });
         });
         const subjects = orderedSubjects.map((s) => {
+          if (s.absent) return { ...s, optional: false, grade: "—", points: "—", gradePoints: null, result: "—" };
           const band = s.percentage != null ? getGradeForScore(s.percentage, gradingSystem) : null;
           return {
             ...s,
@@ -209,8 +254,22 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
       const allScores = exams.flatMap((e) => countedWithoutSplitDuplicates(e.subjects.map((s) => ({ percentage: s.percentage == null ? null : Number(s.percentage), group: s.split_group, sat: true }))).map((x) => x.percentage).filter((n) => n != null && !Number.isNaN(n)));
       const cumulativeAverage = allScores.length ? round2(allScores.reduce((a, b) => a + b, 0) / allScores.length) : null;
 
+      // General remarks (replaces the class teacher's remarks): subjects below the pass mark + absent papers.
+      const passMark = Number.isFinite(Number(gradingSystem?.passMark)) ? Number(gradingSystem.passMark) : 40;
+      const remarkParts = exams.map((e) => {
+        const scored = e.subjects.filter((x) => x.percentage != null && !Number.isNaN(Number(x.percentage))).map((x) => ({ name: x.subjectName, score: Number(x.percentage) }));
+        const text = buildGeneralRemarks({
+          passMark,
+          weak: scored.filter((x) => x.score < passMark),
+          absent: e.subjects.filter((x) => x.absent).map((x) => x.subjectName),
+          all: scored,
+        });
+        return exams.length > 1 && text ? `${e.examName}: ${text}` : text;
+      }).filter(Boolean);
+
       studentPages.push({
         student,
+        generalRemarks: remarkParts.join("\n"),
         exams,
         cumulativeAverage,
         cumulativeResult: cumulativeAverage != null ? getOverallResultForScore(cumulativeAverage, gradingSystem) : "—",
