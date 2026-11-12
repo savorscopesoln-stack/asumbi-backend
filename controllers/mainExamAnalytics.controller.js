@@ -101,7 +101,7 @@ async function loadSubjectsWithAssessment(pool, mainExaminationId) {
       SELECT
         ess.id AS session_id, ess.subject, ess.status AS session_status,
         ess.exam_date, ess.start_time, ess.end_time, ess.e_assessment_id,
-        ess.report_code, ess.report_key,
+        ess.report_code, ess.report_key, ess.allow_concurrent, ess.paper_label,
         ea.title AS assessment_title, ea.total_marks, ea.class_id, ea.year_of_study,
         c.name AS class_name
       FROM exam_subject_sessions ess
@@ -601,7 +601,7 @@ function assignSubjectCodes(subjects, { ignoreOverrides = false } = {}) {
 }
 
 // What the key says a code means: the admin's wording, else the subject name.
-const subjectKeyText = (s) => String(s.report_key || "").trim() || s.subject;
+const subjectKeyText = (s) => String(s.report_key || "").trim() || (s.allow_concurrent && s.paper_label ? `${s.subject} (${s.paper_label})` : s.subject);
 
 async function loadNominalRoll(pool, mainExaminationId) {
   const allSubjects = await loadSubjectsWithAssessment(pool, mainExaminationId);
@@ -664,7 +664,7 @@ async function loadNominalRoll(pool, mainExaminationId) {
         percentage = 0;
         absent = true;
       }
-      if (percentage != null) counted.push({ percentage });
+      if (percentage != null) counted.push({ percentage, group: examPct.splitGroupKey(subj), sat: score != null });
       return {
         session_id: subj.session_id,
         not_registered: false,
@@ -676,7 +676,8 @@ async function loadNominalRoll(pool, mainExaminationId) {
       };
     });
     // Total / average are built from PERCENTAGES (never raw marks).
-    const sum = examPct.summarisePercentages(counted, gradingSystem);
+    // Split papers: every code is listed above, but a split subject counts once (the paper sat).
+    const sum = examPct.summarisePercentages(examPct.countedWithoutSplitDuplicates(counted), gradingSystem);
     return {
       student_id: st.student_id,
       name: st.name,
@@ -703,7 +704,7 @@ async function loadNominalRoll(pool, mainExaminationId) {
   });
 
   return {
-    subjects: subjects.map((s) => ({ session_id: s.session_id, subject: s.subject, code: subjectCodes.get(s.session_id), key: subjectKeyText(s), total_marks: s.total_marks })),
+    subjects: subjects.map((s) => ({ session_id: s.session_id, subject: s.subject, paper_label: s.paper_label || null, split_paper: !!s.allow_concurrent, code: subjectCodes.get(s.session_id), key: subjectKeyText(s), total_marks: s.total_marks })),
     rows,
   };
 }
@@ -1064,7 +1065,7 @@ const getMainExamStudentAnalytics = async (req, res) => {
     // papers not sat left out) — see utils/examPercentages.js.
     const result = await request.query(`
       WITH registered AS (
-        SELECT DISTINCT st.id AS student_id, ess.id AS session_id, ess.e_assessment_id, ess.subject, ess.status AS session_status
+        SELECT DISTINCT st.id AS student_id, ess.id AS session_id, ess.e_assessment_id, ess.subject, ess.allow_concurrent, ess.paper_label, ess.status AS session_status
         FROM Students st
         JOIN exam_subject_sessions ess ON ess.main_examination_id = @mainExaminationId
         JOIN e_assessments ea ON ea.id = ess.e_assessment_id
@@ -1086,16 +1087,22 @@ const getMainExamStudentAnalytics = async (req, res) => {
     const isOptional = await examPct.loadOptionalMatcher(pool);
     const byStudent = new Map();
     result.recordset.forEach((r) => {
-      if (!byStudent.has(r.student_id)) byStudent.set(r.student_id, { student_id: r.student_id, name: r.name, admission_no: r.admissionNo, registered: 0, completed: 0, counted: [] });
+      if (!byStudent.has(r.student_id)) byStudent.set(r.student_id, { student_id: r.student_id, name: r.name, admission_no: r.admissionNo, registered: 0, completed: 0, counted: [], groups: new Set(), completedGroups: new Set() });
       const st = byStudent.get(r.student_id);
-      st.registered += 1;
+      // A split subject (several concurrent papers) is ONE subject here: registered once,
+      // completed once, and only one of its papers is counted in the total.
+      const group = examPct.splitGroupKey(r);
+      if (!group || !st.groups.has(group)) st.registered += 1;
       let percentage = r.score != null && r.total_marks > 0 ? round2((r.score / r.total_marks) * 100) : null;
-      if (r.score != null) st.completed += 1;
-      else if (!isOptional(r.subject) && examPct.isSessionOver(r.session_status)) percentage = 0; // absent compulsory paper = 0
-      if (percentage != null) st.counted.push({ percentage });
+      if (r.score != null) {
+        if (!group || !st.completedGroups.has(group)) st.completed += 1;
+        if (group) st.completedGroups.add(group);
+      } else if (!isOptional(r.subject) && examPct.isSessionOver(r.session_status)) percentage = 0; // absent compulsory paper = 0
+      if (group) st.groups.add(group);
+      if (percentage != null) st.counted.push({ percentage, group, sat: r.score != null });
     });
     const students = [...byStudent.values()].map((st) => {
-      const sum = examPct.summarisePercentages(st.counted, gradingSystem);
+      const sum = examPct.summarisePercentages(examPct.countedWithoutSplitDuplicates(st.counted), gradingSystem);
       return {
         student_id: st.student_id,
         name: st.name,
@@ -1140,7 +1147,7 @@ const getStudentExaminationProfile = async (req, res) => {
       .input("yearOfStudy", sql.Int, student.yearOfStudy || 0)
       .query(`
         SELECT
-          ess.id AS session_id, ess.subject, ess.status AS session_status, ess.exam_date,
+          ess.id AS session_id, ess.subject, ess.allow_concurrent, ess.paper_label, ess.status AS session_status, ess.exam_date,
           ea.total_marks,
           sub.score, sub.status AS submission_status, sub.submitted_at
         FROM exam_subject_sessions ess
@@ -1166,6 +1173,8 @@ const getStudentExaminationProfile = async (req, res) => {
       return {
         session_id: r.session_id,
         subject: r.subject,
+        paper_label: r.paper_label || null,
+        split_group: examPct.splitGroupKey(r),
         exam_date: r.exam_date,
         status,
         optional,
@@ -1175,8 +1184,16 @@ const getStudentExaminationProfile = async (req, res) => {
       };
     });
 
-    const scored = subjects.filter((s) => s.status === "completed" && s.percentage != null);
-    const sum = examPct.summarisePercentages(subjects.map((s) => ({ percentage: s.percentage })), gradingSystem);
+    // Split papers: all papers stay listed, but only the one that was sat counts in the total.
+    const countedItems = examPct.countedWithoutSplitDuplicates(
+      subjects.map((s) => ({ percentage: s.percentage, group: s.split_group, sat: s.status === "completed", session_id: s.session_id })));
+    const countedIds = new Set(countedItems.map((x) => x.session_id));
+    subjects.forEach((s) => { s.counted_in_total = s.percentage != null && countedIds.has(s.session_id); });
+    const completedGroups = new Set(subjects.filter((s) => s.split_group && s.status === "completed").map((s) => s.split_group));
+    // a split paper that was not sat, while its sibling was, is not "absent" or "upcoming"
+    const isSpare = (s) => s.split_group && s.status !== "completed" && completedGroups.has(s.split_group);
+    const scored = subjects.filter((s) => s.status === "completed" && s.percentage != null && (!s.split_group || s.counted_in_total));
+    const sum = examPct.summarisePercentages(countedItems, gradingSystem);
     const totalObtained = sum.total;
     const totalPossible = sum.possible;
     const overallAverage = sum.average;
@@ -1188,8 +1205,8 @@ const getStudentExaminationProfile = async (req, res) => {
       total_possible: totalPossible,
       overall_average: overallAverage,
       subjects_completed: scored.length,
-      subjects_absent: subjects.filter((s) => s.status === "absent").length,
-      subjects_upcoming: subjects.filter((s) => s.status === "upcoming").length,
+      subjects_absent: subjects.filter((s) => s.status === "absent" && !isSpare(s)).length,
+      subjects_upcoming: subjects.filter((s) => s.status === "upcoming" && !isSpare(s)).length,
       subjects,
     });
   } catch (err) {

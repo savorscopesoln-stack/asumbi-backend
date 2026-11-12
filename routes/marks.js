@@ -2,7 +2,7 @@ const express = require("express");
 const app = express();
 const { notifyUsers } = require("../utils/notify");
 const { getReportCardSource } = require("../utils/reportCardSource");
-const { applyReportFormSubjects } = require("../utils/reportFormSubjects");
+const { applyReportFormSubjects, annotateSplitSubjects } = require("../utils/reportFormSubjects");
 
 /* ================= SAFE NUMBER ================= */
 const toNum = (v) => {
@@ -213,7 +213,7 @@ app.get("/api/marks/:assessmentId", async (req, res) => {
 app.get("/api/report-card-source", async (req, res) => {
   try {
     const pool = req.pool || req.app.locals.pool;
-    res.json(await applyReportFormSubjects(pool, await getReportCardSource(pool)));
+    res.json(await annotateSplitSubjects(pool, await applyReportFormSubjects(pool, await getReportCardSource(pool))));
   } catch (err) {
     console.error("REPORT CARD SOURCE ERROR:", err);
     res.status(500).json({ mode: "none", id: null, name: null, subjects: [] });

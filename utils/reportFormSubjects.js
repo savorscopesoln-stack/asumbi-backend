@@ -22,6 +22,7 @@
      no mark yet.) Applies to every report the system generates.
 ========================================================================= */
 const sql = require("mssql");
+const { splitGroupKey, splitBaseName, detectPossibleSplits, norm: normName } = require("./splitPapers");
 
 const ensured = new WeakSet();
 
@@ -78,6 +79,32 @@ async function applyReportFormSubjects(pool, source) {
   };
 }
 
+
+/** Marks each subject of an exam-mode report-card source with its split-paper info:
+    split (flagged on the exam's sessions), paper_label, split_group, and possible_split
+    (looks like a split paper by name but is not flagged). Never throws. */
+async function annotateSplitSubjects(pool, source) {
+  if (!source || source.mode !== "exam" || !Array.isArray(source.subjects)) return source;
+  try {
+    const rows = (await pool.request().input("id", sql.Int, source.id).query(
+      `SELECT subject, allow_concurrent, paper_label FROM exam_subject_sessions WHERE main_examination_id = @id`)).recordset;
+    const flagged = new Map();
+    rows.filter((r) => r.allow_concurrent).forEach((r) => flagged.set(normName(r.subject), r));
+    const possible = detectPossibleSplits(source.subjects.map((s, i) => ({ id: i, name: s.name })));
+    return {
+      ...source,
+      subjects: source.subjects.map((s, i) => {
+        const f = flagged.get(normName(s.name));
+        if (f) return { ...s, split: true, paper_label: f.paper_label || null, split_group: splitGroupKey({ subject: s.name, paper_label: f.paper_label, allow_concurrent: 1 }) };
+        return possible.has(i) ? { ...s, possible_split: true, possible_group: possible.get(i) } : s;
+      }),
+    };
+  } catch (err) {
+    console.error("SPLIT ANNOTATE ERROR (ignored):", err.message);
+    return source;
+  }
+}
+
 /** SQL fragment restricting a ranking/average query to the subjects on the
     report form. Optional subjects are INCLUDED: they only produce a Marks row
     for students who did them, so for everyone else they are naturally left
@@ -98,12 +125,25 @@ const getReportFormSubjectsAdmin = async (req, res) => {
     const cfg = await getReportFormConfig(pool);
     const all = (await pool.request().query(`SELECT id, name, code FROM Subjects ORDER BY name ASC`)).recordset;
     const chosen = new Map(cfg.subjects.map((s) => [s.id, s]));
+    // Split papers: flagged on any Main Examination subject session (by name), plus
+    // subjects whose names look like papers of one subject but were never flagged.
+    let flagged = new Map();
+    try {
+      const rows = (await pool.request().query(
+        `SELECT subject, paper_label FROM exam_subject_sessions WHERE allow_concurrent = 1`)).recordset;
+      rows.forEach((r) => flagged.set(normName(r.subject), r.paper_label || null));
+    } catch (_) { /* columns not there yet: nothing is flagged */ }
+    const possible = detectPossibleSplits(all.map((s) => ({ id: s.id, name: s.name })));
     res.json({
       configured: cfg.configured,
       subjects: all.map((s) => ({
         id: s.id, name: s.name, code: s.code,
         selected: chosen.has(s.id),
         isOptional: !!chosen.get(s.id)?.optional,
+        split: flagged.has(normName(s.name)),
+        paper_label: flagged.get(normName(s.name)) || null,
+        possible_split: !flagged.has(normName(s.name)) && possible.has(s.id),
+        split_group: flagged.has(normName(s.name)) || possible.has(s.id) ? splitBaseName(s.name, flagged.get(normName(s.name))) : null,
       })),
     });
   } catch (err) {
@@ -163,6 +203,6 @@ const putReportFormSubjectsAdmin = async (req, res) => {
 };
 
 module.exports = {
-  ensureTable, getReportFormConfig, applyReportFormSubjects, countedSubjectsClause,
+  ensureTable, getReportFormConfig, applyReportFormSubjects, annotateSplitSubjects, countedSubjectsClause,
   getReportFormSubjectsAdmin, putReportFormSubjectsAdmin,
 };

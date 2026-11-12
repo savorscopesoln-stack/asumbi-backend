@@ -15,7 +15,7 @@ const { denyPrivateUploads } = require("./utils/privateUploadGuard");
 
 const { runWithTenant } = require("./utils/uploadPaths");
 const { getReportCardSource } = require("./utils/reportCardSource");
-const { applyReportFormSubjects, countedSubjectsClause } = require("./utils/reportFormSubjects");
+const { applyReportFormSubjects, annotateSplitSubjects, countedSubjectsClause } = require("./utils/reportFormSubjects");
 const { poolPromise, sql, getPool, listTenantKeys, hasTenant } = require("./config/db");
 const { resolveTenantKey } = require("./config/tenants");
 const { protect, authorize, adminOnly, requirePage } = require("./middleware/authMiddleware");
@@ -1270,50 +1270,50 @@ app.get("/api/student/positions", protect, async (req, res) => {
     // student's position always matches the average printed on their report.
     const countedClause = await countedSubjectsClause(pool, source, "m.subjectId");
 
-    const result = await pool.request()
-      .input("studentId", sql.Int, studentId)
+    // Split / concurrent papers: a split subject (e.g. 9819 + 9820) counts ONCE in the
+    // average the positions are ranked on — the paper the student sat (highest if both).
+    // The averages are therefore built here from the marks, not by a SQL AVG().
+    const annotated = await annotateSplitSubjects(pool, source);
+    const groupBySubjectId = new Map();
+    (annotated.subjects || []).forEach((s) => { if (s.id != null && s.split_group) groupBySubjectId.set(Number(s.id), s.split_group); });
+
+    const marksResult = await pool.request()
       .input("sourceId", sql.Int, source.id)
       .query(`
-        WITH StudentAverages AS (
-          SELECT
-            st.id AS studentId,
-            st.studentClass,
-            AVG(CAST(m.percentage AS FLOAT)) AS averageScore
-          FROM Students st
-          INNER JOIN Marks m ON m.studentId = st.id
-          INNER JOIN Assessments a
-            ON a.id = m.assessmentId
-           AND a.sourceSystem = 'e_assessment'
-           AND ${scope}
-          WHERE ISNULL(st.status, '') <> 'graduated'
-            AND m.percentage IS NOT NULL
-            ${countedClause}
-          GROUP BY st.id, st.studentClass
-        ),
-        RankedStudents AS (
-          SELECT
-            studentId,
-            studentClass,
-            averageScore,
-            RANK() OVER (ORDER BY averageScore DESC) AS overallPosition,
-            RANK() OVER (
-              PARTITION BY studentClass
-              ORDER BY averageScore DESC
-            ) AS classPosition
-          FROM StudentAverages
-        )
-        SELECT
-          currentStudent.studentId,
-          currentStudent.studentClass,
-          currentStudent.averageScore,
-          currentStudent.classPosition,
-          currentStudent.overallPosition,
-          (SELECT COUNT(*) FROM StudentAverages cohort
-            WHERE cohort.studentClass = currentStudent.studentClass) AS classRankedCount,
-          (SELECT COUNT(*) FROM StudentAverages) AS overallRankedCount
-        FROM RankedStudents currentStudent
-        WHERE currentStudent.studentId = @studentId
+        SELECT st.id AS studentId, st.studentClass, m.subjectId, m.percentage
+        FROM Students st
+        INNER JOIN Marks m ON m.studentId = st.id
+        INNER JOIN Assessments a
+          ON a.id = m.assessmentId
+         AND a.sourceSystem = 'e_assessment'
+         AND ${scope}
+        WHERE ISNULL(st.status, '') <> 'graduated'
+          AND m.percentage IS NOT NULL
+          ${countedClause}
       `);
+    const examPct = require("./utils/examPercentages");
+    const perStudent = new Map();
+    marksResult.recordset.forEach((r) => {
+      if (!perStudent.has(r.studentId)) perStudent.set(r.studentId, { studentId: r.studentId, studentClass: r.studentClass, items: [] });
+      perStudent.get(r.studentId).items.push({ percentage: Number(r.percentage), group: groupBySubjectId.get(Number(r.subjectId)) || null, sat: true });
+    });
+    const averages = [...perStudent.values()].map((st) => {
+      const counted = examPct.countedWithoutSplitDuplicates(st.items);
+      return { studentId: st.studentId, studentClass: st.studentClass, averageScore: counted.length ? counted.reduce((a, x) => a + x.percentage, 0) / counted.length : null };
+    }).filter((x) => x.averageScore != null);
+    // competition ranking (ties share a rank: 1, 1, 3)
+    const rankOf = (list, value) => 1 + list.filter((x) => x.averageScore > value).length;
+    const mine = averages.find((x) => Number(x.studentId) === Number(studentId));
+    const sameClass = mine ? averages.filter((x) => x.studentClass === mine.studentClass) : [];
+    const result = {
+      recordset: mine ? [{
+        averageScore: mine.averageScore,
+        classPosition: rankOf(sameClass, mine.averageScore),
+        overallPosition: rankOf(averages, mine.averageScore),
+        classRankedCount: sameClass.length,
+        overallRankedCount: averages.length,
+      }] : [],
+    };
 
     const row = result.recordset?.[0];
     return res.json({

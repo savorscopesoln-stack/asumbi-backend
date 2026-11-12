@@ -150,3 +150,42 @@ test("publish timetable: succeeds once every subject is scheduled + approved", a
   assert.strictEqual(res.statusCode, 200);
   assert.ok(log.some((l) => l.sql.includes("status = 'published'")));
 });
+
+/* ---------- split / concurrent papers ---------- */
+test("add subject: a concurrent paper needs a paper name", async () => {
+  const { pool } = makeMockPool(noConflictResponses());
+  const res = makeRes();
+  await addSubjectSession(makeReq({
+    pool, params: { mainExamId: "10" },
+    body: { subject: "Mathematics", allow_concurrent: true,
+      start_time: "2026-11-02T09:00:00", end_time: "2026-11-02T11:00:00" },
+  }), res);
+  assert.strictEqual(res.statusCode, 400);
+  assert.match(res.body.message, /paper name/i);
+});
+
+test("add subject: concurrent paper saves allow_concurrent and paper_label", async () => {
+  const { pool, calls } = makeMockPool(noConflictResponses());
+  const res = makeRes();
+  await addSubjectSession(makeReq({
+    pool, params: { mainExamId: "10" },
+    body: { subject: "Mathematics", allow_concurrent: true, paper_label: "Paper 2",
+      start_time: "2026-11-02T09:00:00", end_time: "2026-11-02T11:00:00" },
+  }), res);
+  assert.strictEqual(res.statusCode, 201);
+  const insert = (calls || []).find((c) => /INSERT INTO exam_subject_sessions/.test(c.query || c.sql || ""));
+  if (insert) assert.match(insert.query || insert.sql, /allow_concurrent, paper_label/);
+});
+
+test("add subject: same subject + same paper name is still a duplicate", async () => {
+  const { pool } = makeMockPool(noConflictResponses().map((r) =>
+    r[0].includes("LOWER(@subject)") ? [r[0], () => [{ id: 9 }]] : r));
+  const res = makeRes();
+  await addSubjectSession(makeReq({
+    pool, params: { mainExamId: "10" },
+    body: { subject: "Mathematics", allow_concurrent: true, paper_label: "Paper 1",
+      start_time: "2026-11-02T09:00:00", end_time: "2026-11-02T11:00:00" },
+  }), res);
+  assert.strictEqual(res.statusCode, 400);
+  assert.match(res.body.message, /Paper 1/);
+});

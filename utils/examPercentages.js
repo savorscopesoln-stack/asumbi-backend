@@ -34,6 +34,30 @@ async function loadOptionalMatcher(pool) {
   return (subjectName) => /\(\s*optional\s*\)/i.test(String(subjectName || "")) || names.has(norm(subjectName));
 }
 
+
+/* Split / concurrent papers (exam_subject_sessions.allow_concurrent = 1): one
+   subject sat as several papers at the same time (e.g. codes 9819 and 9820).
+   In reports every paper/code is still LISTED, but the subject is ONE paper
+   in the totals: only the paper the candidate actually sat is counted. */
+const { splitBaseName, splitGroupKey } = require("./splitPapers");
+
+/** items: [{ percentage, group, sat }] -> the items that COUNT: ungrouped items as they are,
+    and for each split group ONE item (the paper that was sat — highest if several — else the
+    first one, i.e. a single absent 0 for the whole subject). */
+function countedWithoutSplitDuplicates(items) {
+  const out = [];
+  const best = new Map(); // group -> chosen item
+  items.forEach((it) => {
+    if (it.percentage == null) return;
+    if (!it.group) { out.push(it); return; }
+    const cur = best.get(it.group);
+    if (!cur) { best.set(it.group, it); return; }
+    const better = (it.sat && !cur.sat) || (it.sat === cur.sat && it.sat && Number(it.percentage) > Number(cur.percentage));
+    if (better) best.set(it.group, it);
+  });
+  return out.concat([...best.values()]);
+}
+
 /** items: [{ percentage }] for the papers that COUNT (absent compulsory = 0). */
 function summarisePercentages(items, gradingSystem) {
   const counted = items.filter((x) => x.percentage != null);
@@ -46,4 +70,4 @@ function summarisePercentages(items, gradingSystem) {
   };
 }
 
-module.exports = { round2, isSessionOver, loadOptionalMatcher, summarisePercentages, loadGradingSystem };
+module.exports = { round2, isSessionOver, loadOptionalMatcher, summarisePercentages, loadGradingSystem, splitGroupKey, splitBaseName, countedWithoutSplitDuplicates };

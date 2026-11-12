@@ -305,7 +305,7 @@ const getClassResultsReport = async (req, res) => {
     const subjectsResult = await pool.request()
       .input("mainExamId", sql.Int, mainExamId).input("classId", sql.Int, classId).input("year", sql.Int, classYear)
       .query(`
-        SELECT ess.id AS session_id, ess.subject, ess.status AS session_status, ess.e_assessment_id, ea.total_marks
+        SELECT ess.id AS session_id, ess.subject, ess.allow_concurrent, ess.paper_label, ess.status AS session_status, ess.e_assessment_id, ea.total_marks
         FROM exam_subject_sessions ess
         JOIN e_assessments ea ON ea.id = ess.e_assessment_id
         WHERE ess.main_examination_id = @mainExamId
@@ -345,10 +345,10 @@ const getClassResultsReport = async (req, res) => {
         let absent = false;
         // Not sat: a compulsory paper counts as 0 once its session is over; an optional one is left out.
         if (score == null && !optional && examPct.isSessionOver(sub.session_status)) { percentage = 0; absent = true; }
-        if (percentage != null) counted.push({ percentage });
-        return { subject: sub.subject, score: score ?? null, total_marks: sub.total_marks, percentage, absent, optional, grade: null };
+        if (percentage != null) counted.push({ percentage, group: examPct.splitGroupKey(sub), sat: score != null });
+        return { subject: sub.subject, paper_label: sub.paper_label || null, score: score ?? null, total_marks: sub.total_marks, percentage, absent, optional, grade: null };
       });
-      const sum = examPct.summarisePercentages(counted, gradingSystem);
+      const sum = examPct.summarisePercentages(examPct.countedWithoutSplitDuplicates(counted), gradingSystem);
       return {
         student_id: st.id,
         name: st.name,
@@ -366,7 +366,7 @@ const getClassResultsReport = async (req, res) => {
       report: "class_results",
       generated_at: new Date().toISOString(),
       class: { id: klass.id, name: klass.name },
-      subjects: subjects.map((s) => ({ session_id: s.session_id, subject: s.subject, total_marks: s.total_marks })),
+      subjects: subjects.map((s) => ({ session_id: s.session_id, subject: s.subject, paper_label: s.paper_label || null, total_marks: s.total_marks })),
       rows,
     });
   } catch (err) {

@@ -2301,6 +2301,19 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       ALTER TABLE exam_subject_sessions ADD report_key NVARCHAR(150) NULL
     `);
 
+    /* ---------------- exam_subject_sessions.paper_label / allow_concurrent ----------------
+       Split / concurrent papers: one subject may have several papers at the
+       same time (Paper 1, Paper 2...). Mirrors migrations/2026-10-08_add_split_paper_columns.sql
+       so a fresh or older database gets the columns without a manual step. */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sys.columns WHERE Name = N'paper_label' AND Object_ID = Object_ID(N'exam_subject_sessions'))
+      ALTER TABLE exam_subject_sessions ADD paper_label NVARCHAR(100) NULL
+    `);
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sys.columns WHERE Name = N'allow_concurrent' AND Object_ID = Object_ID(N'exam_subject_sessions'))
+      ALTER TABLE exam_subject_sessions ADD allow_concurrent BIT NOT NULL DEFAULT 0
+    `);
+
     /* ---------------- exam_audit_log ----------------
        Factual event trail for Main Examination actions (§53) —
        created/scheduled/activated/ended/results-published/etc.

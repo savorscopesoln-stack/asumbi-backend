@@ -1,6 +1,8 @@
 const sql = require("mssql");
 const { getInstitutionHeader, getSigningOfficials, getClassTeachers, getFooterStampDiskPath, sendPdfBuffer, urlToDiskPath, loadPdfImage } = require("../utils/reportExport");
 const { getReportFormConfig } = require("../utils/reportFormSubjects");
+const { splitGroupKey } = require("../utils/splitPapers");
+const { countedWithoutSplitDuplicates } = require("../utils/examPercentages");
 const { buildTranscriptPdf } = require("../utils/transcriptPdf");
 const { loadGradingSystem, getGradeForScore, getOverallResultForScore } = require("../utils/grading");
 
@@ -87,6 +89,7 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
         m.studentId,
         me.id AS mainExaminationId, me.name AS examName, me.academic_year, me.term, me.start_date,
         m.subjectId, sub.name AS subjectName, sub.code AS subjectCode,
+        ess.allow_concurrent, ess.paper_label,
         m.percentage
       FROM Marks m
       INNER JOIN Assessments a ON a.id = m.assessmentId AND a.sourceSystem = 'e_assessment'
@@ -130,6 +133,7 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
         subjectCode: row.subjectCode || null,
         subjectName: row.subjectName || row.subjectCode || "Subject",
         percentage: row.percentage,
+        split_group: splitGroupKey({ subject: row.subjectName, paper_label: row.paper_label, allow_concurrent: row.allow_concurrent }),
       });
     });
 
@@ -142,7 +146,9 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
       if (!examsMap || !examsMap.size) return;
 
       const exams = [...examsMap.values()].map((exam) => {
-        const scores = exam.subjects.map((s) => Number(s.percentage)).filter((n) => !Number.isNaN(n));
+        // Split papers (e.g. 9819 + 9820) stay listed, but a split subject counts once (the paper sat).
+        const counted = countedWithoutSplitDuplicates(exam.subjects.map((s) => ({ percentage: s.percentage == null ? null : Number(s.percentage), group: s.split_group, key: s.subjectId, sat: true })));
+        const scores = counted.map((x) => x.percentage).filter((n) => n != null && !Number.isNaN(n));
         const average = scores.length ? round2(scores.reduce((a, b) => a + b, 0) / scores.length) : null;
 
         // Per-subject columns, all from the school's Grading System:
@@ -171,7 +177,8 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
           };
         });
 
-        const gradePointsList = subjects.map((s) => s.gradePoints).filter((n) => n != null && !Number.isNaN(n));
+        const countedSubjectKeys = new Set(counted.map((x) => x.key));
+        const gradePointsList = subjects.filter((s) => !s.split_group || countedSubjectKeys.has(s.subjectId)).map((s) => s.gradePoints).filter((n) => n != null && !Number.isNaN(n));
         const aggregatePoints = gradePointsList.length ? gradePointsList.reduce((a, b) => a + b, 0) : null;
 
         return {
@@ -183,7 +190,7 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
         };
       });
 
-      const allScores = exams.flatMap((e) => e.subjects.map((s) => Number(s.percentage)).filter((n) => !Number.isNaN(n)));
+      const allScores = exams.flatMap((e) => countedWithoutSplitDuplicates(e.subjects.map((s) => ({ percentage: s.percentage == null ? null : Number(s.percentage), group: s.split_group, sat: true }))).map((x) => x.percentage).filter((n) => n != null && !Number.isNaN(n)));
       const cumulativeAverage = allScores.length ? round2(allScores.reduce((a, b) => a + b, 0) / allScores.length) : null;
 
       studentPages.push({
