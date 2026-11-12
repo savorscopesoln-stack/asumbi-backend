@@ -317,144 +317,324 @@ function drawCumulativeSummary(doc, page, theme) {
   doc.y += 26;
 }
 
-/* Signature / stamp block — mirrors the on-screen Report Form's
-   authorisation section (frontend/src/pages/reports.jsx) so every stamp
-   and signature shown there also appears on the downloaded transcript:
-     1. one "Class Teacher's Remarks" row per class teacher of THIS
-        student's class (name, own uploaded signature, own stamp);
-     2. one "Approval & Authentication" row per signatory (name, title,
-        own uploaded signature, own stamp).
-   A stamp falls back to the school-wide stamp when the person hasn't
-   uploaded their own (same fallback as the form), and a plain dashed
-   placeholder is drawn only when no stamp exists anywhere. */
-function drawImageFit(doc, diskPath, x, y, w, h) {
-  if (!diskPath) return false;
+/* =========================================================================
+   OFFICIAL AUTHORISATION BLOCK — a 1:1 redraw of the student Report Form's
+   "Official Authorisation" section (frontend/src/pages/Student/
+   StudentReport.jsx, mirrored on screen by
+   frontend/src/components/OfficialAuthorisation.jsx), so the downloaded
+   transcript carries its stamps and signatures exactly the way the Report
+   Form does:
+
+     - a section label bar ("OFFICIAL AUTHORISATION", theme-coloured left
+       rule);
+     - a two-column grid of rounded cards, filled left-to-right:
+         · one "<Title>'s Remarks" card per class teacher of the student's
+           class — dashed remarks box, then Name / Signature / Date;
+         · one "Approved By" card per signatory — name, title, then
+           Signature / Official Stamp;
+     - every card's stamp is the person's OWN stamp, falling back to the
+       school-wide stamp, drawn LARGE (2in x 1in) over the card's upper
+       right corner, tilted -8deg at 85% opacity with a multiply blend so
+       it reads as ink pressed onto the page;
+     - the dashed "Official Stamp" placeholder shows only on an Approved By
+       card when no stamp exists anywhere; a class-teacher card has none.
+
+   Every measurement below is the Report Form's CSS value in px, converted
+   with `u` (1px -> points, shrunk by the one-page-fit scale). There is no
+   separate footer stamp: the Report Form has none.
+========================================================================= */
+const IMG_SIZE_CACHE = new Map();
+function imageSize(doc, diskPath) {
+  if (!diskPath) return null;
+  if (IMG_SIZE_CACHE.has(diskPath)) return IMG_SIZE_CACHE.get(diskPath);
+  let size = null;
   try {
-    doc.image(diskPath, x, y, { fit: [w, h], align: "left", valign: "center" });
-    return true;
+    const img = doc.openImage(diskPath);
+    size = { w: img.width, h: img.height };
   } catch (err) {
-    console.error("⚠️ Could not embed image in transcript PDF:", err.message);
-    return false;
+    console.error("⚠️ Could not read image for transcript PDF:", err.message);
   }
+  IMG_SIZE_CACHE.set(diskPath, size);
+  return size;
 }
 
-function drawStampOrPlaceholder(doc, diskPath, x, y, size) {
-  if (drawImageFit(doc, diskPath, x, y, size, size)) return;
-  const cx = x + size / 2;
-  const cy = y + size / 2;
-  doc.circle(cx, cy, size / 2 - 1).dash(3, { space: 2 }).strokeColor("#bbb").stroke();
-  doc.undash();
-  doc.fontSize(7).font("Helvetica-Bold").fillColor("#bbb")
-    .text("OFFICIAL\nSTAMP", x, cy - 8, { width: size, align: "center" });
-  doc.fillColor("#000");
+/* Graphics state that gives the stamp the Report Form's `opacity: .85` +
+   `mix-blend-mode: multiply`. PDFKit has no blend-mode API, so register the
+   ExtGState the same way its own opacity() does. */
+function applyMultiplyBlend(doc, opacity) {
+  try {
+    const key = `mul_${opacity}`;
+    let entry = doc._opacityRegistry[key];
+    if (!entry) {
+      const dict = doc.ref({ Type: "ExtGState", BM: "Multiply", ca: opacity, CA: opacity, AIS: false });
+      dict.end();
+      entry = [dict, `GsMul${++doc._opacityCount}`];
+      doc._opacityRegistry[key] = entry;
+    }
+    doc.page.ext_gstates[entry[1]] = entry[0];
+    doc.addContent(`/${entry[1]} gs`);
+  } catch (err) {
+    doc.opacity(opacity); // plain transparency if blend modes are unavailable
+  }
 }
 
 function drawSignatureBlock(doc, officials, institution, theme, classTeachers = [], m) {
+  const sc = Math.max(0.6, m.s);
+  const u = 0.75 * sc; // one Report Form CSS px, in PDF points
+  const px = (n) => n * u;
+  const fsz = (n) => Math.max(5, n * u);
+  const primary = theme.primary;
   const pageLeft = doc.page.margins.left;
-  const pageRight = doc.page.width - doc.page.margins.right;
-  const usableWidth = pageRight - pageLeft;
-  const stampSize = m.stamp;
-  const sigBoxW = 150;
-  const sigBoxH = m.sigBoxH;
+  const usable = doc.page.width - doc.page.margins.left - doc.page.margins.right;
   const schoolStamp = institution.stampDiskPath;
   const bottomLimit = () => doc.page.height - doc.page.margins.bottom;
-  const stampX = pageRight - stampSize;
-
   const ensureRoom = (h) => { if (doc.y + h > bottomLimit()) doc.addPage(); };
 
-  doc.moveDown(0.4 * m.s);
-  ensureRoom(40);
-  doc.moveTo(pageLeft, doc.y).lineTo(pageRight, doc.y).strokeColor(theme.rule).stroke();
-  doc.moveDown(0.6 * m.s);
+  const lineH = (size, font) => doc.font(font).fontSize(size).currentLineHeight();
+  const textH = (str, size, font, width, opts = {}) =>
+    doc.font(font).fontSize(size).heightOfString(String(str), { width, ...opts });
 
-  // One row: label, name, optional title, signature image over a line,
-  // date, and the stamp at the right-hand edge. Row height is derived from
-  // its contents (and the stamp) so nothing overlaps at any scale.
-  const drawRow = ({ label, name, title, signatureDiskPath, stampDiskPath, remarks, noStamp }) => {
-    const remarksBlock = remarks ? m.remarksBoxH + 8 : 0;
-    const rowH = Math.max(stampSize + 10, 12 + remarksBlock + m.lineOff + 14);
-    ensureRoom(rowH);
-    const topY = doc.y;
-    const lineW = usableWidth - stampSize - 24;
+  const GAP = px(6);
+  const colW = (usable - GAP) / 2;
+  const BORDER = px(1);
+  const PAD_X = px(12);
+  const PAD_Y = px(8);
+  const innerW = colW - 2 * (PAD_X + BORDER);
+  const cellW = (innerW - 2 * GAP) / 3; // sigGrid: 3 equal columns, 6px gap
 
-    doc.fontSize(7.5).font("Helvetica-Bold").fillColor("#777").text(label.toUpperCase(), pageLeft, topY, { width: lineW, lineBreak: false });
-    let y = topY + 12;
-    if (remarks) {
-      doc.rect(pageLeft, y, lineW, m.remarksBoxH).dash(3, { space: 2 }).strokeColor("#cbd5e1").stroke();
-      doc.undash();
-      doc.fontSize(7.5).font("Helvetica").fillColor("#999")
-        .text("Remarks and recommendations.", pageLeft + 6, y + (m.remarksBoxH - 9) / 2, { width: lineW - 12, lineBreak: false });
-      y += remarksBlock;
-    }
-    // Name and title are shown in full: the font shrinks to fit the column.
-    const fitText = (text, font, startSize, maxW, floor) => {
-      let size = startSize;
-      doc.font(font);
-      while (size > floor && doc.fontSize(size).widthOfString(text) > maxW) size -= 0.5;
-      return size;
-    };
-    const nameText = name || "—";
-    const nameSize = fitText(nameText, "Helvetica-Bold", 9.5, lineW * 0.55, 6);
-    doc.fontSize(nameSize).font("Helvetica-Bold").fillColor("#000").text(nameText, pageLeft, y, { width: lineW * 0.57, lineBreak: false });
-    if (title) {
-      const titleSize = fitText(String(title), "Helvetica", 8, lineW * 0.55, 6);
-      doc.fontSize(titleSize).font("Helvetica").fillColor("#555").text(String(title), pageLeft, y + 12, { width: lineW * 0.57, lineBreak: false });
-    }
+  /* ---- element specs (Report Form CSS) ---- */
+  const TITLE = { size: fsz(10.5), font: "Helvetica-Bold", spacing: 0.1, mb: px(9) };
+  const LABEL = { size: fsz(9.5), font: "Helvetica-Bold", mb: px(5) };
+  const SIG_MAX_W = 0.8 * cellW;
+  const SIG_MAX_H = px(32);
 
-    // signature image sits on the line, to the right of the name
-    const sigX = pageLeft + lineW * 0.58;
-    const lineY = y + m.lineOff;
-    drawImageFit(doc, signatureDiskPath, sigX, lineY - sigBoxH - 1, sigBoxW, sigBoxH);
-    doc.moveTo(sigX, lineY).lineTo(sigX + sigBoxW, lineY).strokeColor("#999").stroke();
-    doc.fontSize(7).font("Helvetica").fillColor("#777").text("Signature", sigX, lineY + 2, { width: sigBoxW, lineBreak: false });
-
-    doc.fontSize(7).font("Helvetica").fillColor("#777").text("Date", pageLeft, lineY + 2, { lineBreak: false });
-    doc.moveTo(pageLeft + 24, lineY).lineTo(pageLeft + 24 + 90, lineY).strokeColor("#999").stroke();
-
-    if (!noStamp) drawStampOrPlaceholder(doc, stampDiskPath || schoolStamp, stampX, topY + 4, stampSize);
-    doc.fillColor("#000");
-    doc.x = pageLeft;
-    doc.y = topY + rowH;
+  // sigImage: max 80% x 32px, object-fit: contain, never upscaled past natural px size
+  const sigDisplay = (diskPath) => {
+    const s = imageSize(doc, diskPath);
+    if (!s) return null;
+    const k = Math.min(1, SIG_MAX_W / (s.w * u), SIG_MAX_H / (s.h * u));
+    return { w: s.w * u * k, h: s.h * u * k };
   };
 
-  // The Report Form always shows a class-teacher card — a blank hand-signed
-  // one when nobody is assigned to the class — so the transcript does too.
+  const titleText = (t) => String(t).toUpperCase();
+  const titleHeight = (t) =>
+    textH(titleText(t), TITLE.size, TITLE.font, innerW, { characterSpacing: TITLE.spacing * TITLE.size });
+
+  const labelH = () => lineH(LABEL.size, LABEL.font) + LABEL.mb;
+
+  // The Report Form lets a stamp overhang its card; on paper keep it inside
+  // so it never runs into whatever is printed below.
+  const minForStamp = (c) => (c.stamp ? BORDER * 2 + px(2) + 72 * sc + 5 * sc : 0);
+
+  /* ---- layout: natural height of each card ---- */
+  const layoutTeacher = (c) => {
+    const nameSize = fsz(11.5);
+    const items = [
+      labelH() + (c.name ? textH(c.name, nameSize, "Helvetica-Bold", cellW) : BORDER),
+      labelH() + (c.signatureDiskPath && sigDisplay(c.signatureDiskPath) ? sigDisplay(c.signatureDiskPath).h : BORDER),
+      labelH() + BORDER,
+    ];
+    const gridH = Math.max(...items);
+    const remarksH = px(22) + px(16) + 2 * BORDER;
+    return Math.max(
+      BORDER + PAD_Y + titleHeight(c.title) + TITLE.mb + remarksH + px(6) + gridH + PAD_Y + BORDER,
+      minForStamp(c)
+    );
+  };
+
+  const layoutApprover = (c) => {
+    const nameH = textH(c.name || "—", fsz(14), "Helvetica-Bold", innerW);
+    const roleH = textH(c.role || "—", fsz(12), "Helvetica", innerW);
+    const identH = px(4) + nameH + px(2) + roleH + px(2) + px(4);
+    const sig = c.signatureDiskPath ? sigDisplay(c.signatureDiskPath) : null;
+    const items = [
+      labelH() + (sig ? sig.h : BORDER),
+      labelH() + (c.stamp ? 0 : px(0.7 * 96)), // dashed placeholder is 0.7in tall
+    ];
+    const gridH = Math.max(...items);
+    return Math.max(
+      BORDER + PAD_Y + titleHeight(c.title) + TITLE.mb + identH + px(6) + gridH + PAD_Y + BORDER,
+      minForStamp(c)
+    );
+  };
+
+  /* ---- painting ---- */
+  const paintSigLine = (x, y, w) => {
+    const lw = 0.8 * w;
+    doc.lineWidth(BORDER).strokeColor("#334155")
+      .moveTo(x + (w - lw) / 2, y + BORDER / 2).lineTo(x + (w + lw) / 2, y + BORDER / 2).stroke();
+  };
+  const paintLabel = (str, x, y, w) => {
+    doc.font(LABEL.font).fontSize(LABEL.size).fillColor("#64748b")
+      .text(str, x, y, { width: w, align: "center", lineBreak: false });
+    return y + lineH(LABEL.size, LABEL.font) + LABEL.mb;
+  };
+  const paintSigImage = (diskPath, x, y, w) => {
+    const d = sigDisplay(diskPath);
+    if (!d) return false;
+    try {
+      doc.image(diskPath, x + (w - d.w) / 2, y, { width: d.w, height: d.h });
+      return true;
+    } catch (err) {
+      console.error("⚠️ Could not embed signature in transcript PDF:", err.message);
+      return false;
+    }
+  };
+
+  // Stamp: 2in x 1in, top 2px / right 4px of the card, rotate(-8deg),
+  // opacity .85, multiply — drawn last so it sits over the card's text.
+  const paintStamp = (diskPath, cardX, cardY, cardW) => {
+    if (!diskPath) return;
+    const w = 144 * sc;
+    const h = 72 * sc;
+    const x = cardX + cardW - BORDER - px(4) - w;
+    const y = cardY + BORDER + px(2);
+    try {
+      doc.save();
+      doc.rotate(-8, { origin: [x + w / 2, y + h / 2] });
+      applyMultiplyBlend(doc, 0.85);
+      doc.image(diskPath, x, y, { fit: [w, h], align: "center", valign: "center" });
+      doc.restore();
+    } catch (err) {
+      doc.restore();
+      console.error("⚠️ Could not embed stamp in transcript PDF:", err.message);
+    }
+  };
+
+  const paintCardFrame = (x, y, h) => {
+    doc.roundedRect(x + BORDER / 2, y + BORDER / 2, colW - BORDER, h - BORDER, px(10))
+      .lineWidth(BORDER).strokeColor("#e2e8f0").stroke();
+  };
+  const paintTitle = (str, x, y) => {
+    doc.font(TITLE.font).fontSize(TITLE.size).fillColor(primary)
+      .text(titleText(str), x, y, { width: innerW, characterSpacing: TITLE.spacing * TITLE.size });
+    return y + titleHeight(str) + TITLE.mb;
+  };
+
+  const paintTeacher = (c, x, y, h) => {
+    paintCardFrame(x, y, h);
+    const ix = x + BORDER + PAD_X;
+    let cy = paintTitle(c.title, ix, y + BORDER + PAD_Y);
+    // remarks box: dashed #cbd5e1, radius 8, #f8fafc fill
+    const remarksH = px(22) + px(16) + 2 * BORDER;
+    doc.roundedRect(ix, cy, innerW, remarksH, px(8)).fill("#f8fafc");
+    doc.roundedRect(ix + BORDER / 2, cy + BORDER / 2, innerW - BORDER, remarksH - BORDER, px(8))
+      .lineWidth(BORDER).dash(px(3), { space: px(3) }).strokeColor("#cbd5e1").stroke();
+    doc.undash();
+    cy += remarksH + px(6);
+    // Name / Signature / Date
+    const cols = [0, 1, 2].map((i) => ix + i * (cellW + GAP));
+    let ty = paintLabel("Name", cols[0], cy, cellW);
+    if (c.name) {
+      doc.font("Helvetica-Bold").fontSize(fsz(11.5)).fillColor("#0f172a")
+        .text(c.name, cols[0], ty, { width: cellW, align: "center" });
+    } else paintSigLine(cols[0], ty, cellW);
+    ty = paintLabel("Signature", cols[1], cy, cellW);
+    if (!(c.signatureDiskPath && paintSigImage(c.signatureDiskPath, cols[1], ty, cellW))) paintSigLine(cols[1], ty, cellW);
+    ty = paintLabel("Date", cols[2], cy, cellW);
+    paintSigLine(cols[2], ty, cellW);
+    paintStamp(c.stamp, x, y, colW);
+  };
+
+  const paintApprover = (c, x, y, h) => {
+    paintCardFrame(x, y, h);
+    const ix = x + BORDER + PAD_X;
+    let cy = paintTitle(c.title, ix, y + BORDER + PAD_Y);
+    // identity block (padding 4px 0)
+    cy += px(4);
+    const nameH = textH(c.name || "—", fsz(14), "Helvetica-Bold", innerW);
+    doc.font("Helvetica-Bold").fontSize(fsz(14)).fillColor("#0f172a").text(c.name || "—", ix, cy, { width: innerW });
+    cy += nameH + px(2);
+    const roleH = textH(c.role || "—", fsz(12), "Helvetica", innerW);
+    doc.font("Helvetica").fontSize(fsz(12)).fillColor("#64748b").text(c.role || "—", ix, cy, { width: innerW });
+    cy += roleH + px(2) + px(4) + px(6);
+    // Signature / Official Stamp (columns 1 and 2 of the 3-column grid)
+    const c1 = ix;
+    const c2 = ix + cellW + GAP;
+    const sy = paintLabel("Signature", c1, cy, cellW);
+    if (!(c.signatureDiskPath && paintSigImage(c.signatureDiskPath, c1, sy, cellW))) paintSigLine(c1, sy, cellW);
+    const sy2 = paintLabel("Official Stamp", c2, cy, cellW);
+    if (!c.stamp) {
+      // dashed placeholder, 1.4in x 0.7in; like the Report Form it is centred
+      // in its column and simply overflows to the right when wider.
+      const bw = px(1.4 * 96);
+      const bh = px(0.7 * 96);
+      const bx = c2 + Math.max(0, (cellW - bw) / 2);
+      doc.roundedRect(bx + px(0.75), sy2 + px(0.75), bw - px(1.5), bh - px(1.5), px(4))
+        .lineWidth(px(1.5)).dash(px(4), { space: px(3) }).strokeColor("#94a3b8").stroke();
+      doc.undash();
+    }
+    paintStamp(c.stamp, x, y, colW);
+  };
+
+  /* ---- build the cards in the Report Form's order ---- */
+  const cards = [];
   if (classTeachers.length) {
-    classTeachers.forEach((ct) => drawRow({
-      label: ct.title ? `${ct.title}'s Remarks` : "Class Teacher's Remarks",
+    classTeachers.forEach((ct) => cards.push({
+      kind: "teacher",
+      title: ct.title ? `${ct.title}'s Remarks` : "Class Teacher / Lecturer's Remarks",
       name: ct.name,
       signatureDiskPath: ct.signatureDiskPath,
-      stampDiskPath: ct.stampDiskPath,
-      remarks: true,
+      stamp: ct.stampDiskPath || schoolStamp,
     }));
   } else {
-    drawRow({ label: "Class Teacher's Remarks", name: "—", remarks: true, noStamp: true });
+    cards.push({ kind: "teacher", title: "Class Teacher / Lecturer's Remarks", name: null, signatureDiskPath: null, stamp: null });
   }
-
   if (officials.length) {
-    officials.forEach((o) => drawRow({
-      label: "Approval & Authentication",
+    officials.forEach((o) => cards.push({
+      kind: "approver",
+      title: "Approved By",
       name: o.name,
-      title: o.title,
+      role: o.title,
       signatureDiskPath: o.signatureDiskPath,
-      stampDiskPath: o.stampDiskPath,
+      stamp: o.stampDiskPath || schoolStamp,
     }));
   } else {
-    drawRow({ label: "Approval & Authentication", name: "—", stampDiskPath: schoolStamp });
+    // Report Form fallback when no signatory is configured: the dean /
+    // principal / first signatory, whose stamp is resolved into footerStampDiskPath.
+    cards.push({
+      kind: "approver",
+      title: "Approved By",
+      name: "—",
+      role: "—",
+      signatureDiskPath: null,
+      stamp: institution.footerStampDiskPath || schoolStamp,
+    });
   }
 
-  // Footer "Official stamp" — the Report Form's footer stamp (Dean's, else
-  // Principal's, else first signatory's), shown bottom-left with the date.
-  const footerStamp = institution.footerStampDiskPath || schoolStamp;
-  const footerSize = Math.max(40, Math.round(stampSize * 0.85));
-  ensureRoom(footerSize + 6);
-  const footTop = doc.y + 2;
-  drawStampOrPlaceholder(doc, footerStamp, pageLeft, footTop, footerSize);
-  doc.fontSize(7).font("Helvetica").fillColor("#777")
-    .text(`Date: ${new Date().toLocaleDateString()}`, pageLeft, footTop + footerSize - 8, { width: usableWidth, align: "right", lineBreak: false });
-  doc.fillColor("#000");
+  /* ---- section label bar ---- */
+  doc.moveDown(0.4 * m.s);
+  const labelSize = fsz(9.5);
+  const labelSpacing = 0.12 * labelSize;
+  const barH = lineH(labelSize, "Helvetica-Bold");
+  const rows = [];
+  for (let i = 0; i < cards.length; i += 2) {
+    const pair = cards.slice(i, i + 2);
+    const hs = pair.map((c) => (c.kind === "teacher" ? layoutTeacher(c) : layoutApprover(c)));
+    rows.push({ pair, h: Math.max(...hs) });
+  }
+  ensureRoom(barH + px(8) + rows[0].h);
+  const barY = doc.y;
+  doc.rect(pageLeft, barY, px(4), barH).fill(primary);
+  doc.font("Helvetica-Bold").fontSize(labelSize).fillColor(primary)
+    .text("OFFICIAL AUTHORISATION", pageLeft + px(4) + px(9), barY, { characterSpacing: labelSpacing, lineBreak: false });
+  doc.y = barY + barH + px(8);
+
+  /* ---- rows (grid items in one row share the taller card's height) ---- */
+  rows.forEach((row, ri) => {
+    if (ri > 0) ensureRoom(row.h);
+    const y = doc.y;
+    row.pair.forEach((c, ci) => {
+      const x = pageLeft + ci * (colW + GAP);
+      if (c.kind === "teacher") paintTeacher(c, x, y, row.h);
+      else paintApprover(c, x, y, row.h);
+    });
+    doc.y = y + row.h + GAP;
+  });
+
+  doc.fillColor("#000").strokeColor("#000").lineWidth(1);
   doc.x = pageLeft;
-  doc.y = footTop + footerSize + Math.max(4, 8 * m.s);
+  doc.y += Math.max(2, 4 * m.s);
 }
 
 function addPageNumbers(doc) {
