@@ -299,7 +299,7 @@ router.post("/report-link", async (req, res) => {
     if (!gate.ok) return res.status(gate.status).json({ code: gate.code, message: gate.message });
 
     return res.json({
-      token: signReportSession({ student, tenant, mode: gate.access.mode }),
+      token: signReportSession({ student, tenant, mode: gate.access.mode, src: "link" }),
       downloads: publicView(gate.access),
       user: {
         id: student.id, username: student.username, name: student.name || "", role: "student",
@@ -347,13 +347,18 @@ router.get("/transcript-link", async (req, res) => {
     // A link the school sent for ONE student's transcript obeys the open/close window only (not the "what is offered" button).
     const gate = await checkDownload(pool, "any");
     if (!gate.ok) return res.status(gate.status).json({ code: gate.code, message: gate.message });
-    const result = await buildTranscripts(pool, { scope: "student", studentId: Number(link.sid), examId: link.exam || null, requirePhoto: true });
+    const result = await buildTranscripts(pool, { scope: "student", studentId: Number(link.sid), examId: link.exam || null, requirePhoto: gate.access?.requirePhoto !== false, allowedExamIds: gate.access?.transcriptExamIds });
     if (!result.ok) {
       return res.status(result.status).json({
         code: result.code,
         message: result.status === 404 ? "Your transcript isn't available yet — no released marks were found." : result.message,
       });
     }
+    try {
+      const { logDownload } = require("../utils/downloadAccess");
+      const sr = await pool.request().input("id", Number(link.sid)).query(`SELECT id, name, username, studentClass FROM Students WHERE id = @id`);
+      await logDownload(pool, { student: sr.recordset[0] || { id: Number(link.sid) }, kind: "transcript", method: "transcript-pdf", source: "transcript-link", req });
+    } catch (e) { /* history is best-effort */ }
     return sendPdfBuffer(res, result.buffer, result.filename);
   } catch (err) {
     console.log("TRANSCRIPT LINK ERROR:", err);

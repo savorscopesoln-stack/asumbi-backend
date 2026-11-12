@@ -69,11 +69,11 @@ const verifyProfileToken = (token) => {
   return d;
 };
 
-const signReportSession = ({ student, tenant, mode }) =>
+const signReportSession = ({ student, tenant, mode, src }) =>
   jwt.sign(
     {
       id: student.id, username: student.username, role: "student", source: "Students", tenant: tenant || "default",
-      scope: SESSION_SCOPE, dl: mode || "report", mustChangePassword: false, profileIncomplete: false,
+      scope: SESSION_SCOPE, dl: mode || "report", src: src === "link" ? "link" : "page", mustChangePassword: false, profileIncomplete: false,
     },
     secret(),
     { expiresIn: `${SESSION_MINUTES}m` }

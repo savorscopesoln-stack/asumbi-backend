@@ -40,7 +40,7 @@ const PHOTO_REQUIRED_MESSAGE = "Please upload a clear, official passport photo t
 const slug = (v) => String(v || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
 
 /** Builds the transcript file for a selection. Returns { ok:true, buffer, filename, contentType } or { ok:false, status, message }. */
-const buildTranscripts = async (pool, { scope, className, studentId, examId, separate, requirePhoto }) => {
+const buildTranscripts = async (pool, { scope, className, studentId, examId, separate, requirePhoto, allowedExamIds, selectedExamIds }) => {
   try {
     if (!["all", "class", "student"].includes(scope)) scope = "class";
     if (scope === "class" && !className) return fail(400, "A class is required for a per-class transcript");
@@ -64,6 +64,21 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
     // Student-facing downloads (report link / report-only session) need a photo on file.
     if (requirePhoto && students.some((s) => !String(s.photoUrl || "").trim())) {
       return fail(409, PHOTO_REQUIRED_MESSAGE, "PHOTO_REQUIRED");
+    }
+
+    // Student-facing downloads only show the exams the school picked (Report Download Link → "Exams on the transcript").
+    let allowed = Array.isArray(allowedExamIds) && allowedExamIds.length ? allowedExamIds.map(Number).filter(Number.isFinite) : null;
+    // The student may narrow it further to one or more of the exams the school allowed.
+    const picked = Array.isArray(selectedExamIds) ? [...new Set(selectedExamIds.map(Number).filter((n) => Number.isFinite(n) && n > 0))] : [];
+    if (picked.length && !examId) {
+      const usable = allowed ? picked.filter((id) => allowed.includes(id)) : picked;
+      if (!usable.length) return fail(404, "None of the selected exams are available on transcripts.");
+      if (usable.length === 1) examId = usable[0]; // one exam: same title/filename as a single-exam transcript
+      else allowed = usable;
+    }
+    const subsetOfExams = !examId && !!allowed;
+    if (allowed && examId && !allowed.includes(Number(examId))) {
+      return fail(404, "That exam is not available on transcripts.");
     }
 
     /* ---------------- 2. Resolve the selected exam's name (for the title/filename) ---------------- */
@@ -100,6 +115,7 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
       WHERE m.studentId IN (${idParams.join(",")})
     `;
     if (examId) marksQuery += ` AND me.id = @examId`;
+    if (allowed) marksQuery += ` AND me.id IN (${allowed.join(",")})`; // integers only (sanitised above)
     marksQuery += ` ORDER BY me.start_date ASC, me.id ASC, sub.name ASC`;
 
     const marksResult = await marksReq.query(marksQuery);
@@ -217,10 +233,10 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
     const officials = await getSigningOfficials(pool);
     const classTeachers = await getClassTeachers(pool);
     institution.footerStampDiskPath = await getFooterStampDiskPath(pool);
-    const title = singleExam ? singleExam.name : "Full Academic Transcript (All Exams)";
+    const title = singleExam ? singleExam.name : subsetOfExams ? "Academic Transcript (Selected Exams)" : "Full Academic Transcript (All Exams)";
     const subtitle = scope === "class" ? `Class: ${className}`
       : scope === "student" ? `Student: ${studentPages[0].student.name}` : "All Students";
-    const examSlug = singleExam ? singleExam.name : "all-exams";
+    const examSlug = singleExam ? singleExam.name : subsetOfExams ? "selected-exams" : "all-exams";
 
     // one PDF per student, zipped
     if (separate && scope !== "student" && studentPages.length > 1) {
@@ -290,4 +306,19 @@ const downloadTranscripts = async (req, res) => {
   res.send(result.buffer);
 };
 
-module.exports = { downloadTranscripts, buildTranscripts, studentIdsWithTranscript };
+/** Exams a student can pick from: those the school allows (or all) that have released marks for them. */
+const examsForStudentTranscript = async (pool, studentId, allowedExamIds) => {
+  const allowed = Array.isArray(allowedExamIds) && allowedExamIds.length ? allowedExamIds.map(Number).filter(Number.isFinite) : null;
+  const r = await pool.request().input("sid", sql.Int, Number(studentId)).query(`
+    SELECT DISTINCT me.id, me.name, me.academic_year, me.term, me.start_date
+    FROM Marks m
+    INNER JOIN Assessments a ON a.id = m.assessmentId AND a.sourceSystem = 'e_assessment'
+    INNER JOIN e_assessments ea ON ea.id = a.sourceRefId
+    INNER JOIN exam_subject_sessions ess ON ess.e_assessment_id = ea.id
+    INNER JOIN main_examinations me ON me.id = ess.main_examination_id
+    WHERE m.studentId = @sid ${allowed ? `AND me.id IN (${allowed.join(",")})` : ""}
+    ORDER BY me.start_date DESC, me.id DESC`);
+  return r.recordset || [];
+};
+
+module.exports = { examsForStudentTranscript, downloadTranscripts, buildTranscripts, studentIdsWithTranscript };

@@ -40,6 +40,20 @@ test("mode decides what is offered", async () => {
 
 test("publicView gives ISO times", () => {
   const v = publicView({ mode: "both", opensAt: new Date("2026-11-20T06:00:00Z"), closesAt: null });
-  assert.deepStrictEqual(v, { mode: "both", opensAt: "2026-11-20T06:00:00.000Z", closesAt: null });
+  assert.deepStrictEqual(v, { mode: "both", opensAt: "2026-11-20T06:00:00.000Z", closesAt: null, requirePhoto: true, transcriptExamIds: null });
   assert.strictEqual(windowState({ opensAt: null, closesAt: null }).open, true);
+});
+
+test("photo requirement defaults ON and can be switched OFF", async () => {
+  assert.strictEqual((await checkDownload(poolWith(null), "any")).access.requirePhoto, true);
+  const off = await checkDownload(poolWith({ mode: "report", opensAt: null, closesAt: null, requirePhoto: false }), "any");
+  assert.strictEqual(off.access.requirePhoto, false);
+  assert.strictEqual(publicView(off.access).requirePhoto, false);
+});
+
+test("transcript exams: stored list is parsed, empty means all", async () => {
+  const one = await checkDownload(poolWith({ mode: "both", opensAt: null, closesAt: null, requirePhoto: true, transcriptExamIds: "4, 7,x,7" }), "any");
+  assert.deepStrictEqual(one.access.transcriptExamIds, [4, 7]);
+  const none = await checkDownload(poolWith({ mode: "both", opensAt: null, closesAt: null, transcriptExamIds: "" }), "any");
+  assert.strictEqual(none.access.transcriptExamIds, null);
 });

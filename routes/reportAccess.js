@@ -2,7 +2,7 @@ const express = require("express");
 const router = express.Router();
 const { sql, getPool, listTenantKeys } = require("../config/db");
 const { signReportSession, signProfileToken, verifyProfileToken, verifyReportSession } = require("../utils/reportLink");
-const { checkDownload, publicView } = require("../utils/downloadAccess");
+const { checkDownload, publicView, logDownload } = require("../utils/downloadAccess");
 const { isActiveStudent } = require("../utils/examAccess");
 const { runPhotoUpload } = require("../middleware/photoUpload");
 const { uploadUrl, deleteUploadByUrl } = require("../utils/uploadPaths");
@@ -59,11 +59,13 @@ const readyResponse = (student, tenant, access) => ({
   },
 });
 
-// Every student needs a clear passport photo on file before the report form / transcript unlock.
+// Unless the school switched the photo requirement OFF (Report Download Link → "Require passport photo"),
+// every student needs a clear passport photo on file before the report form / transcript unlock.
 // If there is none, the page asks for it right here (POST /photo below) instead of failing later.
 const hasPhoto = (student) => !!String(student?.photoUrl || "").trim();
+const photoOk = (student, access) => access?.requirePhoto === false || hasPhoto(student);
 const PHOTO_PROMPT = "Please upload a clear, official passport photo to continue. Your report form and transcript need your photo.";
-const nextStep = (student, tenant, access) => (hasPhoto(student)
+const nextStep = (student, tenant, access) => (photoOk(student, access)
   ? readyResponse(student, tenant, access)
   : {
       status: "photo_required",
@@ -270,6 +272,28 @@ router.post("/photo", async (req, res) => {
 /* ------------------------------------------------------------ transcript */
 // The student's own transcript PDF, for someone holding a report-only session (from /report-download or a /r/ link).
 // Re-checks the open/close window and the mode on every request, so closing downloads takes effect at once.
+const parseExamIds = (v) => String(v || "").split(",").map((x) => parseInt(x, 10)).filter((n) => Number.isFinite(n) && n > 0).slice(0, 100);
+
+// The exams this student can choose from on their transcript (the school's allowed list ∩ exams with released marks).
+router.get("/transcript-exams", async (req, res) => {
+  try {
+    if (tooMany(req)) return res.status(429).json({ message: "Too many attempts. Please wait a minute and try again." });
+    const header = req.headers.authorization || "";
+    let session;
+    try { session = verifyReportSession(header.startsWith("Bearer ") ? header.slice(7) : ""); }
+    catch (e) { return res.status(401).json({ message: "Please open the page again." }); }
+    const pool = await getPool(session.tenant || "default");
+    const gate = await checkDownload(pool, "transcript");
+    if (!gate.ok) return res.status(gate.status).json({ code: gate.code, message: gate.message });
+    const { examsForStudentTranscript } = require("../controllers/transcript.controller");
+    const exams = await examsForStudentTranscript(pool, Number(session.id), gate.access.transcriptExamIds);
+    res.json({ exams: exams.map((e) => ({ id: e.id, name: e.name, academic_year: e.academic_year || null, term: e.term || null })) });
+  } catch (err) {
+    console.log("REPORT ACCESS TRANSCRIPT EXAMS ERROR:", err);
+    res.status(500).json({ message: "Could not load your exams. Please try again." });
+  }
+});
+
 router.get("/transcript", async (req, res) => {
   try {
     if (tooMany(req)) return res.status(429).json({ message: "Too many attempts. Please wait a minute and try again." });
@@ -280,7 +304,7 @@ router.get("/transcript", async (req, res) => {
       return res.status(401).json({ message: e.name === "TokenExpiredError" ? "Your session timed out. Please open the page again." : "Please open the page again." });
     }
     const pool = await getPool(session.tenant || "default");
-    const r = await pool.request().input("id", sql.Int, Number(session.id)).query(`SELECT id, status FROM Students WHERE id = @id`);
+    const r = await pool.request().input("id", sql.Int, Number(session.id)).query(`SELECT id, status, name, username, studentClass FROM Students WHERE id = @id`);
     const student = r.recordset[0];
     if (!student) return res.status(404).json({ message: "This student record could not be found." });
     if (!isActiveStudent(student.status)) return res.status(403).json({ message: "Your account isn't active. Please contact the school office." });
@@ -290,17 +314,49 @@ router.get("/transcript", async (req, res) => {
 
     const { buildTranscripts } = require("../controllers/transcript.controller");
     const { sendPdfBuffer } = require("../utils/reportExport");
-    const result = await buildTranscripts(pool, { scope: "student", studentId: Number(student.id), examId: null, requirePhoto: true });
+    const result = await buildTranscripts(pool, { scope: "student", studentId: Number(student.id), examId: null, requirePhoto: gate.access?.requirePhoto !== false, allowedExamIds: gate.access?.transcriptExamIds, selectedExamIds: parseExamIds(req.query.examIds) });
     if (!result.ok) {
       return res.status(result.status).json({
         code: result.code,
         message: result.status === 404 ? "Your transcript isn't available yet — no released marks were found." : result.message,
       });
     }
+    await logDownload(pool, { student, kind: "transcript", method: "transcript-pdf", source: session.src === "link" ? "report-link" : "download-page", req });
     return sendPdfBuffer(res, result.buffer, result.filename);
   } catch (err) {
     console.log("REPORT ACCESS TRANSCRIPT ERROR:", err);
     res.status(500).json({ message: "Could not prepare your transcript. Please try again." });
+  }
+});
+
+/* ------------------------------------------------------------------- log */
+// The report form is built into a PDF in the student's browser, so the page tells the server when the student
+// actually downloads (or prints) it and we write it to the download history. Report-only session required.
+// Body: { method: "pdf" | "print", source: "report-link" | "download-page" }
+router.post("/log", async (req, res) => {
+  try {
+    if (tooMany(req)) return res.status(429).json({ message: "Too many attempts. Please wait a minute and try again." });
+    const header = req.headers.authorization || "";
+    let session;
+    try { session = verifyReportSession(header.startsWith("Bearer ") ? header.slice(7) : ""); }
+    catch (e) { return res.status(401).json({ message: "Please open the page again." }); }
+
+    const pool = await getPool(session.tenant || "default");
+    const r = await pool.request().input("id", sql.Int, Number(session.id)).query(`SELECT id, status, name, username, studentClass, photoUrl FROM Students WHERE id = @id`);
+    const student = r.recordset[0];
+    if (!student) return res.status(404).json({ message: "This student record could not be found." });
+    if (!isActiveStudent(student.status)) return inactiveResponse(res);
+    const gate = await checkDownload(pool, "report");
+    if (!gate.ok) return closedResponse(res, gate);
+    if (!photoOk(student, gate.access)) return res.status(409).json({ code: "PHOTO_REQUIRED", message: PHOTO_PROMPT });
+
+    const method = req.body?.method === "print" ? "print" : "pdf";
+    const source = req.body?.source === "download-page" ? "download-page" : "report-link";
+    await logDownload(pool, { student, kind: "report", method, source, req });
+    res.json({ success: true });
+  } catch (err) {
+    console.log("REPORT ACCESS LOG ERROR:", err);
+    res.status(500).json({ message: "Could not record the download." });
   }
 });
 
