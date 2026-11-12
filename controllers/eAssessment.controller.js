@@ -455,7 +455,11 @@ const getEAssessments = async (req, res) => {
               SELECT 1 FROM e_assessment_question_setters qs
               WHERE qs.e_assessment_id = ea.id AND qs.teacher_id = @teacherId
             )` : isStudent ? `
-      WHERE (
+      WHERE NOT EXISTS (SELECT 1 FROM e_assessment_blocked_students dz
+                        WHERE dz.student_id = @studentId)
+        AND (
+          (
+            (
               ea.class_id IN (
                 SELECT c2.id FROM Classes c2
                 JOIN Students st ON st.studentClass = c2.name
@@ -463,13 +467,18 @@ const getEAssessments = async (req, res) => {
               )
               OR ea.year_of_study = (SELECT yearOfStudy FROM Students WHERE id = @studentId)
             )
-        AND (${SQL_ACTIVE_OR_UPCOMING}
-             OR (ISNULL(mysess.resit_allowed, 0) = 1 AND mysess.status = 'issued'))
-        AND (ISNULL(ea.restrict_students, 0) = 0
-             OR EXISTS (SELECT 1 FROM e_assessment_allowed_students al
-                        WHERE al.e_assessment_id = ea.id AND al.student_id = @studentId))
-        AND NOT EXISTS (SELECT 1 FROM e_assessment_blocked_students dz
-                        WHERE dz.student_id = @studentId)` : ""}
+            AND (${SQL_ACTIVE_OR_UPCOMING}
+                 OR (ISNULL(mysess.resit_allowed, 0) = 1 AND mysess.status = 'issued'))
+            AND (ISNULL(ea.restrict_students, 0) = 0
+                 OR EXISTS (SELECT 1 FROM e_assessment_allowed_students al
+                            WHERE al.e_assessment_id = ea.id AND al.student_id = @studentId))
+          )
+          -- A student's OWN marked papers stay listed for good: once a teacher has released the
+          -- marks they must never vanish just because the paper was stopped / closed, the
+          -- student moved to another class or year, or the access list changed. (Results
+          -- Summary is built from this list; the marked paper itself is read by getStudentResult.)
+          OR sub.status = 'released'
+        )` : ""}
       ORDER BY ${isStudent ? `CASE WHEN ${SQL_IS_ACTIVE} THEN 0 ELSE 1 END, ea.available_from ASC, ` : ""}ea.id DESC
     `);
     const rows = (result.recordset || []).map((r) => redactForRole(r, req.user?.role));

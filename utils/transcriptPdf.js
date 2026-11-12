@@ -34,11 +34,33 @@ const { resolveReportTheme } = require("./reportThemes");
 ========================================================================= */
 
 const PAGE_MARGIN = 40;
-const ROW_H = 16;
 
-function drawInstitutionHeader(doc, institution, { title, subtitle }, theme) {
+/* One-page fitting. Every size below comes from a "metrics" object built
+   for a scale factor. buildTranscriptPdf() tries scale 1 first and steps
+   down (dry run on a scratch document) until a student's whole transcript
+   fits on ONE A4 page. Fonts/rows never shrink below a readable floor; if
+   a student has so many exams that even the floor does not fit, the
+   transcript flows onto a second page instead of becoming unreadable. */
+const SCALES = [1, 0.94, 0.88, 0.82, 0.76, 0.7, 0.64, 0.58];
+const MAX_CELL_LINES = 3; // a code/subject cell wraps to at most this many lines, then ends with "…"
+const metricsFor = (s) => ({
+  s,
+  font: Math.max(6, 8 * s),
+  headFont: Math.max(6, 7.5 * s),
+  headH: Math.max(12, 16 * s),
+  minRowH: Math.max(11, 16 * s),
+  pad: Math.max(2, 3.5 * s),
+  logo: Math.max(30, Math.round(42 * s)),
+  infoRowH: Math.max(24, 30 * s),
+  stamp: Math.max(46, Math.round(74 * s)),
+  sigBoxH: Math.max(22, 34 * s),
+  remarksBoxH: Math.max(18, 26 * s),
+  lineOff: Math.max(26, 34 * s),
+});
+
+function drawInstitutionHeader(doc, institution, { title, subtitle }, theme, m) {
   const startX = doc.page.margins.left;
-  const LOGO_SIZE = 42;
+  const LOGO_SIZE = m.logo;
   let textX = startX;
   let logoDrawn = false;
   if (institution.logoDiskPath) {
@@ -103,10 +125,10 @@ function drawIntroParagraph(doc, student, title) {
   doc.moveDown(0.5);
 }
 
-function drawStudentInfo(doc, student) {
+function drawStudentInfo(doc, student, m) {
   const startX = doc.page.margins.left;
   const colWidth = (doc.page.width - doc.page.margins.left - doc.page.margins.right) / 3;
-  const rowH = 30;
+  const rowH = m.infoRowH;
   // Row/col positions are anchored to `startY`, captured once below —
   // NOT to doc.y at call time. PDFKit still advances doc.y after every
   // .text() call even when it's given an explicit x/y, so if each
@@ -146,41 +168,31 @@ function drawStudentInfo(doc, student) {
   doc.moveDown(0.3);
 }
 
-/* One exam's subject table: Code | Subject | Score | Grade | Points |
-   Result, plus an average row. `Grade` and `Points` intentionally show
-   the same value — the app has one grading scale, not two separate
-   letter/points scales — kept as two columns purely to match the
-   two-grading-column shape of a college transcript. Kept
-   intentionally simple/portrait (unlike the wide landscape admin
-   report tables) since a transcript is a narrow, read-top-to-bottom
-   document, closer in spirit to the report card than to a Nominal
-   Roll. */
-function drawExamTable(doc, exam, theme) {
+/* One exam's subject table: Code | Subject | Marks % | Grade | Points |
+   Result, plus an average row.
+     GRADE  = the grade of the score's band in the Grading System (e.g. 1-7)
+     POINTS = the band's label from the Grading System (e.g. Distinction)
+     RESULT = the result label for the score (overall bands, e.g. CREDIT)
+   Row height is MEASURED per row: a long subject code or name wraps (up to
+   MAX_CELL_LINES lines) and the row grows to hold it, so text can never
+   spill over the row below. Everything is sized from the metrics `m`. */
+function drawExamTable(doc, exam, theme, m) {
   const pageLeft = doc.page.margins.left;
   const pageRight = doc.page.width - doc.page.margins.right;
   const usableWidth = pageRight - pageLeft;
-  const codeW = usableWidth * 0.12;
-  const subjectW = usableWidth * 0.34;
-  const scoreW = usableWidth * 0.14;
-  const gradeW = usableWidth * 0.14;
-  const pointsW = usableWidth * 0.13;
-  const resultW = usableWidth - codeW - subjectW - scoreW - gradeW - pointsW;
-  const colX = [pageLeft, pageLeft + codeW, pageLeft + codeW + subjectW,
-    pageLeft + codeW + subjectW + scoreW, pageLeft + codeW + subjectW + scoreW + gradeW,
-    pageLeft + codeW + subjectW + scoreW + gradeW + pointsW];
-  const colW = [codeW, subjectW, scoreW, gradeW, pointsW, resultW];
+  const colW = [0.13, 0.33, 0.11, 0.09, 0.15, 0.19].map((w) => usableWidth * w);
+  const colX = [];
+  colW.reduce((x, w) => { colX.push(x); return x + w; }, pageLeft);
+  const bottomLimit = () => doc.page.height - doc.page.margins.bottom - 20;
 
-  // Section heading for this exam — start a fresh page if it (plus at
-  // least a header row and one data row) can't fit above the bottom
-  // margin, so an exam's heading is never left orphaned at a page's
-  // very bottom with its table starting on the next page.
-  const neededForHeading = 20 + ROW_H * 2;
+  // Never leave an exam heading orphaned at the bottom of a page.
+  const neededForHeading = 20 + m.headH + m.minRowH;
   if (doc.y + neededForHeading > doc.page.height - doc.page.margins.bottom) {
     doc.addPage();
   }
 
   const examLabel = [exam.examName, exam.term, exam.academic_year].filter(Boolean).join(" — ");
-  doc.fontSize(9.5).font("Helvetica-Bold").fillColor(theme.primary)
+  doc.fontSize(Math.max(8.5, 9.5 * m.s)).font("Helvetica-Bold").fillColor(theme.primary)
     .text(examLabel, pageLeft, doc.y, { width: usableWidth });
   doc.fillColor("#000");
   doc.x = pageLeft;
@@ -190,67 +202,79 @@ function drawExamTable(doc, exam, theme) {
   const headers = ["CODE", "SUBJECT", "MARKS %", "GRADE", "POINTS", "RESULT"];
   const aligns = ["center", "left", "center", "center", "center", "center"];
   const drawHeaderRow = () => {
-    doc.rect(pageLeft, y, usableWidth, ROW_H).fill(theme.primary);
-    doc.fillColor(theme.onPrimary).fontSize(7.5).font("Helvetica-Bold");
+    doc.rect(pageLeft, y, usableWidth, m.headH).fill(theme.primary);
+    doc.fillColor(theme.onPrimary).fontSize(m.headFont).font("Helvetica-Bold");
+    const ty = y + (m.headH - doc.currentLineHeight(true)) / 2;
     headers.forEach((h, i) => {
-      doc.text(h, colX[i] + 4, y + 4.5, { width: colW[i] - 8, align: aligns[i], lineBreak: false });
+      doc.text(h, colX[i] + 4, ty, { width: colW[i] - 8, align: aligns[i], lineBreak: false });
     });
     doc.fillColor("#000").font("Helvetica");
-    y += ROW_H;
+    y += m.headH;
   };
   drawHeaderRow();
 
   exam.subjects.forEach((s, idx) => {
-    if (y + ROW_H > doc.page.height - doc.page.margins.bottom - 20) {
+    const cells = [
+      s.subjectCode || "—",
+      s.subjectName || "-",
+      s.percentage != null && !Number.isNaN(Number(s.percentage)) ? `${Math.floor(Number(s.percentage) + 1e-9)}%` : "—",
+      s.grade || "—",
+      s.points || "—",
+      s.result || "—",
+    ].map(String);
+
+    // Measure first, so the row is exactly tall enough for its wrapped text.
+    doc.fontSize(m.font).font("Helvetica");
+    const lh = doc.currentLineHeight(true);
+    const maxH = lh * MAX_CELL_LINES + 0.5;
+    const heights = cells.map((val, i) => (i < 2
+      ? Math.min(maxH, Math.max(lh, doc.heightOfString(val, { width: colW[i] - 8 })))
+      : lh));
+    const rowH = Math.max(m.minRowH, Math.max(...heights) + 2 * m.pad);
+
+    if (y + rowH > bottomLimit()) {
       doc.addPage();
       y = doc.page.margins.top;
       drawHeaderRow();
     }
     if (idx % 2 === 1) {
-      doc.rect(pageLeft, y, usableWidth, ROW_H).fill(theme.zebra);
-      doc.fillColor("#000");
+      doc.rect(pageLeft, y, usableWidth, rowH).fill(theme.zebra);
     }
-    doc.fontSize(8).font("Helvetica");
-    const cells = [
-      s.subjectCode || "—",
-      s.subjectName || "-",
-      s.percentage != null && !Number.isNaN(Number(s.percentage)) ? `${Math.floor(Number(s.percentage)+1e-9)}%` : "—",
-      s.grade || "—",
-      s.points || "—",
-      s.result || "—",
-    ];
+    doc.fillColor("#000").fontSize(m.font).font("Helvetica");
     cells.forEach((val, i) => {
-      doc.text(val, colX[i] + 4, y + 4, { width: colW[i] - 8, align: aligns[i], lineBreak: false, ellipsis: true });
+      const textY = y + (rowH - heights[i]) / 2;
+      const opts = { width: colW[i] - 8, align: aligns[i], ellipsis: true };
+      if (i < 2) doc.text(val, colX[i] + 4, textY, { ...opts, height: maxH });
+      else doc.text(val, colX[i] + 4, textY, { ...opts, lineBreak: false });
     });
-    y += ROW_H;
+    y += rowH;
   });
 
-  // Exam average row — visually distinct (theme-filled) so it reads as
-  // a total, the same convention the report card's AVERAGE row uses.
-  if (y + ROW_H > doc.page.height - doc.page.margins.bottom - 20) {
+  // Exam average row — theme-filled so it reads as a total.
+  if (y + m.minRowH > bottomLimit()) {
     doc.addPage();
     y = doc.page.margins.top;
   }
-  doc.rect(pageLeft, y, usableWidth, ROW_H).fill(theme.primary);
-  doc.fillColor(theme.onPrimary).fontSize(8).font("Helvetica-Bold");
-  doc.text("EXAM AVERAGE", pageLeft + 4, y + 4, { width: codeW + subjectW - 8 });
-  doc.text(exam.average != null ? `${Math.floor(Number(exam.average)+1e-9)}%` : "—", colX[2] + 4, y + 4, { width: scoreW - 8, align: "center" });
-  doc.text(exam.overallResult || "—", colX[3], y + 4, { width: gradeW + pointsW + resultW - 4, align: "center" });
+  doc.rect(pageLeft, y, usableWidth, m.minRowH).fill(theme.primary);
+  doc.fillColor(theme.onPrimary).fontSize(m.font).font("Helvetica-Bold");
+  const ay = y + (m.minRowH - doc.currentLineHeight(true)) / 2;
+  doc.text("EXAM AVERAGE", pageLeft + 4, ay, { width: colW[0] + colW[1] - 8, lineBreak: false });
+  doc.text(exam.average != null ? `${Math.floor(Number(exam.average) + 1e-9)}%` : "—", colX[2] + 4, ay, { width: colW[2] - 8, align: "center", lineBreak: false });
+  doc.text(exam.overallResult || "—", colX[3], ay, { width: colW[3] + colW[4] + colW[5] - 4, align: "center", lineBreak: false });
   doc.fillColor("#000").font("Helvetica");
-  y += ROW_H;
+  y += m.minRowH;
 
-  doc.y = y + 6;
+  doc.y = y + Math.max(3, 6 * m.s);
 
-  // Aggregate points line — the exam's subject grade-band codes summed
-  // (see transcript.controller.js), the same "total points" figure a
-  // college transcript's aggregate box shows alongside the average.
+  // Aggregate points line — the subject grade codes summed (see transcript.controller.js).
   if (exam.aggregatePoints != null) {
     doc.fontSize(8).font("Helvetica-Bold").fillColor("#555")
       .text(`Aggregate Points: ${exam.aggregatePoints}`, pageLeft, doc.y, { width: usableWidth, align: "right" });
     doc.fillColor("#000");
   }
 
-  doc.y += 10;
+  doc.x = pageLeft;
+  doc.y += Math.max(4, 10 * m.s);
 }
 
 function drawCumulativeSummary(doc, page, theme) {
@@ -302,28 +326,30 @@ function drawStampOrPlaceholder(doc, diskPath, x, y, size) {
   doc.fillColor("#000");
 }
 
-function drawSignatureBlock(doc, officials, institution, theme, classTeachers = []) {
+function drawSignatureBlock(doc, officials, institution, theme, classTeachers = [], m) {
   const pageLeft = doc.page.margins.left;
   const pageRight = doc.page.width - doc.page.margins.right;
   const usableWidth = pageRight - pageLeft;
-  const stampSize = 74;
+  const stampSize = m.stamp;
   const sigBoxW = 150;
-  const sigBoxH = 34;
+  const sigBoxH = m.sigBoxH;
   const schoolStamp = institution.stampDiskPath;
   const bottomLimit = () => doc.page.height - doc.page.margins.bottom;
   const stampX = pageRight - stampSize;
 
   const ensureRoom = (h) => { if (doc.y + h > bottomLimit()) doc.addPage(); };
 
-  doc.moveDown(0.4);
+  doc.moveDown(0.4 * m.s);
   ensureRoom(40);
   doc.moveTo(pageLeft, doc.y).lineTo(pageRight, doc.y).strokeColor(theme.rule).stroke();
-  doc.moveDown(0.6);
+  doc.moveDown(0.6 * m.s);
 
   // One row: label, name, optional title, signature image over a line,
-  // date, and the stamp at the right-hand edge.
+  // date, and the stamp at the right-hand edge. Row height is derived from
+  // its contents (and the stamp) so nothing overlaps at any scale.
   const drawRow = ({ label, name, title, signatureDiskPath, stampDiskPath, remarks }) => {
-    const rowH = remarks ? 118 : 88;
+    const remarksBlock = remarks ? m.remarksBoxH + 8 : 0;
+    const rowH = Math.max(stampSize + 10, 12 + remarksBlock + m.lineOff + 14);
     ensureRoom(rowH);
     const topY = doc.y;
     const lineW = usableWidth - stampSize - 24;
@@ -331,18 +357,18 @@ function drawSignatureBlock(doc, officials, institution, theme, classTeachers = 
     doc.fontSize(7.5).font("Helvetica-Bold").fillColor("#777").text(label.toUpperCase(), pageLeft, topY, { width: lineW, lineBreak: false });
     let y = topY + 12;
     if (remarks) {
-      doc.rect(pageLeft, y, lineW, 26).dash(3, { space: 2 }).strokeColor("#cbd5e1").stroke();
+      doc.rect(pageLeft, y, lineW, m.remarksBoxH).dash(3, { space: 2 }).strokeColor("#cbd5e1").stroke();
       doc.undash();
       doc.fontSize(7.5).font("Helvetica").fillColor("#999")
-        .text("Remarks and recommendations.", pageLeft + 6, y + 8, { width: lineW - 12, lineBreak: false });
-      y += 34;
+        .text("Remarks and recommendations.", pageLeft + 6, y + (m.remarksBoxH - 9) / 2, { width: lineW - 12, lineBreak: false });
+      y += remarksBlock;
     }
-    doc.fontSize(9.5).font("Helvetica-Bold").fillColor("#000").text(name || "—", pageLeft, y, { width: lineW * 0.55, lineBreak: false });
-    if (title) doc.fontSize(8).font("Helvetica").fillColor("#555").text(title, pageLeft, y + 12, { width: lineW * 0.55, lineBreak: false });
+    doc.fontSize(9.5).font("Helvetica-Bold").fillColor("#000").text(name || "—", pageLeft, y, { width: lineW * 0.55, lineBreak: false, ellipsis: true });
+    if (title) doc.fontSize(8).font("Helvetica").fillColor("#555").text(title, pageLeft, y + 12, { width: lineW * 0.55, lineBreak: false, ellipsis: true });
 
     // signature image sits on the line, to the right of the name
     const sigX = pageLeft + lineW * 0.58;
-    const lineY = y + 34;
+    const lineY = y + m.lineOff;
     drawImageFit(doc, signatureDiskPath, sigX, lineY - sigBoxH - 1, sigBoxW, sigBoxH);
     doc.moveTo(sigX, lineY).lineTo(sigX + sigBoxW, lineY).strokeColor("#999").stroke();
     doc.fontSize(7).font("Helvetica").fillColor("#777").text("Signature", sigX, lineY + 2, { width: sigBoxW, lineBreak: false });
@@ -380,7 +406,7 @@ function drawSignatureBlock(doc, officials, institution, theme, classTeachers = 
     .text(`Date: ${new Date().toLocaleDateString()}`, pageLeft, doc.y, { width: usableWidth, align: "right", lineBreak: false });
   doc.fillColor("#000");
   doc.x = pageLeft;
-  doc.y += 10;
+  doc.y += Math.max(4, 10 * m.s);
 }
 
 function addPageNumbers(doc) {
@@ -403,37 +429,71 @@ function addPageNumbers(doc) {
   doc.fillColor("#000");
 }
 
+/* Draws ONE student's whole transcript starting at the current page. */
+function renderStudentPage(doc, page, ctx, m) {
+  drawInstitutionHeader(doc, ctx.institution, { title: ctx.title, subtitle: ctx.subtitle }, ctx.theme, m);
+  drawIntroParagraph(doc, page.student, ctx.title);
+  drawStudentInfo(doc, page.student, m);
+  page.exams.forEach((exam) => drawExamTable(doc, exam, ctx.theme, m));
+  drawCumulativeSummary(doc, page, ctx.theme);
+  const norm = (v) => String(v || "").trim().toLowerCase();
+  const classTeachersForStudent = ctx.classTeachers.filter((c) => norm(c.className) === norm(page.student.studentClass));
+  drawSignatureBlock(doc, ctx.signers, ctx.institution, ctx.theme, classTeachersForStudent, m);
+  doc.fontSize(7).fillColor("#999").text(`Generated: ${new Date().toLocaleString()}`, { align: "right" });
+  doc.fillColor("#000");
+}
+
 /* Returns a Buffer. `students` is the per-student array shaped by
    transcript.controller.js; `title`/`subtitle` describe the exam
    scope and class/audience scope for the header on every page.
-   `officials` is the school's signing officials (see file header). */
+   `officials` is the school's signing officials (see file header).
+   Each student gets ONE page: the layout is dry-run on a scratch document
+   at decreasing scales until it fits (see SCALES above). */
 function buildTranscriptPdf({ institution, officials, classTeachers, title, subtitle, students }) {
   const theme = resolveReportTheme(institution?.reportTheme);
-  const signers = Array.isArray(officials) ? officials : [];
-  const allClassTeachers = Array.isArray(classTeachers) ? classTeachers : [];
-  const norm = (v) => String(v || "").trim().toLowerCase();
+  const ctx = {
+    institution, title, subtitle, theme,
+    signers: Array.isArray(officials) ? officials : [],
+    classTeachers: Array.isArray(classTeachers) ? classTeachers : [],
+  };
   return new Promise((resolve, reject) => {
-    const doc = new PDFDocument({ layout: "portrait", margin: PAGE_MARGIN, size: "A4", bufferPages: true });
-    const chunks = [];
-    doc.on("data", (chunk) => chunks.push(chunk));
-    doc.on("end", () => resolve(Buffer.concat(chunks)));
-    doc.on("error", reject);
+    try {
+      const opts = { layout: "portrait", margin: PAGE_MARGIN, size: "A4", bufferPages: true };
+      const doc = new PDFDocument(opts);
+      const chunks = [];
+      doc.on("data", (chunk) => chunks.push(chunk));
+      doc.on("end", () => resolve(Buffer.concat(chunks)));
+      doc.on("error", reject);
 
-    students.forEach((page, idx) => {
-      if (idx > 0) doc.addPage();
-      drawInstitutionHeader(doc, institution, { title, subtitle }, theme);
-      drawIntroParagraph(doc, page.student, title);
-      drawStudentInfo(doc, page.student);
-      page.exams.forEach((exam) => drawExamTable(doc, exam, theme));
-      drawCumulativeSummary(doc, page, theme);
-      const classTeachersForStudent = allClassTeachers.filter((c) => norm(c.className) === norm(page.student.studentClass));
-      drawSignatureBlock(doc, signers, institution, theme, classTeachersForStudent);
-      doc.fontSize(7).fillColor("#999").text(`Generated: ${new Date().toLocaleString()}`, { align: "right" });
-      doc.fillColor("#000");
-    });
+      // Scratch document used only to measure; its output is discarded.
+      const scratch = new PDFDocument(opts);
+      scratch.on("data", () => {});
+      const fitsOnOnePage = (page, m) => {
+        scratch.addPage();
+        const before = scratch.bufferedPageRange().count;
+        renderStudentPage(scratch, page, ctx, m);
+        return scratch.bufferedPageRange().count === before;
+      };
+      const pickMetrics = (page) => {
+        for (const sc of SCALES) {
+          const m = metricsFor(sc);
+          if (fitsOnOnePage(page, m)) return m;
+        }
+        return metricsFor(SCALES[SCALES.length - 1]);
+      };
 
-    addPageNumbers(doc);
-    doc.end();
+      students.forEach((page, idx) => {
+        const m = pickMetrics(page);
+        if (idx > 0) doc.addPage();
+        renderStudentPage(doc, page, ctx, m);
+      });
+      scratch.end();
+
+      addPageNumbers(doc);
+      doc.end();
+    } catch (err) {
+      reject(err);
+    }
   });
 }
 

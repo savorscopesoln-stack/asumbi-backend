@@ -352,6 +352,9 @@ app.use("/api/website", websiteRoutes);
 // before/regardless of role, so it's public read; writes are gated
 // requirePage("School Settings") internally in routes/schoolSettings.js.
 app.use("/api/school-settings", schoolSettingsRoutes);
+// Public "Download report form" page (/report-download): username + password -> (profile step if
+// needed) -> a REPORT-ONLY session. No portal login. Rate-limited and locked out per username inside.
+app.use("/api/report-access", require("./routes/reportAccess"));
 app.use("/api/contact", contactRoutes); // public POSTs (contact form + newsletter); GET/manage routes are protected internally
 app.use("/analytics", protect, analyticsRoute);
 app.use("/api/register", registerRoutes);
@@ -1419,9 +1422,9 @@ app.put("/api/student/profile", protect, authorize("student"), async (req, res) 
     phone = (phone || "").toString().trim();
     assessmentNumber = (assessmentNumber || "").toString().trim();
 
-    if (!studentClass || !gender || !email || !phone) {
+    if (!studentClass || !gender || !email || !phone || !assessmentNumber) {
       return res.status(400).json({
-        message: "Class, gender, email, and phone are required",
+        message: "Class, gender, email, phone, and assessment number are required",
       });
     }
 
@@ -1455,7 +1458,7 @@ app.put("/api/student/profile", protect, authorize("student"), async (req, res) 
       .input("gender", sql.NVarChar, gender)
       .input("email", sql.NVarChar, email)
       .input("phone", sql.NVarChar, cleanPhone)
-      .input("assessmentNumber", sql.NVarChar, assessmentNumber || null)
+      .input("assessmentNumber", sql.NVarChar, assessmentNumber)
       .query(`
         UPDATE Students
         SET studentClass = @studentClass,

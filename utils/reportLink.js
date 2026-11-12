@@ -54,6 +54,20 @@ const verifyReportLink = (token) => {
   return d;
 };
 
+/* Step-up token for the public "Download report form" page (/report-download):
+   the student proved who they are (username + password) but their profile is not filled in
+   yet, so they get a short-lived token that can do exactly ONE thing — save that profile
+   (POST /api/report-access/profile). It is never accepted as a login (see authMiddleware). */
+const PROFILE_TYP = "report-profile";
+const PROFILE_MINUTES = 20;
+const signProfileToken = ({ studentId, tenant }) =>
+  jwt.sign({ typ: PROFILE_TYP, sid: studentId, tenant: tenant || "default" }, secret(), { expiresIn: `${PROFILE_MINUTES}m` });
+const verifyProfileToken = (token) => {
+  const d = jwt.verify(String(token || ""), secret());
+  if (d.typ !== PROFILE_TYP || d.sid == null) throw new Error("not a profile token");
+  return d;
+};
+
 const signReportSession = ({ student, tenant }) =>
   jwt.sign(
     {
@@ -75,6 +89,6 @@ const renderMessage = (template, vars) =>
   String(template || "").replace(/\{(name|link|days|class)\}/gi, (_, k) => String(vars[k.toLowerCase()] ?? ""));
 
 module.exports = {
-  LINK_TYP, TRANSCRIPT_TYP, SESSION_SCOPE, REPORT_SESSION_ALLOWED_GET,
-  signReportLink, signTranscriptLink, verifyTranscriptLink, verifyReportLink, signReportSession, isAllowedForReportSession, renderMessage,
+  LINK_TYP, TRANSCRIPT_TYP, PROFILE_TYP, SESSION_SCOPE, REPORT_SESSION_ALLOWED_GET,
+  signProfileToken, verifyProfileToken, signReportLink, signTranscriptLink, verifyTranscriptLink, verifyReportLink, signReportSession, isAllowedForReportSession, renderMessage,
 };
