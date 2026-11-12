@@ -342,6 +342,18 @@ async function computeMainExaminationSummary(pool, id) {
 // Standard competition ranking (1, 2, 2, 4, ...) within each class, by
 // average_percentage descending. Candidates with no scored subject yet
 // get a null position (rendered as "—") rather than a fabricated rank.
+// Rank order used by EVERY ranking in the reports: higher average first; when the average is
+// the same the candidate with the higher TOTAL comes first. A name is never used to order
+// candidates. No average (nothing scored yet) goes last.
+function compareMeanThenTotal(a, b) {
+  const am = a.average_percentage, bm = b.average_percentage;
+  if (am == null && bm == null) return 0;
+  if (am == null) return 1;
+  if (bm == null) return -1;
+  if (bm !== am) return bm - am;
+  return (Number(b.total_obtained) || 0) - (Number(a.total_obtained) || 0);
+}
+
 function assignClassPositions(rows) {
   const byClass = new Map();
   rows.forEach((r) => {
@@ -350,19 +362,15 @@ function assignClassPositions(rows) {
     byClass.get(key).push(r);
   });
   byClass.forEach((group) => {
-    group.sort((a, b) => {
-      if (a.average_percentage == null && b.average_percentage == null) return 0;
-      if (a.average_percentage == null) return 1;
-      if (b.average_percentage == null) return -1;
-      return b.average_percentage - a.average_percentage;
-    });
-    let rank = 0, seen = 0, lastScore = null;
+    group.sort(compareMeanThenTotal);
+    // Same average AND same total share a position; same average but a higher total ranks higher.
+    let rank = 0, seen = 0, last = null;
     group.forEach((r) => {
       seen += 1;
       if (r.average_percentage == null) { r.class_position = null; return; }
-      if (lastScore === null || r.average_percentage !== lastScore) {
+      if (last === null || compareMeanThenTotal(last, r) !== 0) {
         rank = seen;
-        lastScore = r.average_percentage;
+        last = r;
       }
       r.class_position = rank;
     });
@@ -379,19 +387,14 @@ function assignClassPositions(rows) {
 // Roll's own average_percentage (§51). Candidates with no scored subject
 // yet get a null position rather than a fabricated rank.
 function assignOverallPositions(rows) {
-  const sorted = [...rows].sort((a, b) => {
-    if (a.average_percentage == null && b.average_percentage == null) return 0;
-    if (a.average_percentage == null) return 1;
-    if (b.average_percentage == null) return -1;
-    return b.average_percentage - a.average_percentage;
-  });
-  let rank = 0, seen = 0, lastScore = null;
+  const sorted = [...rows].sort(compareMeanThenTotal);
+  let rank = 0, seen = 0, last = null;
   sorted.forEach((r) => {
     seen += 1;
     if (r.average_percentage == null) { r.overall_position = null; return; }
-    if (lastScore === null || r.average_percentage !== lastScore) {
+    if (last === null || compareMeanThenTotal(last, r) !== 0) {
       rank = seen;
-      lastScore = r.average_percentage;
+      last = r;
     }
     r.overall_position = rank;
   });
