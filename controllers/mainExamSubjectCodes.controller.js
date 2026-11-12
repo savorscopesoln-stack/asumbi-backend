@@ -1,11 +1,12 @@
 const sql = require("mssql");
 const { logExamAudit } = require("../utils/examAuditLog");
 const { loadSubjectsWithAssessment, assignSubjectCodes } = require("./mainExamAnalytics.controller");
+const { buildCombineMap, validateCombineChanges } = require("../utils/combinedSubjects");
 
 /* =========================================================================
    SUBJECT CODES & KEY (Main Examination reports)
    GET /main-exams/:mainExamId/subject-codes
-   PUT /main-exams/:mainExamId/subject-codes   { items: [{ session_id, code, key }] }
+   PUT /main-exams/:mainExamId/subject-codes   { items: [{ session_id, code, key, combine_with? }] }
 
    The Nominal Roll / Overall Performance / Class Ranking reports head each
    subject column with a short code and print a "Code = Subject" key
@@ -14,6 +15,11 @@ const { loadSubjectsWithAssessment, assignSubjectCodes } = require("./mainExamAn
    to the generated code / the subject name. Deliberately NOT blocked once
    an exam is live or finished, because fixing a printed code is exactly
    when it is needed (the schedule-edit freeze does not apply).
+
+   COMBINE: each item may also carry combine_with (a session_id, or null).
+   A subject combined into another is shown as ONE subject with it on every
+   report (one column, the main subject's code, one key line), and that one
+   subject is what the totals and the mean use. See utils/combinedSubjects.js.
 ========================================================================= */
 
 const MAX_CODE = 20;
@@ -29,6 +35,7 @@ const getSubjectCodes = async (req, res) => {
     const subjects = all.filter((s) => s.e_assessment_id);
     const effective = assignSubjectCodes(subjects);
     const generated = assignSubjectCodes(subjects, { ignoreOverrides: true });
+    const combineMap = buildCombineMap(subjects);
     res.json({
       success: true,
       subjects: subjects.map((s) => ({
@@ -38,6 +45,7 @@ const getSubjectCodes = async (req, res) => {
         generated_code: generated.get(s.session_id),
         report_code: s.report_code || "",
         report_key: s.report_key || "",
+        combine_with: combineMap.get(s.session_id) || null,
       })),
     });
   } catch (err) {
@@ -60,6 +68,7 @@ const updateSubjectCodes = async (req, res) => {
     const clean = [];
     const errors = [];
     const seen = new Map();
+    const combineChanges = new Map(); // session_id -> main subject id | null (only when the item carries combine_with)
     for (const it of items) {
       const sessionId = toInt(it?.session_id);
       if (!sessionId || !valid.has(sessionId)) { errors.push("Unknown subject in list."); continue; }
@@ -71,7 +80,16 @@ const updateSubjectCodes = async (req, res) => {
         if (seen.has(code)) errors.push(`Code "${code}" is used for two subjects — codes must be unique.`);
         seen.set(code, sessionId);
       }
-      clean.push({ sessionId, code: code || null, key: key || null });
+      const hasCombine = it && Object.prototype.hasOwnProperty.call(it, "combine_with");
+      const combineWith = hasCombine ? toInt(it.combine_with) : undefined;
+      if (hasCombine) combineChanges.set(sessionId, combineWith || null);
+      clean.push({ sessionId, code: code || null, key: key || null, hasCombine, combineWith: combineWith || null });
+    }
+    if (combineChanges.size) {
+      const combineError = validateCombineChanges(
+        all.map((s) => ({ session_id: s.session_id, subject: s.subject, report_combine_with: s.report_combine_with, has_paper: !!s.e_assessment_id })),
+        combineChanges);
+      if (combineError) errors.push(combineError);
     }
     if (errors.length) return res.status(400).json({ success: false, message: errors[0], errors });
 
@@ -84,7 +102,9 @@ const updateSubjectCodes = async (req, res) => {
           .input("mainExaminationId", sql.Int, mainExamId)
           .input("code", sql.NVarChar(MAX_CODE), c.code)
           .input("key", sql.NVarChar(MAX_KEY), c.key)
+          .input("combineWith", sql.Int, c.combineWith)
           .query(`UPDATE exam_subject_sessions SET report_code = @code, report_key = @key
+                    ${c.hasCombine ? ", report_combine_with = @combineWith" : ""}
                   WHERE id = @id AND main_examination_id = @mainExaminationId`);
       }
       await tx.commit();
@@ -98,7 +118,7 @@ const updateSubjectCodes = async (req, res) => {
       action: "subject_codes_updated",
       actorId: req.user?.id,
       actorRole: req.user?.role,
-      details: { items: clean.map((c) => ({ session_id: c.sessionId, code: c.code, key: c.key })) },
+      details: { items: clean.map((c) => ({ session_id: c.sessionId, code: c.code, key: c.key, ...(c.hasCombine ? { combine_with: c.combineWith } : {}) })) },
     });
     return getSubjectCodes(req, res);
   } catch (err) {

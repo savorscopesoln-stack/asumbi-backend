@@ -1,5 +1,6 @@
 const examPct = require("../utils/examPercentages");
 const sql = require("mssql");
+const combine = require("../utils/combinedSubjects");
 
 /* =========================================================================
    MAIN EXAMINATION ANALYTICS (Phase 9 — §15-§26)
@@ -101,7 +102,7 @@ async function loadSubjectsWithAssessment(pool, mainExaminationId) {
       SELECT
         ess.id AS session_id, ess.subject, ess.status AS session_status,
         ess.exam_date, ess.start_time, ess.end_time, ess.e_assessment_id,
-        ess.report_code, ess.report_key, ess.allow_concurrent, ess.paper_label,
+        ess.report_code, ess.report_key, ess.report_combine_with, ess.allow_concurrent, ess.paper_label,
         ea.title AS assessment_title, ea.total_marks, ea.class_id, ea.year_of_study,
         c.name AS class_name
       FROM exam_subject_sessions ess
@@ -120,6 +121,15 @@ async function loadSubjectsWithAssessment(pool, mainExaminationId) {
     .map((s, i) => ({ s, i, code: codes.get(s.session_id) || null }))
     .sort((a, b) => compareSubjectCodes(a.code, b.code) || String(a.s.subject || "").localeCompare(String(b.s.subject || ""), undefined, { numeric: true }) || a.i - b.i)
     .map((x) => x.s);
+}
+
+/** Map(secondarySessionId -> mainSessionId): the subjects an admin combined into ONE subject
+    (Subject codes & key -> "Combine into"). Used by every report that builds totals / means. */
+async function loadCombineMap(pool, mainExaminationId) {
+  const r = await pool.request().input("mainExaminationId", sql.Int, mainExaminationId)
+    .query(`SELECT id AS session_id, report_combine_with FROM exam_subject_sessions
+            WHERE main_examination_id = @mainExaminationId AND e_assessment_id IS NOT NULL`);
+  return combine.buildCombineMap(r.recordset);
 }
 
 // Ascending by code; numbers compare as numbers ("9811" < "9812" < "9822E"
@@ -611,6 +621,24 @@ async function loadNominalRoll(pool, mainExaminationId) {
   const subjectCodes = assignSubjectCodes(subjects);
   const eAssessmentIds = [...new Set(subjects.map((s) => s.e_assessment_id))];
 
+  // Combined subjects (Subject codes & key -> "Combine into"): two subjects shown as ONE column.
+  // The combined subject keeps the main subject's code and place; its mark is built from both
+  // papers (see utils/combinedSubjects.js) and is what the total and the average use.
+  const combineMap = combine.buildCombineMap(subjects);
+  const subjectById = new Map(subjects.map((s) => [s.session_id, s]));
+  const columns = combine.planFold(subjects.map((s) => s.session_id), combineMap).map((p) => {
+    const main = subjectById.get(p.pid);
+    if (!p.combined) return { session_id: main.session_id, subject: main.subject, paper_label: main.paper_label || null, split_paper: !!main.allow_concurrent, code: subjectCodes.get(main.session_id), key: subjectKeyText(main), total_marks: main.total_marks };
+    const members = p.members.map((id) => subjectById.get(id));
+    const label = combine.combinedLabel(members, main);
+    return {
+      session_id: main.session_id, subject: label, paper_label: null, split_paper: false,
+      code: subjectCodes.get(main.session_id), key: label,
+      total_marks: members.reduce((a, m) => a + (Number(m.total_marks) || 0), 0),
+      combined: true, combined_subjects: members.map((m) => m.subject),
+    };
+  });
+
   // Class names come from the Classes table (the school's real classes).
   // A student's free-text studentClass is matched to one of them
   // (case/whitespace-insensitive); anything that matches no real class
@@ -634,7 +662,7 @@ async function loadNominalRoll(pool, mainExaminationId) {
     )
   `);
   const candidates = candidatesResult.recordset;
-  if (!candidates.length) return { subjects: subjects.map((s) => ({ session_id: s.session_id, subject: s.subject, code: subjectCodes.get(s.session_id), key: subjectKeyText(s), total_marks: s.total_marks })), rows: [] };
+  if (!candidates.length) return { subjects: columns, rows: [] };
 
   const idParams = eAssessmentIds.map((_, i) => `@eid${i}`).join(",");
   const subReq = pool.request();
@@ -652,7 +680,7 @@ async function loadNominalRoll(pool, mainExaminationId) {
 
   const rows = candidates.map((st) => {
     const counted = [];
-    const marks = subjects.map((subj) => {
+    const rawMarks = subjects.map((subj) => {
       const registered = (subj.class_name && subj.class_name === st.studentClass) || subj.year_of_study === st.yearOfStudy;
       if (!registered) return { session_id: subj.session_id, not_registered: true, score: null, total_marks: subj.total_marks, percentage: null };
       const score = scoreMap.has(`${st.student_id}:${subj.e_assessment_id}`) ? scoreMap.get(`${st.student_id}:${subj.e_assessment_id}`) : null;
@@ -664,7 +692,6 @@ async function loadNominalRoll(pool, mainExaminationId) {
         percentage = 0;
         absent = true;
       }
-      if (percentage != null) counted.push({ percentage, group: examPct.splitGroupKey(subj), sat: score != null });
       return {
         session_id: subj.session_id,
         not_registered: false,
@@ -674,6 +701,12 @@ async function loadNominalRoll(pool, mainExaminationId) {
         absent,
         optional,
       };
+    });
+    // Combined subjects become ONE cell here, so everything below (total, average, positions,
+    // subject analysis, exports) sees the combined subject and never its two halves.
+    const marks = combine.foldCells(rawMarks, combineMap);
+    marks.forEach((m) => {
+      if (m.percentage != null) counted.push({ percentage: m.percentage, group: examPct.splitGroupKey(subjectById.get(m.session_id)), sat: m.sat != null ? m.sat : m.score != null });
     });
     // Total / average are built from PERCENTAGES (never raw marks).
     // Split papers: every code is listed above, but a split subject counts once (the paper sat).
@@ -704,7 +737,7 @@ async function loadNominalRoll(pool, mainExaminationId) {
   });
 
   return {
-    subjects: subjects.map((s) => ({ session_id: s.session_id, subject: s.subject, paper_label: s.paper_label || null, split_paper: !!s.allow_concurrent, code: subjectCodes.get(s.session_id), key: subjectKeyText(s), total_marks: s.total_marks })),
+    subjects: columns,
     rows,
   };
 }
@@ -1085,31 +1118,41 @@ const getMainExamStudentAnalytics = async (req, res) => {
 
     const gradingSystem = await examPct.loadGradingSystem(pool);
     const isOptional = await examPct.loadOptionalMatcher(pool);
+    const combineMap = await loadCombineMap(pool, id);
     const byStudent = new Map();
     result.recordset.forEach((r) => {
-      if (!byStudent.has(r.student_id)) byStudent.set(r.student_id, { student_id: r.student_id, name: r.name, admission_no: r.admissionNo, registered: 0, completed: 0, counted: [], groups: new Set(), completedGroups: new Set() });
+      if (!byStudent.has(r.student_id)) byStudent.set(r.student_id, { student_id: r.student_id, name: r.name, admission_no: r.admissionNo, cells: [], groupById: new Map() });
       const st = byStudent.get(r.student_id);
-      // A split subject (several concurrent papers) is ONE subject here: registered once,
-      // completed once, and only one of its papers is counted in the total.
+      const optional = isOptional(r.subject);
       const group = examPct.splitGroupKey(r);
-      if (!group || !st.groups.has(group)) st.registered += 1;
-      let percentage = r.score != null && r.total_marks > 0 ? round2((r.score / r.total_marks) * 100) : null;
-      if (r.score != null) {
-        if (!group || !st.completedGroups.has(group)) st.completed += 1;
-        if (group) st.completedGroups.add(group);
-      } else if (!isOptional(r.subject) && examPct.isSessionOver(r.session_status)) percentage = 0; // absent compulsory paper = 0
-      if (group) st.groups.add(group);
-      if (percentage != null) st.counted.push({ percentage, group, sat: r.score != null });
+      st.groupById.set(r.session_id, group);
+      // absent compulsory paper = 0 (counted); absent optional paper = left out.
+      st.cells.push({ session_id: r.session_id, not_registered: false, score: r.score != null ? r.score : null, total_marks: r.total_marks, optional, absent: r.score == null && !optional && examPct.isSessionOver(r.session_status) });
     });
     const students = [...byStudent.values()].map((st) => {
-      const sum = examPct.summarisePercentages(examPct.countedWithoutSplitDuplicates(st.counted), gradingSystem);
+      // Combined subjects are ONE subject here (registered once, completed once, one mark in the total).
+      // A split subject (several concurrent papers) is ONE subject too: registered once,
+      // completed once, and only one of its papers is counted in the total.
+      const folded = combine.foldCells(st.cells, combineMap);
+      const groups = new Set(); const completedGroups = new Set(); const counted = [];
+      let registered = 0, completed = 0;
+      folded.forEach((c) => {
+        const group = st.groupById.get(c.session_id) || null;
+        const sat = c.combined ? c.sat : c.score != null;
+        if (!group || !groups.has(group)) registered += 1;
+        if (sat && (!group || !completedGroups.has(group))) { completed += 1; if (group) completedGroups.add(group); }
+        if (group) groups.add(group);
+        const percentage = combine.cellPercentage(c);
+        if (percentage != null) counted.push({ percentage, group, sat });
+      });
+      const sum = examPct.summarisePercentages(examPct.countedWithoutSplitDuplicates(counted), gradingSystem);
       return {
         student_id: st.student_id,
         name: st.name,
         admission_no: st.admission_no,
-        subjects_registered: st.registered,
-        subjects_completed: st.completed,
-        subjects_incomplete: Math.max(0, st.registered - st.completed),
+        subjects_registered: registered,
+        subjects_completed: completed,
+        subjects_incomplete: Math.max(0, registered - completed),
         // sum of subject percentages / total marks achievable; the average is the mean %
         total_obtained: sum.total,
         total_possible: sum.possible,
@@ -1147,7 +1190,7 @@ const getStudentExaminationProfile = async (req, res) => {
       .input("yearOfStudy", sql.Int, student.yearOfStudy || 0)
       .query(`
         SELECT
-          ess.id AS session_id, ess.subject, ess.allow_concurrent, ess.paper_label, ess.status AS session_status, ess.exam_date,
+          ess.id AS session_id, ess.subject, ess.report_key, ess.allow_concurrent, ess.paper_label, ess.status AS session_status, ess.exam_date,
           ea.total_marks,
           sub.score, sub.status AS submission_status, sub.submitted_at
         FROM exam_subject_sessions ess
@@ -1161,7 +1204,7 @@ const getStudentExaminationProfile = async (req, res) => {
 
     const gradingSystem = await examPct.loadGradingSystem(pool);
     const isOptional = await examPct.loadOptionalMatcher(pool);
-    const subjects = rowsResult.recordset.map((r) => {
+    const subjectsRaw = rowsResult.recordset.map((r) => {
       const optional = isOptional(r.subject);
       let percentage = r.score != null && r.total_marks > 0 ? round2((r.score / r.total_marks) * 100) : null;
       let status;
@@ -1181,6 +1224,33 @@ const getStudentExaminationProfile = async (req, res) => {
         score: r.score,
         total_marks: r.total_marks,
         percentage,
+      };
+    });
+
+    // Combined subjects (Subject codes & key -> "Combine into") are listed and counted as ONE subject.
+    const combineMap = await loadCombineMap(pool, id);
+    const recById = new Map(rowsResult.recordset.map((r) => [r.session_id, r]));
+    const rawById = new Map(subjectsRaw.map((x) => [x.session_id, x]));
+    const folded = combine.foldCells(
+      subjectsRaw.map((x) => ({ session_id: x.session_id, not_registered: false, score: x.score, total_marks: x.total_marks, optional: x.optional, absent: x.status === "absent" && !x.optional })),
+      combineMap);
+    const subjects = folded.map((c) => {
+      if (!c.combined) return rawById.get(c.session_id);
+      const members = c.members.map((mid) => rawById.get(mid));
+      const main = rawById.get(c.session_id) || members[0];
+      return {
+        session_id: c.session_id,
+        subject: combine.combinedLabel(members, recById.get(c.session_id) || members[0]),
+        paper_label: null,
+        split_group: main.split_group,
+        exam_date: main.exam_date,
+        status: c.sat ? "completed" : c.absent ? "absent" : "upcoming",
+        optional: c.optional,
+        score: c.score,
+        total_marks: c.total_marks,
+        percentage: c.percentage,
+        combined: true,
+        combined_subjects: members.map((m) => m.subject),
       };
     });
 
@@ -1229,6 +1299,7 @@ module.exports = {
   computeGenderPerformance,
   loadSubjectsWithAssessment,
   loadNominalRoll,
+  loadCombineMap,
   assignSubjectCodes,
   // Exported so the Overview dashboard (mainExam.controller.js's
   // getMainExaminationDashboard) reads the pass mark from the exact

@@ -2301,6 +2301,16 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       ALTER TABLE exam_subject_sessions ADD report_key NVARCHAR(150) NULL
     `);
 
+    /* ---------------- exam_subject_sessions.report_combine_with ----------------
+       Combined subjects: a subject can be merged INTO another one (the id of
+       the main subject's session). On every report the two then appear as ONE
+       subject, and that one subject is what the total and the average use.
+       NULL = not combined. Mirrors migrations/2026-11-12_add_report_combine_to_subject_sessions.sql */
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sys.columns WHERE Name = N'report_combine_with' AND Object_ID = Object_ID(N'exam_subject_sessions'))
+      ALTER TABLE exam_subject_sessions ADD report_combine_with INT NULL
+    `);
+
     /* ---------------- exam_subject_sessions.paper_label / allow_concurrent ----------------
        Split / concurrent papers: one subject may have several papers at the
        same time (Paper 1, Paper 2...). Mirrors migrations/2026-10-08_add_split_paper_columns.sql

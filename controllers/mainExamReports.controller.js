@@ -1,10 +1,12 @@
 const examPct = require("../utils/examPercentages");
 const sql = require("mssql");
+const combine = require("../utils/combinedSubjects");
 const {
   getMainExamAnalytics,
   getSubjectAnalytics,
   getStudentExaminationProfile,
   loadNominalRoll,
+  loadCombineMap,
   computeClassPerformance,
   computeGenderPerformance,
   computeSubjectAnalysis,
@@ -305,7 +307,7 @@ const getClassResultsReport = async (req, res) => {
     const subjectsResult = await pool.request()
       .input("mainExamId", sql.Int, mainExamId).input("classId", sql.Int, classId).input("year", sql.Int, classYear)
       .query(`
-        SELECT ess.id AS session_id, ess.subject, ess.allow_concurrent, ess.paper_label, ess.status AS session_status, ess.e_assessment_id, ea.total_marks
+        SELECT ess.id AS session_id, ess.subject, ess.report_key, ess.allow_concurrent, ess.paper_label, ess.status AS session_status, ess.e_assessment_id, ea.total_marks
         FROM exam_subject_sessions ess
         JOIN e_assessments ea ON ea.id = ess.e_assessment_id
         WHERE ess.main_examination_id = @mainExamId
@@ -336,17 +338,32 @@ const getClassResultsReport = async (req, res) => {
 
     const gradingSystem = await examPct.loadGradingSystem(pool);
     const isOptional = await examPct.loadOptionalMatcher(pool);
+    // Combined subjects (Subject codes & key -> "Combine into") are ONE column and ONE mark here.
+    const combineMap = await loadCombineMap(pool, mainExamId);
+    const subById = new Map(subjects.map((x) => [x.session_id, x]));
+    const columns = combine.planFold(subjects.map((x) => x.session_id), combineMap).map((p) => {
+      const main = subById.get(p.pid);
+      if (!p.combined) return { session_id: main.session_id, subject: main.subject, paper_label: main.paper_label || null, total_marks: main.total_marks };
+      const members = p.members.map((id) => subById.get(id));
+      return { session_id: main.session_id, subject: combine.combinedLabel(members, main), paper_label: null, total_marks: members.reduce((a, m) => a + (Number(m.total_marks) || 0), 0), combined: true, combined_subjects: members.map((m) => m.subject) };
+    });
+    const columnById = new Map(columns.map((c) => [c.session_id, c]));
+
     const rows = students.map((st) => {
       const counted = [];
-      const subjectMarks = subjects.map((sub) => {
+      const cells = subjects.map((sub) => {
         const score = subMap[`${st.id}:${sub.e_assessment_id}`];
-        let percentage = score != null && sub.total_marks > 0 ? round2((score / sub.total_marks) * 100) : null;
         const optional = isOptional(sub.subject);
-        let absent = false;
         // Not sat: a compulsory paper counts as 0 once its session is over; an optional one is left out.
-        if (score == null && !optional && examPct.isSessionOver(sub.session_status)) { percentage = 0; absent = true; }
-        if (percentage != null) counted.push({ percentage, group: examPct.splitGroupKey(sub), sat: score != null });
-        return { subject: sub.subject, paper_label: sub.paper_label || null, score: score ?? null, total_marks: sub.total_marks, percentage, absent, optional, grade: null };
+        const absent = score == null && !optional && examPct.isSessionOver(sub.session_status);
+        return { session_id: sub.session_id, not_registered: false, score: score ?? null, total_marks: sub.total_marks, optional, absent };
+      });
+      const subjectMarks = combine.foldCells(cells, combineMap).map((c) => {
+        const percentage = combine.cellPercentage(c);
+        const sat = c.combined ? c.sat : c.score != null;
+        if (percentage != null) counted.push({ percentage, group: examPct.splitGroupKey(subById.get(c.session_id)), sat });
+        const col = columnById.get(c.session_id);
+        return { subject: col.subject, paper_label: col.paper_label || null, score: c.score ?? null, total_marks: c.total_marks, percentage, absent: !!c.absent, optional: !!c.optional, grade: null, ...(c.combined ? { combined: true } : {}) };
       });
       const sum = examPct.summarisePercentages(examPct.countedWithoutSplitDuplicates(counted), gradingSystem);
       return {
@@ -366,7 +383,7 @@ const getClassResultsReport = async (req, res) => {
       report: "class_results",
       generated_at: new Date().toISOString(),
       class: { id: klass.id, name: klass.name },
-      subjects: subjects.map((s) => ({ session_id: s.session_id, subject: s.subject, paper_label: s.paper_label || null, total_marks: s.total_marks })),
+      subjects: columns,
       rows,
     });
   } catch (err) {
