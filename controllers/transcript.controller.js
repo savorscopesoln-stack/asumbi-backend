@@ -1,5 +1,5 @@
 const sql = require("mssql");
-const { getInstitutionHeader, getSigningOfficials, getClassTeachers, sendPdfBuffer } = require("../utils/reportExport");
+const { getInstitutionHeader, getSigningOfficials, getClassTeachers, getFooterStampDiskPath, sendPdfBuffer } = require("../utils/reportExport");
 const { buildTranscriptPdf } = require("../utils/transcriptPdf");
 const { loadGradingSystem, getGradeForScore, getOverallResultForScore } = require("../utils/grading");
 
@@ -189,6 +189,7 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
     const institution = await getInstitutionHeader(pool);
     const officials = await getSigningOfficials(pool);
     const classTeachers = await getClassTeachers(pool);
+    institution.footerStampDiskPath = await getFooterStampDiskPath(pool);
     const title = singleExam ? singleExam.name : "Full Academic Transcript (All Exams)";
     const subtitle = scope === "class" ? `Class: ${className}`
       : scope === "student" ? `Student: ${studentPages[0].student.name}` : "All Students";

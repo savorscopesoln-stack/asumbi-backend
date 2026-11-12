@@ -24,6 +24,7 @@ const SESSION_MINUTES = 120;
 // request. Anything else is refused for a report-only session.
 const REPORT_SESSION_ALLOWED_GET = new Set([
   "/api/student/marks",
+  "/api/student/positions", // class / overall position shown on the report form
   "/api/students",
   "/api/subjects",
   "/api/report-card-source",
