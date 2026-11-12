@@ -343,7 +343,11 @@ router.get("/transcript-link", async (req, res) => {
     const { buildTranscripts } = require("../controllers/transcript.controller");
     const { sendPdfBuffer } = require("../utils/reportExport");
     const pool = await getPool(link.tenant || "default");
-    const result = await buildTranscripts(pool, { scope: "student", studentId: Number(link.sid), examId: link.exam || null });
+    const { checkDownload } = require("../utils/downloadAccess");
+    // A link the school sent for ONE student's transcript obeys the open/close window only (not the "what is offered" button).
+    const gate = await checkDownload(pool, "any");
+    if (!gate.ok) return res.status(gate.status).json({ code: gate.code, message: gate.message });
+    const result = await buildTranscripts(pool, { scope: "student", studentId: Number(link.sid), examId: link.exam || null, requirePhoto: true });
     if (!result.ok) {
       return res.status(result.status).json({
         code: result.code,
