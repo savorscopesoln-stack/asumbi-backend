@@ -69,6 +69,10 @@ router.use(protect, requirePage("E-Assessments"));
 const { previewReportLinks, sendReportLinks } = require("../controllers/reportLink.controller");
 router.post("/report-links/preview", previewReportLinks);
 router.post("/report-links/send", sendReportLinks);
+// When students may download, and what (report form / transcript / both) — utils/downloadAccess.js.
+const { getDownloadAccessAdmin, putDownloadAccessAdmin } = require("../utils/downloadAccess");
+router.get("/download-access", getDownloadAccessAdmin);
+router.put("/download-access", putDownloadAccessAdmin);
 
 router.get("/", getMainExaminations);
 // Phase 5 (wallet integration): requireFundableExamination is a

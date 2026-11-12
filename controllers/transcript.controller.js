@@ -1,5 +1,6 @@
 const sql = require("mssql");
-const { getInstitutionHeader, getSigningOfficials, getClassTeachers, sendPdfBuffer } = require("../utils/reportExport");
+const { getInstitutionHeader, getSigningOfficials, getClassTeachers, getFooterStampDiskPath, sendPdfBuffer, urlToDiskPath, loadPdfImage } = require("../utils/reportExport");
+const { getReportFormConfig } = require("../utils/reportFormSubjects");
 const { buildTranscriptPdf } = require("../utils/transcriptPdf");
 const { loadGradingSystem, getGradeForScore, getOverallResultForScore } = require("../utils/grading");
 
@@ -32,11 +33,12 @@ const round2 = (n) => (n == null ? null : Math.floor(Number(n) + 1e-9));
    released marks for the chosen scope are silently skipped rather
    than given a blank page.
 ========================================================================= */
-const fail = (status, message) => ({ ok: false, status, message });
+const fail = (status, message, code) => ({ ok: false, status, message, code });
+const PHOTO_REQUIRED_MESSAGE = "Please upload a clear, official passport photo to your profile before downloading. Your report form and transcript need your photo.";
 const slug = (v) => String(v || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
 
 /** Builds the transcript file for a selection. Returns { ok:true, buffer, filename, contentType } or { ok:false, status, message }. */
-const buildTranscripts = async (pool, { scope, className, studentId, examId, separate }) => {
+const buildTranscripts = async (pool, { scope, className, studentId, examId, separate, requirePhoto }) => {
   try {
     if (!["all", "class", "student"].includes(scope)) scope = "class";
     if (scope === "class" && !className) return fail(400, "A class is required for a per-class transcript");
@@ -44,7 +46,7 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
 
     /* ---------------- 1. Students in scope ---------------- */
     const studentsReq = pool.request();
-    let studentsQuery = `SELECT id, name, admissionNo, studentClass, gender, assessmentNumber, yearOfStudy FROM Students`;
+    let studentsQuery = `SELECT id, name, admissionNo, studentClass, gender, assessmentNumber, yearOfStudy, photoUrl FROM Students`;
     if (scope === "class") {
       studentsReq.input("className", sql.NVarChar, className);
       studentsQuery += ` WHERE studentClass = @className`;
@@ -56,6 +58,11 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
     const studentsResult = await studentsReq.query(studentsQuery);
     const students = studentsResult.recordset;
     if (!students.length) return fail(404, "No students found for this selection");
+
+    // Student-facing downloads (report link / report-only session) need a photo on file.
+    if (requirePhoto && students.some((s) => !String(s.photoUrl || "").trim())) {
+      return fail(409, PHOTO_REQUIRED_MESSAGE, "PHOTO_REQUIRED");
+    }
 
     /* ---------------- 2. Resolve the selected exam's name (for the title/filename) ---------------- */
     let singleExam = null;
@@ -79,7 +86,7 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
       SELECT
         m.studentId,
         me.id AS mainExaminationId, me.name AS examName, me.academic_year, me.term, me.start_date,
-        sub.name AS subjectName, sub.code AS subjectCode,
+        m.subjectId, sub.name AS subjectName, sub.code AS subjectCode,
         m.percentage
       FROM Marks m
       INNER JOIN Assessments a ON a.id = m.assessmentId AND a.sourceSystem = 'e_assessment'
@@ -103,6 +110,12 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
 
     /* ---------------- 4. Group rows: studentId → examId → subjects[] ---------------- */
     const gradingSystem = await loadGradingSystem(pool);
+    // Report Form Subjects: an optional subject counts toward the averages only
+    // when the student actually has a mark in it (a student who didn't take it
+    // just doesn't have it listed — never a CRNM), so the transcript always
+    // agrees with the report form.
+    const optionalSubjectIds = new Set((await getReportFormConfig(pool)).optionalIds.map(Number));
+    const isOptionalSubject = (s) => s.subjectId != null && optionalSubjectIds.has(Number(s.subjectId));
     const byStudent = new Map();
     marksRows.forEach((row) => {
       if (!byStudent.has(row.studentId)) byStudent.set(row.studentId, new Map());
@@ -113,6 +126,7 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
         });
       }
       examsMap.get(row.mainExaminationId).subjects.push({
+        subjectId: row.subjectId,
         subjectCode: row.subjectCode || null,
         subjectName: row.subjectName || row.subjectCode || "Subject",
         percentage: row.percentage,
@@ -149,6 +163,7 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
           const band = s.percentage != null ? getGradeForScore(s.percentage, gradingSystem) : null;
           return {
             ...s,
+            optional: isOptionalSubject(s),
             grade: band && band.grade !== "" && band.grade != null ? String(band.grade) : "—",
             points: band ? band.label : "—",
             gradePoints: band ? Number(band.grade) : null,
@@ -179,6 +194,11 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
       });
     });
 
+    // Profile photo for each transcript (JPEG/PNG buffer, or null → no photo box).
+    for (const page of studentPages) {
+      page.student.photoImage = await loadPdfImage(urlToDiskPath(page.student.photoUrl));
+    }
+
     if (!studentPages.length) {
       return fail(404, singleExam
         ? `No released marks found for "${singleExam.name}" for this selection`
@@ -189,6 +209,7 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
     const institution = await getInstitutionHeader(pool);
     const officials = await getSigningOfficials(pool);
     const classTeachers = await getClassTeachers(pool);
+    institution.footerStampDiskPath = await getFooterStampDiskPath(pool);
     const title = singleExam ? singleExam.name : "Full Academic Transcript (All Exams)";
     const subtitle = scope === "class" ? `Class: ${className}`
       : scope === "student" ? `Student: ${studentPages[0].student.name}` : "All Students";

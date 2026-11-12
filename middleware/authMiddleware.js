@@ -145,7 +145,8 @@ const protect = (req, res, next) => {
        form needs. Everything else (any write, any other endpoint) is refused. */
     if (decoded?.scope === "report") {
       const { isAllowedForReportSession } = require("../utils/reportLink");
-      if (!isAllowedForReportSession(req.method, req.originalUrl)) {
+      // Session issued while only transcripts were on offer: no report-form data.
+      if (decoded.dl === "transcript" || !isAllowedForReportSession(req.method, req.originalUrl)) {
         return res.status(403).json({
           success: false, code: "REPORT_LINK_SCOPE",
           message: "This link only opens your report form.",

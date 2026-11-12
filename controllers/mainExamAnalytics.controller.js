@@ -1,3 +1,4 @@
+const examPct = require("../utils/examPercentages");
 const sql = require("mssql");
 
 /* =========================================================================
@@ -646,25 +647,36 @@ async function loadNominalRoll(pool, mainExaminationId) {
   const scoreMap = new Map(); // `${student_id}:${e_assessment_id}` -> score
   submissionsResult.recordset.forEach((r) => scoreMap.set(`${r.student_id}:${r.e_assessment_id}`, r.score));
 
+  const gradingSystem = await examPct.loadGradingSystem(pool);
+  const isOptional = await examPct.loadOptionalMatcher(pool);
+
   const rows = candidates.map((st) => {
-    let totalObtained = 0, totalPossible = 0, anyScored = false;
+    const counted = [];
     const marks = subjects.map((subj) => {
       const registered = (subj.class_name && subj.class_name === st.studentClass) || subj.year_of_study === st.yearOfStudy;
       if (!registered) return { session_id: subj.session_id, not_registered: true, score: null, total_marks: subj.total_marks, percentage: null };
       const score = scoreMap.has(`${st.student_id}:${subj.e_assessment_id}`) ? scoreMap.get(`${st.student_id}:${subj.e_assessment_id}`) : null;
-      if (score != null) {
-        totalObtained += score;
-        totalPossible += subj.total_marks || 0;
-        anyScored = true;
+      const optional = isOptional(subj.subject);
+      let percentage = score != null && subj.total_marks > 0 ? round2((score / subj.total_marks) * 100) : null;
+      let absent = false;
+      if (percentage == null && score == null && !optional && examPct.isSessionOver(subj.session_status)) {
+        // Registered compulsory paper not sat (exam over): included as 0.
+        percentage = 0;
+        absent = true;
       }
+      if (percentage != null) counted.push({ percentage });
       return {
         session_id: subj.session_id,
         not_registered: false,
-        score,
+        score,               // raw mark, kept for the subject analysis only — reports show `percentage`
         total_marks: subj.total_marks,
-        percentage: score != null && subj.total_marks > 0 ? round2((score / subj.total_marks) * 100) : null,
+        percentage,
+        absent,
+        optional,
       };
     });
+    // Total / average are built from PERCENTAGES (never raw marks).
+    const sum = examPct.summarisePercentages(counted, gradingSystem);
     return {
       student_id: st.student_id,
       name: st.name,
@@ -673,9 +685,9 @@ async function loadNominalRoll(pool, mainExaminationId) {
       class: canonClass(st.studentClass),
       year_of_study: st.yearOfStudy,
       marks,
-      total_obtained: anyScored ? totalObtained : null,
-      total_possible: anyScored ? totalPossible : null,
-      average_percentage: anyScored && totalPossible > 0 ? round2((totalObtained / totalPossible) * 100) : null,
+      total_obtained: sum.total,
+      total_possible: sum.possible,
+      average_percentage: sum.average,
     };
   });
 
@@ -1047,9 +1059,12 @@ const getMainExamStudentAnalytics = async (req, res) => {
       searchClause = "AND (st.name LIKE @search OR st.admissionNo LIKE @search)";
     }
 
+    // One row per (candidate, registered paper); the per-candidate totals are
+    // built in JS from PERCENTAGES (absent compulsory papers = 0, optional
+    // papers not sat left out) — see utils/examPercentages.js.
     const result = await request.query(`
       WITH registered AS (
-        SELECT DISTINCT st.id AS student_id, ess.id AS session_id, ess.e_assessment_id
+        SELECT DISTINCT st.id AS student_id, ess.id AS session_id, ess.e_assessment_id, ess.subject, ess.status AS session_status
         FROM Students st
         JOIN exam_subject_sessions ess ON ess.main_examination_id = @mainExaminationId
         JOIN e_assessments ea ON ea.id = ess.e_assessment_id
@@ -1057,33 +1072,43 @@ const getMainExamStudentAnalytics = async (req, res) => {
         WHERE (c.name IS NOT NULL AND c.name = st.studentClass) OR ea.year_of_study = st.yearOfStudy
       )
       SELECT
-        r.student_id, st.name, st.admissionNo,
-        COUNT(DISTINCT r.session_id) AS subjects_registered,
-        COUNT(DISTINCT sub.id) AS subjects_completed,
-        SUM(CASE WHEN sub.score IS NOT NULL AND ea2.total_marks > 0 THEN CAST(sub.score AS FLOAT) END) AS total_obtained,
-        SUM(CASE WHEN sub.score IS NOT NULL AND ea2.total_marks > 0 THEN CAST(ea2.total_marks AS FLOAT) END) AS total_possible
+        r.student_id, st.name, st.admissionNo, r.session_id, r.subject, r.session_status,
+        ea2.total_marks, sub.score
       FROM registered r
       JOIN Students st ON st.id = r.student_id
       LEFT JOIN e_assessment_submissions sub ON sub.e_assessment_id = r.e_assessment_id AND sub.student_id = r.student_id
       LEFT JOIN e_assessments ea2 ON ea2.id = r.e_assessment_id
       WHERE 1=1 ${searchClause}
-      GROUP BY r.student_id, st.name, st.admissionNo
       ORDER BY st.name
     `);
 
-    const students = result.recordset.map((r) => ({
-      student_id: r.student_id,
-      name: r.name,
-      admission_no: r.admissionNo,
-      subjects_registered: r.subjects_registered,
-      subjects_completed: r.subjects_completed,
-      subjects_incomplete: Math.max(0, r.subjects_registered - r.subjects_completed),
-      // total obtained / total possible across the papers sat, and the
-      // average is that same ratio — identical to the Nominal Roll's.
-      total_obtained: r.total_obtained,
-      total_possible: r.total_possible,
-      overall_average: r.total_possible > 0 ? round2((r.total_obtained / r.total_possible) * 100) : null,
-    }));
+    const gradingSystem = await examPct.loadGradingSystem(pool);
+    const isOptional = await examPct.loadOptionalMatcher(pool);
+    const byStudent = new Map();
+    result.recordset.forEach((r) => {
+      if (!byStudent.has(r.student_id)) byStudent.set(r.student_id, { student_id: r.student_id, name: r.name, admission_no: r.admissionNo, registered: 0, completed: 0, counted: [] });
+      const st = byStudent.get(r.student_id);
+      st.registered += 1;
+      let percentage = r.score != null && r.total_marks > 0 ? round2((r.score / r.total_marks) * 100) : null;
+      if (r.score != null) st.completed += 1;
+      else if (!isOptional(r.subject) && examPct.isSessionOver(r.session_status)) percentage = 0; // absent compulsory paper = 0
+      if (percentage != null) st.counted.push({ percentage });
+    });
+    const students = [...byStudent.values()].map((st) => {
+      const sum = examPct.summarisePercentages(st.counted, gradingSystem);
+      return {
+        student_id: st.student_id,
+        name: st.name,
+        admission_no: st.admission_no,
+        subjects_registered: st.registered,
+        subjects_completed: st.completed,
+        subjects_incomplete: Math.max(0, st.registered - st.completed),
+        // sum of subject percentages / total marks achievable; the average is the mean %
+        total_obtained: sum.total,
+        total_possible: sum.possible,
+        overall_average: sum.average,
+      };
+    });
 
     res.json({ success: true, students });
   } catch (err) {
@@ -1127,29 +1152,34 @@ const getStudentExaminationProfile = async (req, res) => {
         ORDER BY ess.start_time ASC, ess.id ASC
       `);
 
+    const gradingSystem = await examPct.loadGradingSystem(pool);
+    const isOptional = await examPct.loadOptionalMatcher(pool);
     const subjects = rowsResult.recordset.map((r) => {
-      const percentage = r.score != null && r.total_marks > 0 ? round2((r.score / r.total_marks) * 100) : null;
+      const optional = isOptional(r.subject);
+      let percentage = r.score != null && r.total_marks > 0 ? round2((r.score / r.total_marks) * 100) : null;
       let status;
       if (r.score != null) status = "completed";
       else if (r.session_status === "ended" || r.session_status === "completed") status = "absent";
       else status = "upcoming";
+      // Absent compulsory paper = 0 (counted); absent optional paper = left out.
+      if (status === "absent" && !optional) percentage = 0;
       return {
         session_id: r.session_id,
         subject: r.subject,
         exam_date: r.exam_date,
         status,
+        optional,
         score: r.score,
         total_marks: r.total_marks,
         percentage,
       };
     });
 
-    const scored = subjects.filter((s) => s.percentage != null);
-    const withMarks = subjects.filter((s) => s.score != null && s.total_marks > 0);
-    const totalObtained = withMarks.length ? withMarks.reduce((a, s) => a + Number(s.score), 0) : null;
-    const totalPossible = withMarks.length ? withMarks.reduce((a, s) => a + Number(s.total_marks), 0) : null;
-    // same ratio the Nominal Roll uses: total obtained / total possible
-    const overallAverage = totalPossible > 0 ? round2((totalObtained / totalPossible) * 100) : null;
+    const scored = subjects.filter((s) => s.status === "completed" && s.percentage != null);
+    const sum = examPct.summarisePercentages(subjects.map((s) => ({ percentage: s.percentage })), gradingSystem);
+    const totalObtained = sum.total;
+    const totalPossible = sum.possible;
+    const overallAverage = sum.average;
 
     res.json({
       success: true,

@@ -2175,6 +2175,17 @@ async function ensureSchema(pool, sql, tenantKey = "default") {
       END
     `);
 
+    /* GradingSystem.totalMarks — the total number of marks that can be
+       achieved on a report (e.g. 1700). NULL = not set: reports fall back
+       to (counted subjects x 100), exactly as before. */
+    await pool.request().query(`
+      IF NOT EXISTS (
+        SELECT * FROM sys.columns
+        WHERE Name = N'totalMarks' AND Object_ID = Object_ID(N'GradingSystem')
+      )
+      ALTER TABLE GradingSystem ADD totalMarks INT NULL
+    `);
+
     /* =========================================================
        MAIN EXAMINATIONS — parent "2026 Second Year Final
        Examination"-style container that groups several existing

@@ -5,6 +5,7 @@ const { getMarkingDeadline, listMarkingDeadlines, setMarkingDeadline } = require
 const { getZeroMarked, pushBackZeroMarked } = require("../controllers/zeroMarkReturn.controller");
 const { grantResitBulk } = require("../controllers/resitBulk.controller");
 const { getReportCardOptions, putReportCardSource } = require("../utils/reportCardSource");
+const { getReportFormSubjectsAdmin, putReportFormSubjectsAdmin } = require("../utils/reportFormSubjects");
 const router = express.Router();
 
 const {
@@ -146,6 +147,9 @@ router.get("/admin/report-card-release-status", protect, requirePage("E-Assessme
 router.put("/admin/report-card-release", protect, requirePage("E-Assessments"), releaseReportCardMarks);
 router.get("/admin/report-card-options", protect, requirePage("E-Assessments"), getReportCardOptions);
 router.put("/admin/report-card-source", protect, requirePage("E-Assessments"), putReportCardSource);
+// Subjects shown on the report form + which of them are optional (excluded from the average)
+router.get("/admin/report-form-subjects", protect, requirePage("E-Assessments"), getReportFormSubjectsAdmin);
+router.put("/admin/report-form-subjects", protect, requirePage("E-Assessments"), putReportFormSubjectsAdmin);
 router.put("/admin/:id/seb", protect, requirePage("E-Assessments"), setSebSettings);
 router.put("/admin/:id/seb-config", protect, requirePage("E-Assessments"), uploadSebConfig);
 router.delete("/admin/:id/seb-config", protect, requirePage("E-Assessments"), deleteSebConfig);
