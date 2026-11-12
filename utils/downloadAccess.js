@@ -8,6 +8,11 @@
                'both'       → the student picks (report form or transcript)
      opensAt   downloads open from this moment   (NULL = open straight away)
      closesAt  downloads close at this moment    (NULL = never closes)
+     requirePhoto  ON (default) = a student must have a passport photo on file
+               before a report form / transcript unlocks. OFF = no photo needed.
+
+   Every successful student download is also written to ReportDownloadLog
+   (who, what, when, how) so staff can see the history — see logDownload().
 
    Nothing saved yet → mode 'report', always open: exactly the behaviour
    before this feature existed.
@@ -37,6 +42,32 @@ async function ensureTable(pool) {
       )
     END
   `);
+  // Added later: the passport-photo on/off switch (existing rows stay ON, as before).
+  await pool.request().query(`
+    IF COL_LENGTH('ReportDownloadAccess', 'requirePhoto') IS NULL
+      ALTER TABLE ReportDownloadAccess ADD requirePhoto BIT NOT NULL CONSTRAINT DF_ReportDownloadAccess_requirePhoto DEFAULT 1
+  `);
+  // Who downloaded what. One row per successful download.
+  await pool.request().query(`
+    IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='ReportDownloadLog' AND xtype='U')
+    BEGIN
+      CREATE TABLE ReportDownloadLog (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        studentId INT NULL,
+        studentName NVARCHAR(200) NULL,
+        username NVARCHAR(100) NULL,
+        studentClass NVARCHAR(100) NULL,
+        kind NVARCHAR(20) NOT NULL,          -- 'report' | 'transcript'
+        method NVARCHAR(20) NULL,            -- 'pdf' | 'print' | 'transcript-pdf'
+        source NVARCHAR(30) NULL,            -- 'download-page' | 'report-link' | 'transcript-link'
+        ip NVARCHAR(64) NULL,
+        userAgent NVARCHAR(300) NULL,
+        createdAt DATETIME NOT NULL CONSTRAINT DF_ReportDownloadLog_createdAt DEFAULT GETDATE()
+      );
+      CREATE INDEX IX_ReportDownloadLog_createdAt ON ReportDownloadLog (createdAt DESC);
+      CREATE INDEX IX_ReportDownloadLog_student ON ReportDownloadLog (studentId);
+    END
+  `);
   ensured.add(pool);
 }
 
@@ -49,13 +80,16 @@ const toDate = (v) => {
 async function getDownloadAccess(pool) {
   try {
     await ensureTable(pool);
-    const row = (await pool.request().query(`SELECT TOP 1 mode, opensAt, closesAt FROM ReportDownloadAccess WHERE id = 1`)).recordset[0];
-    if (!row) return { mode: "report", opensAt: null, closesAt: null };
-    return { mode: MODES.includes(row.mode) ? row.mode : "report", opensAt: toDate(row.opensAt), closesAt: toDate(row.closesAt) };
+    const row = (await pool.request().query(`SELECT TOP 1 mode, opensAt, closesAt, requirePhoto FROM ReportDownloadAccess WHERE id = 1`)).recordset[0];
+    if (!row) return { mode: "report", opensAt: null, closesAt: null, requirePhoto: true };
+    return {
+      mode: MODES.includes(row.mode) ? row.mode : "report", opensAt: toDate(row.opensAt), closesAt: toDate(row.closesAt),
+      requirePhoto: row.requirePhoto == null ? true : !!row.requirePhoto,
+    };
   } catch (err) {
     // Never lock students out because this optional setting failed to load.
     console.error("DOWNLOAD ACCESS LOAD ERROR (ignored):", err.message);
-    return { mode: "report", opensAt: null, closesAt: null };
+    return { mode: "report", opensAt: null, closesAt: null, requirePhoto: true };
   }
 }
 
@@ -88,6 +122,7 @@ const publicView = (access) => ({
   mode: access.mode,
   opensAt: access.opensAt ? access.opensAt.toISOString() : null,
   closesAt: access.closesAt ? access.closesAt.toISOString() : null,
+  requirePhoto: access.requirePhoto !== false,
 });
 
 /* ── admin endpoints (Main Examinations → Report Download Link) ── */
@@ -112,16 +147,21 @@ const putDownloadAccessAdmin = async (req, res) => {
     if ((rawOpen && !opensAt) || (rawClose && !closesAt)) return res.status(400).json({ success: false, message: "Invalid opening or closing date" });
     if (opensAt && closesAt && closesAt <= opensAt) return res.status(400).json({ success: false, message: "The closing time must be after the opening time" });
 
+    // Photo switch: omitted -> keep what is saved; otherwise on/off.
+    const current = await getDownloadAccess(pool);
+    const requirePhoto = typeof req.body?.requirePhoto === "boolean" ? req.body.requirePhoto : current.requirePhoto;
+
     await pool.request()
       .input("mode", sql.NVarChar(12), mode)
+      .input("requirePhoto", sql.Bit, requirePhoto ? 1 : 0)
       .input("opensAt", sql.DateTime, opensAt)
       .input("closesAt", sql.DateTime, closesAt)
       .input("by", sql.Int, req.user?.id || null)
       .query(`
         IF EXISTS (SELECT 1 FROM ReportDownloadAccess WHERE id = 1)
-          UPDATE ReportDownloadAccess SET mode=@mode, opensAt=@opensAt, closesAt=@closesAt, updatedAt=GETDATE(), updatedBy=@by WHERE id = 1
+          UPDATE ReportDownloadAccess SET mode=@mode, opensAt=@opensAt, closesAt=@closesAt, requirePhoto=@requirePhoto, updatedAt=GETDATE(), updatedBy=@by WHERE id = 1
         ELSE
-          INSERT INTO ReportDownloadAccess (id, mode, opensAt, closesAt, updatedBy) VALUES (1, @mode, @opensAt, @closesAt, @by)
+          INSERT INTO ReportDownloadAccess (id, mode, opensAt, closesAt, requirePhoto, updatedBy) VALUES (1, @mode, @opensAt, @closesAt, @requirePhoto, @by)
       `);
     const access = await getDownloadAccess(pool);
     res.json({ success: true, ...publicView(access), state: windowState(access).state, serverTime: new Date().toISOString() });
@@ -131,4 +171,65 @@ const putDownloadAccessAdmin = async (req, res) => {
   }
 };
 
-module.exports = { MODES, ensureTable, getDownloadAccess, windowState, checkDownload, publicView, getDownloadAccessAdmin, putDownloadAccessAdmin };
+/* ── download history ── */
+const clip = (v, n) => (v == null ? null : String(v).slice(0, n));
+
+/** Records one successful download. NEVER throws: a logging problem must not stop a student's download. */
+async function logDownload(pool, { student, kind, method, source, req }) {
+  try {
+    await ensureTable(pool);
+    const ip = clip(req?.ip || req?.headers?.["x-forwarded-for"], 64);
+    await pool.request()
+      .input("sid", sql.Int, student?.id != null ? Number(student.id) : null)
+      .input("name", sql.NVarChar(200), clip(student?.name, 200))
+      .input("user", sql.NVarChar(100), clip(student?.username, 100))
+      .input("cls", sql.NVarChar(100), clip(student?.studentClass, 100))
+      .input("kind", sql.NVarChar(20), kind === "transcript" ? "transcript" : "report")
+      .input("method", sql.NVarChar(20), clip(method, 20))
+      .input("source", sql.NVarChar(30), clip(source, 30))
+      .input("ip", sql.NVarChar(64), ip)
+      .input("ua", sql.NVarChar(300), clip(req?.headers?.["user-agent"], 300))
+      .query(`INSERT INTO ReportDownloadLog (studentId, studentName, username, studentClass, kind, method, source, ip, userAgent)
+              VALUES (@sid, @name, @user, @cls, @kind, @method, @source, @ip, @ua)`);
+  } catch (err) {
+    console.error("DOWNLOAD LOG ERROR (ignored):", err.message);
+  }
+}
+
+/** GET /main-exams/download-history?kind=&search=&studentId=&from=&to=&limit=&offset= */
+const getDownloadHistoryAdmin = async (req, res) => {
+  try {
+    const pool = req.pool;
+    await ensureTable(pool);
+    const q = req.query || {};
+    const limit = Math.min(500, Math.max(1, parseInt(q.limit, 10) || 100));
+    const offset = Math.max(0, parseInt(q.offset, 10) || 0);
+    const where = ["1 = 1"];
+    const rq = pool.request();
+    if (q.kind === "report" || q.kind === "transcript") { rq.input("kind", sql.NVarChar(20), q.kind); where.push("kind = @kind"); }
+    if (q.studentId && !Number.isNaN(parseInt(q.studentId, 10))) { rq.input("sid", sql.Int, parseInt(q.studentId, 10)); where.push("studentId = @sid"); }
+    if (q.search) {
+      rq.input("s", sql.NVarChar(120), `%${String(q.search).trim().slice(0, 100)}%`);
+      where.push("(studentName LIKE @s OR username LIKE @s OR studentClass LIKE @s)");
+    }
+    const from = toDate(q.from), to = toDate(q.to);
+    if (from) { rq.input("from", sql.DateTime, from); where.push("createdAt >= @from"); }
+    if (to) { rq.input("to", sql.DateTime, to); where.push("createdAt < @to"); }
+    rq.input("limit", sql.Int, limit).input("offset", sql.Int, offset);
+    const cond = where.join(" AND ");
+    const rows = (await rq.query(`
+      SELECT id, studentId, studentName, username, studentClass, kind, method, source, ip, createdAt
+      FROM ReportDownloadLog WHERE ${cond}
+      ORDER BY createdAt DESC, id DESC OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY;
+      SELECT COUNT(*) AS total, COUNT(DISTINCT studentId) AS students FROM ReportDownloadLog WHERE ${cond};
+    `));
+    const sets = rows.recordsets || [rows.recordset];
+    const sum = (sets[1] && sets[1][0]) || { total: 0, students: 0 };
+    res.json({ success: true, total: sum.total, students: sum.students, items: sets[0] || [] });
+  } catch (err) {
+    console.error("DOWNLOAD HISTORY ERROR:", err.message);
+    res.status(500).json({ success: false, message: "Could not load the download history" });
+  }
+};
+
+module.exports = { logDownload, getDownloadHistoryAdmin, MODES, ensureTable, getDownloadAccess, windowState, checkDownload, publicView, getDownloadAccessAdmin, putDownloadAccessAdmin };
