@@ -5864,6 +5864,7 @@ const getGradingSystem = async (req, res) => {
         id: 1,
         systemName: "KNEC Standard",
         passMark: 40,
+        totalMarks: null,
         gradeBands: [
           { minScore: 80, grade: "1", label: "Distinction", remark: "Excellent Performance" },
           { minScore: 75, grade: "2", label: "Distinction", remark: "Good Performance" },
@@ -5891,6 +5892,7 @@ const getGradingSystem = async (req, res) => {
       id: row.id,
       systemName: row.systemName,
       passMark: row.passMark,
+      totalMarks: row.totalMarks ?? null,
       gradeBands,
       overallBands,
       updatedAt: row.updatedAt,
@@ -5904,7 +5906,7 @@ const getGradingSystem = async (req, res) => {
 const updateGradingSystem = async (req, res) => {
   try {
     const pool = req.pool;
-    const { systemName, passMark, gradeBands, overallBands } = req.body || {};
+    const { systemName, passMark, totalMarks, gradeBands, overallBands } = req.body || {};
 
     if (!Array.isArray(gradeBands) || gradeBands.length === 0) {
       return res.status(400).json({ message: "At least one grade band is required" });
@@ -5936,8 +5938,20 @@ const updateGradingSystem = async (req, res) => {
     if (!cleanGradeBands.length) return res.status(400).json({ message: "Grade bands are invalid" });
     if (!cleanOverallBands.length) return res.status(400).json({ message: "Overall-result bands are invalid" });
 
+    // Total marks that can be achieved on a report (blank = not set → reports
+    // fall back to counted subjects x 100). Must be a whole number > 0.
+    let cleanTotalMarks = null;
+    if (totalMarks !== undefined && totalMarks !== null && String(totalMarks).trim() !== "") {
+      const n = Number(totalMarks);
+      if (!Number.isInteger(n) || n <= 0 || n > 1000000) {
+        return res.status(400).json({ message: "Total marks must be a whole number greater than 0 (or left blank)" });
+      }
+      cleanTotalMarks = n;
+    }
+
     await pool.request()
       .input("systemName", sql.NVarChar, systemName || "Standard Grading")
+      .input("totalMarks", sql.Int, cleanTotalMarks)
       .input("passMark", sql.Int, Number.isFinite(Number(passMark)) ? parseInt(passMark, 10) : 40)
       .input("gradeBandsJson", sql.NVarChar(sql.MAX), JSON.stringify(cleanGradeBands))
       .input("overallBandsJson", sql.NVarChar(sql.MAX), JSON.stringify(cleanOverallBands))
@@ -5947,14 +5961,15 @@ const updateGradingSystem = async (req, res) => {
           UPDATE GradingSystem SET
             systemName = @systemName,
             passMark = @passMark,
+            totalMarks = @totalMarks,
             gradeBandsJson = @gradeBandsJson,
             overallBandsJson = @overallBandsJson,
             updatedAt = GETDATE(),
             updatedBy = @updatedBy
           WHERE id = 1
         ELSE
-          INSERT INTO GradingSystem (id, systemName, passMark, gradeBandsJson, overallBandsJson, updatedBy)
-          VALUES (1, @systemName, @passMark, @gradeBandsJson, @overallBandsJson, @updatedBy)
+          INSERT INTO GradingSystem (id, systemName, passMark, totalMarks, gradeBandsJson, overallBandsJson, updatedBy)
+          VALUES (1, @systemName, @passMark, @totalMarks, @gradeBandsJson, @overallBandsJson, @updatedBy)
       `);
 
     const result = await pool.request().query(`SELECT TOP 1 * FROM GradingSystem WHERE id = 1`);
@@ -5964,6 +5979,7 @@ const updateGradingSystem = async (req, res) => {
       id: row.id,
       systemName: row.systemName,
       passMark: row.passMark,
+      totalMarks: row.totalMarks ?? null,
       gradeBands: JSON.parse(row.gradeBandsJson),
       overallBands: JSON.parse(row.overallBandsJson),
       updatedAt: row.updatedAt,

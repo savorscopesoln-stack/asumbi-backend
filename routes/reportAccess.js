@@ -1,7 +1,8 @@
 const express = require("express");
 const router = express.Router();
 const { sql, getPool, listTenantKeys } = require("../config/db");
-const { signReportSession, signProfileToken, verifyProfileToken } = require("../utils/reportLink");
+const { signReportSession, signProfileToken, verifyProfileToken, verifyReportSession } = require("../utils/reportLink");
+const { checkDownload, publicView } = require("../utils/downloadAccess");
 const { isActiveStudent } = require("../utils/examAccess");
 
 /* =========================================================================
@@ -46,9 +47,10 @@ const noteMiss = (req) => recentOf(ipMisses, clientIp(req), 10 * 60_000).push(Da
 const STUDENT_COLS = `id, username, name, status, photoUrl, profileCompleted,
   studentClass, gender, email, phone, assessmentNumber`;
 
-const readyResponse = (student, tenant) => ({
+const readyResponse = (student, tenant, access) => ({
   status: "ready",
-  token: signReportSession({ student, tenant }),
+  token: signReportSession({ student, tenant, mode: access?.mode }),
+  downloads: publicView(access || { mode: "report", opensAt: null, closesAt: null }), // what this student may download, and when
   user: {
     id: student.id, username: student.username, name: student.name || "", role: "student",
     source: "Students", tenant, photoUrl: student.photoUrl || null, reportLinkSession: true,
@@ -59,6 +61,9 @@ const inactiveResponse = (res) => res.status(403).json({
   code: "STUDENT_INACTIVE",
   message: "Your account isn't active, so a report form can't be downloaded. Please contact the school office.",
 });
+
+// Outside the open/close window (Report Download Link → "When can students download?") nobody gets in.
+const closedResponse = (res, gate) => res.status(gate.status).json({ code: gate.code, message: gate.message });
 
 const loadClasses = async (pool) => {
   try {
@@ -96,6 +101,8 @@ router.post("/verify", async (req, res) => {
 
     const { student, tenant, pool } = found[0];
     if (!isActiveStudent(student.status)) return inactiveResponse(res);
+    const gate = await checkDownload(pool, "any");
+    if (!gate.ok) return closedResponse(res, gate);
 
     if (!student.profileCompleted) {
       return res.json({
@@ -109,7 +116,7 @@ router.post("/verify", async (req, res) => {
         classes: await loadClasses(pool),
       });
     }
-    return res.json(readyResponse(student, tenant));
+    return res.json(readyResponse(student, tenant, gate.access));
   } catch (err) {
     console.log("REPORT ACCESS VERIFY ERROR:", err);
     res.status(500).json({ message: "Something went wrong. Please try again." });
@@ -140,9 +147,11 @@ router.post("/profile", async (req, res) => {
     const student = r.recordset[0];
     if (!student) return res.status(404).json({ message: "This student record could not be found." });
     if (!isActiveStudent(student.status)) return inactiveResponse(res);
+    const gate = await checkDownload(pool, "any");
+    if (!gate.ok) return closedResponse(res, gate);
 
     // Already filled in (another tab / device): nothing to save, the download is simply available.
-    if (student.profileCompleted) return res.json(readyResponse(student, tenant));
+    if (student.profileCompleted) return res.json(readyResponse(student, tenant, gate.access));
 
     const clean = (v) => (v == null ? "" : String(v)).trim();
     const studentClass = clean(req.body?.studentClass);
@@ -179,10 +188,47 @@ router.post("/profile", async (req, res) => {
 
     const fresh = await pool.request().input("id", sql.Int, student.id)
       .query(`SELECT ${STUDENT_COLS} FROM Students WHERE id = @id`);
-    return res.json(readyResponse(fresh.recordset[0] || student, tenant));
+    return res.json(readyResponse(fresh.recordset[0] || student, tenant, gate.access));
   } catch (err) {
     console.log("REPORT ACCESS PROFILE ERROR:", err);
     res.status(500).json({ message: "Could not save your details. Please try again." });
+  }
+});
+
+/* ------------------------------------------------------------ transcript */
+// The student's own transcript PDF, for someone holding a report-only session (from /report-download or a /r/ link).
+// Re-checks the open/close window and the mode on every request, so closing downloads takes effect at once.
+router.get("/transcript", async (req, res) => {
+  try {
+    if (tooMany(req)) return res.status(429).json({ message: "Too many attempts. Please wait a minute and try again." });
+    const header = req.headers.authorization || "";
+    let session;
+    try { session = verifyReportSession(header.startsWith("Bearer ") ? header.slice(7) : ""); }
+    catch (e) {
+      return res.status(401).json({ message: e.name === "TokenExpiredError" ? "Your session timed out. Please open the page again." : "Please open the page again." });
+    }
+    const pool = await getPool(session.tenant || "default");
+    const r = await pool.request().input("id", sql.Int, Number(session.id)).query(`SELECT id, status FROM Students WHERE id = @id`);
+    const student = r.recordset[0];
+    if (!student) return res.status(404).json({ message: "This student record could not be found." });
+    if (!isActiveStudent(student.status)) return res.status(403).json({ message: "Your account isn't active. Please contact the school office." });
+
+    const gate = await checkDownload(pool, "transcript");
+    if (!gate.ok) return res.status(gate.status).json({ code: gate.code, message: gate.message });
+
+    const { buildTranscripts } = require("../controllers/transcript.controller");
+    const { sendPdfBuffer } = require("../utils/reportExport");
+    const result = await buildTranscripts(pool, { scope: "student", studentId: Number(student.id), examId: null, requirePhoto: true });
+    if (!result.ok) {
+      return res.status(result.status).json({
+        code: result.code,
+        message: result.status === 404 ? "Your transcript isn't available yet — no released marks were found." : result.message,
+      });
+    }
+    return sendPdfBuffer(res, result.buffer, result.filename);
+  } catch (err) {
+    console.log("REPORT ACCESS TRANSCRIPT ERROR:", err);
+    res.status(500).json({ message: "Could not prepare your transcript. Please try again." });
   }
 });
 

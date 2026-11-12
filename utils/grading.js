@@ -18,6 +18,7 @@
 const DEFAULT_GRADING_SYSTEM = {
   systemName: "KNEC Standard",
   passMark: 40,
+  totalMarks: null,
   gradeBands: [
     { minScore: 80, grade: "1", label: "Distinction", remark: "Excellent Performance" },
     { minScore: 75, grade: "2", label: "Distinction", remark: "Good Performance" },
@@ -75,6 +76,7 @@ async function loadGradingSystem(pool) {
     return {
       systemName: row.systemName,
       passMark: row.passMark,
+      totalMarks: row.totalMarks ?? null,
       gradeBands: gradeBands.length ? gradeBands : DEFAULT_GRADING_SYSTEM.gradeBands,
       overallBands: overallBands.length ? overallBands : DEFAULT_GRADING_SYSTEM.overallBands,
     };
@@ -85,4 +87,13 @@ async function loadGradingSystem(pool) {
   }
 }
 
-module.exports = { DEFAULT_GRADING_SYSTEM, getGradeForScore, getOverallResultForScore, loadGradingSystem };
+/** Total marks that can be achieved on a report: the Grading System's "Total
+    Marks That Can Be Achieved" when set, else (counted subjects x 100). Mirrors
+    getTotalMarksPossible in frontend/src/utils/grading.js. */
+function getTotalMarksPossible(gradingSystem, countedSubjects) {
+  const n = Number(gradingSystem?.totalMarks);
+  if (Number.isFinite(n) && n > 0) return n;
+  return (Number(countedSubjects) || 0) * 100;
+}
+
+module.exports = { DEFAULT_GRADING_SYSTEM, getGradeForScore, getOverallResultForScore, loadGradingSystem, getTotalMarksPossible };

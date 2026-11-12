@@ -15,6 +15,8 @@ require("./scheduling.test.js");
 require("./scheduler.test.js");
 require("./studentDashboard.test.js");
 require("./reportExport.test.js");
+require("./optionalSubjects.test.js");
+require("./downloadAccess.test.js");
 require("./regression.test.js");
 require("./walletLedger.test.js");
 require("./walletController.test.js");

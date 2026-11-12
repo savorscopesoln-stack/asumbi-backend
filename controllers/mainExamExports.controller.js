@@ -51,6 +51,13 @@ async function loadExamHeaderInfo(pool, mainExamId) {
 /* "Total marks" cell for a candidate: marks obtained out of the marks
    possible across the papers they sat, e.g. "1400/1700". Shown just
    before the mean/average so the percentage can be checked at a glance. */
+/* One paper's cell: always the % mark, never the raw marks. A compulsory paper
+   not sat is 0%; "—" = not registered, or an optional paper not taken. */
+function fmtPct(m) {
+  if (!m || m.not_registered || m.percentage == null) return "—";
+  return `${m.percentage}%`;
+}
+
 function fmtTotal(obtained, possible) {
   if (obtained == null || possible == null || !(possible > 0)) return "—";
   const f = (n) => String(Math.round(Number(n) * 100) / 100);
@@ -70,7 +77,7 @@ function subjectMarkColumns(nominalSubjects) {
 }
 function subjectMarkValues(marks, base) {
   const row = { ...base };
-  (marks || []).forEach((m, i) => { row[`subj_${i}`] = m.not_registered || m.score == null ? "—" : m.score; });
+  (marks || []).forEach((m, i) => { row[`subj_${i}`] = fmtPct(m); });
   return row;
 }
 
@@ -340,8 +347,6 @@ const SHAPES = {
     const columns = [
       { header: "Admission No", key: "admission_no", width: 16 },
       { header: "Name", key: "name", width: 26 },
-      { header: "Marks", key: "marks", width: 10 },
-      { header: "Total Marks", key: "total_marks", width: 12 },
       { header: "Percentage", key: "percentage", width: 12, percent: true },
       { header: "Grade", key: "grade", width: 10 },
       { header: "Status", key: "status", width: 12 },
@@ -363,9 +368,7 @@ const SHAPES = {
     const infoRows = [
       { label: "Student", value: data.student?.name },
       { label: "Admission No", value: data.student?.admission_no },
-      { label: "Total Marks", value: fmtTotal(
-          (data.subjects || []).filter((x) => x.score != null).reduce((a, x) => a + Number(x.score), 0),
-          (data.subjects || []).filter((x) => x.score != null).reduce((a, x) => a + Number(x.total_marks || 0), 0)) },
+      { label: "Total Marks", value: fmtTotal(data.total_obtained, data.total_possible) },
       { label: "Overall Average", value: data.overall_average != null ? `${data.overall_average}%` : "Not enough data" },
       { label: "Subjects Completed", value: data.subjects_completed },
       { label: "Subjects Absent", value: data.subjects_absent },
@@ -373,8 +376,6 @@ const SHAPES = {
     ];
     const subjectCols = [
       { header: "Subject", key: "subject", width: 22 },
-      { header: "Marks", key: "score", width: 10 },
-      { header: "Total Marks", key: "total_marks", width: 12 },
       { header: "Percentage", key: "percentage", width: 12, percent: true },
       { header: "Status", key: "status", width: 12 },
     ];
@@ -402,7 +403,7 @@ const SHAPES = {
     ];
     const rows = (data.rows || []).map((r) => {
       const flat = { admission_no: r.admission_no, name: r.name, total_marks_obtained: fmtTotal(r.total_marks_obtained, r.total_marks_possible), average_percentage: r.average_percentage };
-      (r.subjects || []).forEach((s, i) => { flat[`subj_${i}`] = s.score ?? "-"; });
+      (r.subjects || []).forEach((s, i) => { flat[`subj_${i}`] = fmtPct(s); });
       return flat;
     });
     return {
