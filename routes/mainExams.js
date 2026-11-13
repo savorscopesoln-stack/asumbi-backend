@@ -70,11 +70,13 @@ const { previewReportLinks, sendReportLinks } = require("../controllers/reportLi
 router.post("/report-links/preview", previewReportLinks);
 router.post("/report-links/send", sendReportLinks);
 // When students may download, and what (report form / transcript / both) — utils/downloadAccess.js.
-const { getDownloadAccessAdmin, putDownloadAccessAdmin, getDownloadHistoryAdmin } = require("../utils/downloadAccess");
+const { getDownloadAccessAdmin, putDownloadAccessAdmin, getDownloadHistoryAdmin, getProfileStatusAdmin } = require("../utils/downloadAccess");
 router.get("/download-access", getDownloadAccessAdmin);
 router.put("/download-access", putDownloadAccessAdmin);
 // Who downloaded which report form / transcript, and when.
 router.get("/download-history", getDownloadHistoryAdmin);
+// Who has / has not filled in their profile (the step the public download page asks for).
+router.get("/profile-status", getProfileStatusAdmin);
 
 router.get("/", getMainExaminations);
 // Phase 5 (wallet integration): requireFundableExamination is a

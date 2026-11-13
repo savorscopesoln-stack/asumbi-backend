@@ -11,6 +11,14 @@
      requirePhoto  ON (default) = a student must have a passport photo on file
                before a report form / transcript unlocks. OFF = no photo needed.
 
+   pageNotice  a message the admin types; shown big on the public download page
+               (GET /report-access/info) whether downloads are open or not.
+
+   Students whose profile is not filled in yet may still fill it in while
+   downloads are CLOSED / NOT OPEN YET (POST /report-access/verify|profile);
+   only the report form / transcript itself stays locked. The admin's list of
+   who has / has not updated is getProfileStatusAdmin().
+
    Every successful student download is also written to ReportDownloadLog
    (who, what, when, how) so staff can see the history — see logDownload().
 
@@ -52,6 +60,11 @@ async function ensureTable(pool) {
     IF COL_LENGTH('ReportDownloadAccess', 'transcriptExamIds') IS NULL
       ALTER TABLE ReportDownloadAccess ADD transcriptExamIds NVARCHAR(MAX) NULL
   `);
+  // The admin's message shown on the public download page.
+  await pool.request().query(`
+    IF COL_LENGTH('ReportDownloadAccess', 'pageNotice') IS NULL
+      ALTER TABLE ReportDownloadAccess ADD pageNotice NVARCHAR(1000) NULL
+  `);
   // Who downloaded what. One row per successful download.
   await pool.request().query(`
     IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='ReportDownloadLog' AND xtype='U')
@@ -88,20 +101,24 @@ const parseIds = (v) => {
   return ids.length ? ids : null;
 };
 
+const NOTICE_MAX = 1000;
+const cleanNotice = (v) => (v == null ? "" : String(v).replace(/\r\n/g, "\n").trim().slice(0, NOTICE_MAX));
+
 async function getDownloadAccess(pool) {
   try {
     await ensureTable(pool);
-    const row = (await pool.request().query(`SELECT TOP 1 mode, opensAt, closesAt, requirePhoto, transcriptExamIds FROM ReportDownloadAccess WHERE id = 1`)).recordset[0];
-    if (!row) return { mode: "report", opensAt: null, closesAt: null, requirePhoto: true, transcriptExamIds: null };
+    const row = (await pool.request().query(`SELECT TOP 1 mode, opensAt, closesAt, requirePhoto, transcriptExamIds, pageNotice FROM ReportDownloadAccess WHERE id = 1`)).recordset[0];
+    if (!row) return { mode: "report", opensAt: null, closesAt: null, requirePhoto: true, transcriptExamIds: null, notice: "" };
     return {
       mode: MODES.includes(row.mode) ? row.mode : "report", opensAt: toDate(row.opensAt), closesAt: toDate(row.closesAt),
       requirePhoto: row.requirePhoto == null ? true : !!row.requirePhoto,
       transcriptExamIds: parseIds(row.transcriptExamIds),
+      notice: cleanNotice(row.pageNotice),
     };
   } catch (err) {
     // Never lock students out because this optional setting failed to load.
     console.error("DOWNLOAD ACCESS LOAD ERROR (ignored):", err.message);
-    return { mode: "report", opensAt: null, closesAt: null, requirePhoto: true, transcriptExamIds: null };
+    return { mode: "report", opensAt: null, closesAt: null, requirePhoto: true, transcriptExamIds: null, notice: "" };
   }
 }
 
@@ -138,11 +155,14 @@ const publicView = (access) => ({
   transcriptExamIds: access.transcriptExamIds || null, // null = all exams
 });
 
+/** publicView + the admin's typed message (admin settings screen only; the student session never carries it). */
+const adminView = (access) => ({ ...publicView(access), notice: access.notice || "" });
+
 /* ── admin endpoints (Main Examinations → Report Download Link) ── */
 const getDownloadAccessAdmin = async (req, res) => {
   try {
     const access = await getDownloadAccess(req.pool);
-    res.json({ success: true, ...publicView(access), state: windowState(access).state, serverTime: new Date().toISOString() });
+    res.json({ success: true, ...adminView(access), state: windowState(access).state, serverTime: new Date().toISOString() });
   } catch (err) {
     console.error("DOWNLOAD ACCESS GET ERROR:", err.message);
     res.status(500).json({ success: false, message: "Could not load the download settings" });
@@ -169,7 +189,11 @@ const putDownloadAccessAdmin = async (req, res) => {
     if (Array.isArray(req.body?.transcriptExamIds)) transcriptExamIds = parseIds(req.body.transcriptExamIds.join(","));
     else if (req.body?.transcriptExamIds === null) transcriptExamIds = null;
 
+    // Message on the download page: omitted -> keep what is saved; a string (even empty) replaces it.
+    const notice = typeof req.body?.notice === "string" ? cleanNotice(req.body.notice) : current.notice;
+
     await pool.request()
+      .input("notice", sql.NVarChar(NOTICE_MAX), notice || null)
       .input("examIds", sql.NVarChar(sql.MAX), transcriptExamIds ? transcriptExamIds.join(",") : null)
       .input("mode", sql.NVarChar(12), mode)
       .input("requirePhoto", sql.Bit, requirePhoto ? 1 : 0)
@@ -178,15 +202,75 @@ const putDownloadAccessAdmin = async (req, res) => {
       .input("by", sql.Int, req.user?.id || null)
       .query(`
         IF EXISTS (SELECT 1 FROM ReportDownloadAccess WHERE id = 1)
-          UPDATE ReportDownloadAccess SET mode=@mode, opensAt=@opensAt, closesAt=@closesAt, requirePhoto=@requirePhoto, transcriptExamIds=@examIds, updatedAt=GETDATE(), updatedBy=@by WHERE id = 1
+          UPDATE ReportDownloadAccess SET mode=@mode, opensAt=@opensAt, closesAt=@closesAt, requirePhoto=@requirePhoto, transcriptExamIds=@examIds, pageNotice=@notice, updatedAt=GETDATE(), updatedBy=@by WHERE id = 1
         ELSE
-          INSERT INTO ReportDownloadAccess (id, mode, opensAt, closesAt, requirePhoto, transcriptExamIds, updatedBy) VALUES (1, @mode, @opensAt, @closesAt, @requirePhoto, @examIds, @by)
+          INSERT INTO ReportDownloadAccess (id, mode, opensAt, closesAt, requirePhoto, transcriptExamIds, pageNotice, updatedBy) VALUES (1, @mode, @opensAt, @closesAt, @requirePhoto, @examIds, @notice, @by)
       `);
     const access = await getDownloadAccess(pool);
-    res.json({ success: true, ...publicView(access), state: windowState(access).state, serverTime: new Date().toISOString() });
+    res.json({ success: true, ...adminView(access), state: windowState(access).state, serverTime: new Date().toISOString() });
   } catch (err) {
     console.error("DOWNLOAD ACCESS PUT ERROR:", err.message);
     res.status(500).json({ success: false, message: "Could not save the download settings" });
+  }
+};
+
+/* ── who has / has not filled in their profile ──
+   GET /main-exams/profile-status?status=all|completed|pending&class=&search=&limit=&offset=
+   Lists the ACTIVE students only (inactive students cannot use the download page anyway).
+   `summary` counts the whole class/search selection, whatever the status tab, so the tabs can show numbers. */
+const ACTIVE_STUDENT = `LTRIM(RTRIM(ISNULL(status, ''))) IN ('', 'active')`;
+
+const getProfileStatusAdmin = async (req, res) => {
+  try {
+    const pool = req.pool;
+    const q = req.query || {};
+    const status = ["completed", "pending"].includes(q.status) ? q.status : "all";
+    const limit = Math.min(5000, Math.max(1, parseInt(q.limit, 10) || 300));
+    const offset = Math.max(0, parseInt(q.offset, 10) || 0);
+
+    const scope = [ACTIVE_STUDENT];
+    const rq = pool.request();
+    const cls = String(q.class || "").trim();
+    if (cls && cls.toLowerCase() !== "all") { rq.input("cls", sql.NVarChar(100), cls); scope.push("studentClass = @cls"); }
+    const search = String(q.search || "").trim().slice(0, 100);
+    if (search) { rq.input("s", sql.NVarChar(120), `%${search}%`); scope.push("(name LIKE @s OR username LIKE @s)"); }
+
+    const where = [...scope];
+    if (status === "completed") where.push("ISNULL(profileCompleted, 0) = 1");
+    if (status === "pending") where.push("ISNULL(profileCompleted, 0) = 0");
+    rq.input("limit", sql.Int, limit).input("offset", sql.Int, offset);
+
+    const result = await rq.query(`
+      SELECT id, name, username, studentClass, phone, email,
+             CASE WHEN ISNULL(profileCompleted, 0) = 1 THEN 1 ELSE 0 END AS profileCompleted,
+             CASE WHEN LEN(LTRIM(RTRIM(ISNULL(photoUrl, '')))) > 0 THEN 1 ELSE 0 END AS hasPhoto
+      FROM Students WHERE ${where.join(" AND ")}
+      ORDER BY studentClass, name, id
+      OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY;
+      SELECT COUNT(*) AS total,
+             SUM(CASE WHEN ISNULL(profileCompleted, 0) = 1 THEN 1 ELSE 0 END) AS completed
+      FROM Students WHERE ${scope.join(" AND ")};
+    `);
+    const sets = result.recordsets || [result.recordset];
+    const sum = (sets[1] && sets[1][0]) || { total: 0, completed: 0 };
+    const total = Number(sum.total) || 0;
+    const completed = Number(sum.completed) || 0;
+
+    let classes = [];
+    try {
+      const c = await pool.request().query(`SELECT DISTINCT studentClass FROM Students WHERE ${ACTIVE_STUDENT} AND studentClass IS NOT NULL AND studentClass <> '' ORDER BY studentClass`);
+      classes = c.recordset.map((r) => r.studentClass);
+    } catch { /* the class filter is optional */ }
+
+    res.json({
+      success: true,
+      summary: { total, completed, pending: total - completed },
+      classes,
+      items: (sets[0] || []).map((r) => ({ ...r, profileCompleted: !!r.profileCompleted, hasPhoto: !!r.hasPhoto })),
+    });
+  } catch (err) {
+    console.error("PROFILE STATUS ERROR:", err.message);
+    res.status(500).json({ success: false, message: "Could not load the profile status list" });
   }
 };
 
@@ -251,4 +335,4 @@ const getDownloadHistoryAdmin = async (req, res) => {
   }
 };
 
-module.exports = { logDownload, getDownloadHistoryAdmin, MODES, ensureTable, getDownloadAccess, windowState, checkDownload, publicView, getDownloadAccessAdmin, putDownloadAccessAdmin };
+module.exports = { cleanNotice, adminView, getProfileStatusAdmin, logDownload, getDownloadHistoryAdmin, MODES, ensureTable, getDownloadAccess, windowState, checkDownload, publicView, getDownloadAccessAdmin, putDownloadAccessAdmin };

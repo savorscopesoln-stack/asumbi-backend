@@ -2,7 +2,7 @@ const express = require("express");
 const router = express.Router();
 const { sql, getPool, listTenantKeys } = require("../config/db");
 const { signReportSession, signProfileToken, verifyProfileToken, verifyReportSession, signTeacherReportSession, verifyTeacherReportSession } = require("../utils/reportLink");
-const { checkDownload, publicView, logDownload } = require("../utils/downloadAccess");
+const { checkDownload, publicView, logDownload, windowState, getDownloadAccess } = require("../utils/downloadAccess");
 const { isActiveStudent } = require("../utils/examAccess");
 const { runPhotoUpload } = require("../middleware/photoUpload");
 const { uploadUrl, deleteUploadByUrl } = require("../utils/uploadPaths");
@@ -17,6 +17,12 @@ const { uploadUrl, deleteUploadByUrl } = require("../utils/uploadPaths");
      - profile completed         -> a 2-hour REPORT-ONLY session (the same one
        a report link gives, utils/reportLink.js): it can read the report form's
        data and nothing else, so it cannot open the portal or change anything.
+
+   While downloads are CLOSED / NOT OPEN YET (Report Download Link → "When can students
+   download?") a student whose profile is not filled in can STILL fill it in here, so they are
+   ready when the school opens downloads. Only the report form / transcript stays locked.
+   GET /info (public, no username) gives the page its school + government logo, the admin's
+   typed message and whether downloads are open.
 
    Because the username is the only thing asked, the page is defended against
    guessing: a per-IP rate limit, and a tighter limit on usernames that do not
@@ -82,12 +88,66 @@ const inactiveResponse = (res) => res.status(403).json({
 // Outside the open/close window (Report Download Link → "When can students download?") nobody gets in.
 const closedResponse = (res, gate) => res.status(gate.status).json({ code: gate.code, message: gate.message });
 
+// Said to a student whose profile is already saved but who came while downloads are closed.
+const closedButSavedResponse = (res, gate) => res.status(gate.status).json({
+  code: gate.code,
+  message: `${gate.message} Your profile details are already saved.`,
+});
+
+// What the page shows once the profile is saved: straight on to the photo / report when downloads are open;
+// otherwise a "details saved" screen — the download itself stays locked until the school opens it.
+const afterProfile = (student, tenant, gate) => (gate.ok
+  ? nextStep(student, tenant, gate.access)
+  : {
+      status: "profile_saved",
+      downloadsOpen: false,
+      code: gate.code,
+      message: gate.message,
+      student: { name: student.name || "", username: student.username },
+    });
+
 const loadClasses = async (pool) => {
   try {
     const r = await pool.request().query(`SELECT name FROM Classes ORDER BY name ASC`);
     return r.recordset.map((c) => c.name).filter(Boolean);
   } catch { return []; }
 };
+
+/* ------------------------------------------------------------------ info */
+// PUBLIC page header: the school's two logos, the admin's typed message and whether downloads are open.
+// Nothing here is private (the same school details are on the login screen); no username is needed.
+router.get("/info", async (req, res) => {
+  try {
+    if (tooMany(req)) return res.status(429).json({ message: "Too many attempts. Please wait a minute and try again." });
+    const pool = req.pool; // the school is found from the site address (same as the login screen)
+    const access = await getDownloadAccess(pool);
+    const w = windowState(access);
+
+    let school = {};
+    try {
+      const r = await pool.request().query(`SELECT TOP 1 * FROM SchoolSettings WHERE id = 1`);
+      school = r.recordset[0] || {};
+    } catch { /* no School Settings yet: the page simply shows no logos */ }
+
+    res.json({
+      notice: access.notice || "",
+      state: w.state,                 // open | not_open | closed
+      message: w.message || "",       // "Downloads are not open yet. They open on …"
+      opensAt: access.opensAt ? access.opensAt.toISOString() : null,
+      closesAt: access.closesAt ? access.closesAt.toISOString() : null,
+      mode: access.mode,
+      school: {
+        name: school.schoolName || "",
+        shortName: school.shortName || "",
+        logoUrl: school.logoUrl || null,
+        governmentLogoUrl: school.governmentLogoUrl || null,
+      },
+    });
+  } catch (err) {
+    console.log("REPORT ACCESS INFO ERROR:", err);
+    res.status(500).json({ message: "Could not load the page details." });
+  }
+});
 
 /* ---------------------------------------------------------------- verify */
 router.post("/verify", async (req, res) => {
@@ -140,11 +200,13 @@ router.post("/verify", async (req, res) => {
     const { student, tenant, pool } = found[0];
     if (!isActiveStudent(student.status)) return inactiveResponse(res);
     const gate = await checkDownload(pool, "any");
-    if (!gate.ok) return closedResponse(res, gate);
 
+    // Profile not filled in: let them do it even when downloads are closed / not open yet.
     if (!student.profileCompleted) {
       return res.json({
         status: "profile_required",
+        downloadsOpen: gate.ok,
+        downloadsMessage: gate.ok ? "" : gate.message,
         token: signProfileToken({ studentId: student.id, tenant }),
         student: { name: student.name || "", username: student.username },
         profile: {
@@ -154,6 +216,8 @@ router.post("/verify", async (req, res) => {
         classes: await loadClasses(pool),
       });
     }
+    // Profile already saved: downloads closed -> say so; open -> on to the photo / report.
+    if (!gate.ok) return closedButSavedResponse(res, gate);
     return res.json(nextStep(student, tenant, gate.access));
   } catch (err) {
     console.log("REPORT ACCESS VERIFY ERROR:", err);
@@ -163,6 +227,7 @@ router.post("/verify", async (req, res) => {
 
 /* --------------------------------------------------------------- profile */
 // Same rules as the portal's first-time profile save (PUT /api/student/profile in server.js).
+// Works while downloads are closed / not open yet too — see the header of this file.
 router.post("/profile", async (req, res) => {
   try {
     if (tooMany(req)) return res.status(429).json({ message: "Too many attempts. Please wait a minute and try again." });
@@ -185,11 +250,11 @@ router.post("/profile", async (req, res) => {
     const student = r.recordset[0];
     if (!student) return res.status(404).json({ message: "This student record could not be found." });
     if (!isActiveStudent(student.status)) return inactiveResponse(res);
+    // NOT blocked when downloads are closed: saving the profile is allowed any time; only the download waits.
     const gate = await checkDownload(pool, "any");
-    if (!gate.ok) return closedResponse(res, gate);
 
-    // Already filled in (another tab / device): nothing to save, the download is simply available.
-    if (student.profileCompleted) return res.json(nextStep(student, tenant, gate.access));
+    // Already filled in (another tab / device): nothing to save, the download is simply available (or still waiting).
+    if (student.profileCompleted) return res.json(afterProfile(student, tenant, gate));
 
     const clean = (v) => (v == null ? "" : String(v)).trim();
     const studentClass = clean(req.body?.studentClass);
@@ -226,7 +291,7 @@ router.post("/profile", async (req, res) => {
 
     const fresh = await pool.request().input("id", sql.Int, student.id)
       .query(`SELECT ${STUDENT_COLS} FROM Students WHERE id = @id`);
-    return res.json(nextStep(fresh.recordset[0] || student, tenant, gate.access));
+    return res.json(afterProfile(fresh.recordset[0] || student, tenant, gate));
   } catch (err) {
     console.log("REPORT ACCESS PROFILE ERROR:", err);
     res.status(500).json({ message: "Could not save your details. Please try again." });

@@ -57,3 +57,16 @@ test("transcript exams: stored list is parsed, empty means all", async () => {
   const none = await checkDownload(poolWith({ mode: "both", opensAt: null, closesAt: null, transcriptExamIds: "" }), "any");
   assert.strictEqual(none.access.transcriptExamIds, null);
 });
+
+test("admin's page message: loaded from the row, empty by default, kept out of the student-facing view", async () => {
+  assert.strictEqual((await checkDownload(poolWith(null), "any")).access.notice, "");
+  const r = await checkDownload(poolWith({ mode: "report", opensAt: null, closesAt: null, pageNotice: "  Results are out!  " }), "any");
+  assert.strictEqual(r.access.notice, "Results are out!");
+  assert.strictEqual(publicView(r.access).notice, undefined);
+});
+
+test("closed window still reports the access settings (so the page can show the message)", async () => {
+  const r = await checkDownload(poolWith({ mode: "report", opensAt: new Date("2030-01-01T00:00:00Z"), closesAt: null, pageNotice: "Soon" }), "any");
+  assert.strictEqual(r.ok, false);
+  assert.strictEqual(r.access.notice, "Soon");
+});
