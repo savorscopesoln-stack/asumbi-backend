@@ -37,7 +37,7 @@ const round2 = (n) => (n == null ? null : Math.floor(Number(n) + 1e-9));
    than given a blank page.
 ========================================================================= */
 const fail = (status, message, code) => ({ ok: false, status, message, code });
-const PHOTO_REQUIRED_MESSAGE = "Please upload a clear, official passport photo to your profile before downloading. Your report form and transcript need your photo.";
+const PHOTO_REQUIRED_MESSAGE = "Kindly upload a clear, official passport photo to your profile before downloading. Your report form and transcript need your photo.";
 const slug = (v) => String(v || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
 
 /** Builds the transcript file for a selection. Returns { ok:true, buffer, filename, contentType } or { ok:false, status, message }. */

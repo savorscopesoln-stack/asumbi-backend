@@ -213,7 +213,9 @@ app.get("/api/marks/:assessmentId", async (req, res) => {
 app.get("/api/report-card-source", async (req, res) => {
   try {
     const pool = req.pool || req.app.locals.pool;
-    res.json(await annotateSplitSubjects(pool, await applyReportFormSubjects(pool, await getReportCardSource(pool))));
+    const src = await annotateSplitSubjects(pool, await applyReportFormSubjects(pool, await getReportCardSource(pool)));
+    if (req.query.studentId) src.registered = await require("../utils/reportCardSource").isStudentRegistered(pool, src, req.query.studentId);
+    res.json(src);
   } catch (err) {
     console.error("REPORT CARD SOURCE ERROR:", err);
     res.status(500).json({ mode: "none", id: null, name: null, subjects: [] });

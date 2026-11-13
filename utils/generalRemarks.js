@@ -18,14 +18,14 @@ function buildGeneralRemarks({ passMark = 40, weak = [], absent = [], all = [] }
   if (sortedWeak.length) {
     parts.push(
       `Below the ${passMark}% pass mark: ${list(sortedWeak.map((s) => `${s.name} (${pct(s.score)})`))}. ` +
-      `Please give extra time to ${sortedWeak.length === 1 ? "this subject" : "these subjects"}: revise the topics you found difficult, practise past papers and ask your teachers for help.`
+      `Kindly give extra time to ${sortedWeak.length === 1 ? "this subject" : "these subjects"}: revise the topics you found difficult, practise past papers and ask your teachers for help.`
     );
   } else if (all.length) {
     const lowest = [...all].sort((a, b) => Number(a.score) - Number(b.score))[0];
     parts.push(`All subjects met the ${passMark}% pass mark. Well done. Keep it up, and keep strengthening your weakest subject, ${lowest.name} (${pct(lowest.score)}).`);
   }
   if (absent.length) {
-    parts.push(`Absent (AB): ${list(absent)}. Please make sure you sit every paper.`);
+    parts.push(`Absent (AB): ${list(absent)}. Kindly make sure you sit every paper.`);
   }
   return parts.join(" ");
 }

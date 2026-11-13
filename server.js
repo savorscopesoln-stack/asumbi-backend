@@ -1172,7 +1172,10 @@ app.get("/api/marks/:assessmentId", protect, async (req, res) => {
 app.get("/api/report-card-source", protect, async (req, res) => {
   try {
     // + the admin's "Report Form Subjects" list (which subjects show, which are optional)
-    res.json(await applyReportFormSubjects(req.pool, await getReportCardSource(req.pool)));
+    const src = await applyReportFormSubjects(req.pool, await getReportCardSource(req.pool));
+    // ?studentId= : is this student registered for the picked exam? (a registered student with no marks still gets a report card: AB / ABSENT / CRNM)
+    if (req.query.studentId) src.registered = await require("./utils/reportCardSource").isStudentRegistered(req.pool, src, req.query.studentId);
+    res.json(src);
   } catch (err) {
     console.log("REPORT CARD SOURCE ERROR:", err.message);
     res.status(500).json({ mode: "none", id: null, name: null, subjects: [] });

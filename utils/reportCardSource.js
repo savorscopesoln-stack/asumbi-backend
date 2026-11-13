@@ -67,6 +67,30 @@ async function getReportCardSource(pool) {
   return { mode: "none", id: null, name: null, subjects: [] };
 }
 
+/** True when the student is registered for the picked source: the class or year of study of one of its
+    papers is the student's own (same rule the exam analytics use for "registered"). Never throws. */
+async function isStudentRegistered(pool, source, studentId) {
+  try {
+    const sid = Number.parseInt(studentId, 10);
+    if (!sid || !source || source.mode === "none" || !source.id) return false;
+    const scope = source.mode === "exam"
+      ? `ea.id IN (SELECT ess.e_assessment_id FROM exam_subject_sessions ess WHERE ess.main_examination_id = @srcId AND ess.e_assessment_id IS NOT NULL)`
+      : `ea.id = @srcId`;
+    const r = await pool.request().input("sid", sql.Int, sid).input("srcId", sql.Int, source.id).query(`
+      SELECT TOP 1 1 AS ok
+      FROM Students st
+      WHERE st.id = @sid AND EXISTS (
+        SELECT 1 FROM e_assessments ea LEFT JOIN Classes c ON c.id = ea.class_id
+        WHERE ${scope}
+          AND ( (c.name IS NOT NULL AND c.name = st.studentClass) OR (ea.year_of_study IS NOT NULL AND ea.year_of_study = st.yearOfStudy) )
+      )`);
+    return r.recordset.length > 0;
+  } catch (err) {
+    console.error("REPORT CARD REGISTRATION CHECK ERROR (ignored):", err.message);
+    return false;
+  }
+}
+
 /** Applies one selection atomically. mode: none | assessment | exam */
 async function setReportCardSource(pool, mode, id) {
   await ensureColumn(pool);
@@ -131,4 +155,4 @@ const putReportCardSource = async (req, res) => {
   }
 };
 
-module.exports = { getReportCardSource, setReportCardSource, getReportCardOptions, putReportCardSource, ensureColumn };
+module.exports = { isStudentRegistered, getReportCardSource, setReportCardSource, getReportCardOptions, putReportCardSource, ensureColumn };
