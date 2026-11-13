@@ -14,7 +14,7 @@
 const sql = require("mssql");
 
 // Session statuses after which a missing submission means "did not sit" (same list as utils/examPercentages.js).
-const OVER = new Set(["ended", "completed", "done", "closed"]);
+const OVER = new Set(["ended", "completed", "done", "closed"]); // (no longer used for AB: see "released" below)
 const ensured = new WeakSet();
 async function ensureColumn(pool) {
   if (ensured.has(pool)) return;
@@ -46,19 +46,28 @@ async function getReportCardSource(pool) {
   const a = (await pool.request().query(
     `SELECT TOP 1 id, title, subject FROM e_assessments WHERE is_report_assessment = 1`)).recordset[0];
   if (a) {
-    return { mode: "assessment", id: a.id, name: a.title, subjects: await subjectsByNames(pool, [a.subject]) };
+    // released = marks for this assessment are in the Marks table -> a student with no mark is AB
+    const rel = (await pool.request().input("aid", sql.Int, a.id).query(
+      `SELECT TOP 1 1 AS ok FROM Marks m JOIN Assessments x ON x.id = m.assessmentId AND x.sourceSystem = 'e_assessment' WHERE x.sourceRefId = @aid`)).recordset.length > 0;
+    const subs = (await subjectsByNames(pool, [a.subject])).map((s) => ({ ...s, over: rel }));
+    return { mode: "assessment", id: a.id, name: a.title, subjects: subs };
   }
   const e = (await pool.request().query(
     `SELECT TOP 1 id, name FROM main_examinations WHERE is_report_exam = 1`)).recordset[0];
   if (e) {
     const subs = (await pool.request().input("id", sql.Int, e.id).query(
-      `SELECT subject, status FROM exam_subject_sessions WHERE main_examination_id = @id`)).recordset;
-    // over = every paper of the subject has finished, so a missing mark means the student was absent (AB), not "not marked yet" (CRNM).
+      `SELECT subject, status, e_assessment_id FROM exam_subject_sessions WHERE main_examination_id = @id`)).recordset;
+    // over = the subject's marks have been RELEASED (are in the Marks table), so a student with no mark was absent (AB);
+    // before release a missing mark is just "not marked yet" (CRNM).
+    const releasedIds = new Set((await pool.request().input("id", sql.Int, e.id).query(`
+      SELECT DISTINCT x.sourceRefId AS eid FROM Marks m
+      JOIN Assessments x ON x.id = m.assessmentId AND x.sourceSystem = 'e_assessment'
+      WHERE x.sourceRefId IN (SELECT e_assessment_id FROM exam_subject_sessions WHERE main_examination_id = @id AND e_assessment_id IS NOT NULL)`)).recordset.map((r) => Number(r.eid)));
     const overBy = new Map();
     subs.forEach((r) => {
       const k = String(r.subject || "").trim().toLowerCase();
-      const done = OVER.has(String(r.status || "").toLowerCase());
-      overBy.set(k, overBy.has(k) ? overBy.get(k) && done : done);
+      const done = r.e_assessment_id != null && releasedIds.has(Number(r.e_assessment_id));
+      overBy.set(k, overBy.has(k) ? overBy.get(k) || done : done);
     });
     const subjects = (await subjectsByNames(pool, subs.map((s) => s.subject)))
       .map((s) => ({ ...s, over: !!overBy.get(String(s.name || "").trim().toLowerCase()) }));

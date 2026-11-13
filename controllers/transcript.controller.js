@@ -197,21 +197,28 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
       try {
         const sessions = (await pool.request().query(`
           SELECT ess.main_examination_id AS examId, ess.subject, ess.paper_label, ess.allow_concurrent, ess.status AS session_status,
-                 c.name AS className, ea.year_of_study
+                 c.name AS className, ea.year_of_study, ess.e_assessment_id AS eaId
           FROM exam_subject_sessions ess
           JOIN e_assessments ea ON ea.id = ess.e_assessment_id
           LEFT JOIN Classes c ON c.id = ea.class_id
           WHERE ess.main_examination_id IN (${examIdsInPlay.join(",")})`)).recordset;
+        // AB only once the paper's marks are released (in the Marks table)
+        const releasedEa = new Set((await pool.request().query(`
+          SELECT DISTINCT x.sourceRefId AS eid FROM Marks m
+          JOIN Assessments x ON x.id = m.assessmentId AND x.sourceSystem = 'e_assessment'
+          WHERE x.sourceRefId IN (SELECT e_assessment_id FROM exam_subject_sessions WHERE main_examination_id IN (${examIdsInPlay.join(",")}) AND e_assessment_id IS NOT NULL)`)).recordset.map((r) => Number(r.eid)));
         const codes = new Map((await pool.request().query(`SELECT name, code FROM Subjects`)).recordset.map((r) => [nm(r.name), r.code]));
         students.forEach((st) => {
           const examsMap = byStudent.get(st.id);
           if (!examsMap) return;
           examsMap.forEach((exam, examId) => {
+            const hadNoMarks = exam.subjects.length === 0; // decided before any AB row is added
             const have = new Set(exam.subjects.map((x) => nm(x.subjectName)));
             const haveGroups = new Set(exam.subjects.map((x) => x.split_group).filter(Boolean));
             sessions.filter((ss) => Number(ss.examId) === Number(examId)).forEach((ss) => {
               const forThem = (ss.className && ss.className === st.studentClass) || (Number(st.yearOfStudy) > 0 && Number(ss.year_of_study) === Number(st.yearOfStudy));
-              if (!forThem || !isSessionOver(ss.session_status) || isOptionalByName(ss.subject)) return;
+              // a student with no marks at all in this exam did not sit it: every compulsory paper is AB, whatever the session status
+              if (!forThem || !releasedEa.has(Number(ss.eaId)) || isOptionalByName(ss.subject)) return;
               const key = nm(ss.subject);
               const group = splitGroupKey({ subject: ss.subject, paper_label: ss.paper_label, allow_concurrent: ss.allow_concurrent });
               if (have.has(key) || (group && haveGroups.has(group))) return;
