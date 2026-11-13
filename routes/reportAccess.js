@@ -89,8 +89,10 @@ const inactiveResponse = (res) => res.status(403).json({
 const closedResponse = (res, gate) => res.status(gate.status).json({ code: gate.code, message: gate.message });
 
 // Said to a student whose profile is already saved but who came while downloads are closed.
-const closedButSavedResponse = (res, gate) => res.status(gate.status).json({
+const closedButSavedResponse = (res, gate, student = {}) => res.status(gate.status).json({
   code: gate.code,
+  profileSaved: true,
+  student: { name: student.name || "", username: student.username || "" },
   message: `${gate.message} Your profile details are already saved.`,
 });
 
@@ -217,7 +219,7 @@ router.post("/verify", async (req, res) => {
       });
     }
     // Profile already saved: downloads closed -> say so; open -> on to the photo / report.
-    if (!gate.ok) return closedButSavedResponse(res, gate);
+    if (!gate.ok) return closedButSavedResponse(res, gate, student);
     return res.json(nextStep(student, tenant, gate.access));
   } catch (err) {
     console.log("REPORT ACCESS VERIFY ERROR:", err);
