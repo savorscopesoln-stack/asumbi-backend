@@ -132,10 +132,20 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
     const marksResult = await marksReq.query(marksQuery);
     const marksRows = marksResult.recordset;
 
-    if (!marksRows.length) {
-      return fail(404, singleExam
-        ? `No released marks found for "${singleExam.name}" for this selection`
-        : "No released marks found for this selection");
+    // No marks in the Marks table is fine: a registered student who sat nothing still gets a transcript (AB / ABSENT / CRNM).
+    // The exams are then the selected one, the allowed ones, or the one picked for the report card.
+    const extraExamRows = [];
+    try {
+      try { await require("../utils/reportCardSource").ensureColumn(pool); } catch (_) {}
+      const exReq = pool.request();
+      let exWhere = "me.is_report_exam = 1";
+      if (examId) { exReq.input("exId", sql.Int, examId); exWhere = "me.id = @exId"; }
+      else if (allowed && allowed.length) { exWhere = `me.id IN (${allowed.join(",")})`; } // integers only (sanitised above)
+      const exRows = (await exReq.query(`SELECT me.id AS mainExaminationId, me.name AS examName, me.academic_year, me.term, me.start_date
+        FROM main_examinations me WHERE ${exWhere} ORDER BY me.start_date ASC, me.id ASC`)).recordset;
+      exRows.forEach((r) => extraExamRows.push(r));
+    } catch (err) {
+      console.error("TRANSCRIPT EXTRA EXAMS LOOKUP ERROR (ignored):", err.message);
     }
 
     /* ---------------- 4. Group rows: studentId → examId → subjects[] ---------------- */
@@ -172,7 +182,7 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
     // A student who sat nothing has no marks, but must still get a transcript: give every student every exam
     // that has released marks (for anyone in scope); exams not scheduled for them are dropped again below.
     const examMeta = new Map();
-    marksRows.forEach((row) => {
+    [...marksRows, ...extraExamRows].forEach((row) => {
       if (!examMeta.has(row.mainExaminationId)) examMeta.set(row.mainExaminationId, { examName: row.examName, academic_year: row.academic_year, term: row.term });
     });
     students.forEach((st) => {
