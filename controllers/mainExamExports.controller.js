@@ -54,6 +54,7 @@ async function loadExamHeaderInfo(pool, mainExamId) {
 /* One paper's cell: always the % mark, never the raw marks. A compulsory paper
    not sat is 0%; "—" = not registered, or an optional paper not taken. */
 function fmtPct(m) {
+  if (m && m.absent && !m.not_registered) return "AB";
   if (!m || m.not_registered || m.percentage == null) return "—";
   return `${m.percentage}%`;
 }

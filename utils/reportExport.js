@@ -230,6 +230,7 @@ function addReportSheet(workbook, { name, title, subtitle, columns, rows, totals
   if (title) aoa.push([title]);
   if (subtitle) aoa.push([subtitle]);
   aoa.push([`Generated: ${new Date().toLocaleString()}`]);
+  aoa.push(["Key: CRNM = Course Requirement Not Met; AB = Absent."]);
   aoa.push([]);
   const headerRowIndex = aoa.length; // 0-based index of the column-header row
   aoa.push(columns.map((c) => c.header));
@@ -364,6 +365,7 @@ function drawPdfHeader(doc, institution, { examinationName, academicYear, report
   centre(reportTitle, 12, "Helvetica-Bold", "#000");
   if (subtitle) centre(subtitle, 9, "Helvetica", "#000");
   centre(`Generated: ${new Date().toLocaleString()}`, 8, "Helvetica", "#777");
+  centre("Key: CRNM = Course Requirement Not Met; AB = Absent.", 8, "Helvetica-Bold", "#555");
   doc.fillColor("#000");
   doc.x = startX;
   doc.moveDown(1);

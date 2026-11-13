@@ -169,10 +169,11 @@ function drawStudentInfo(doc, student, m) {
     while (size > 6 && doc.fontSize(size).widthOfString(shown) > colWidth - 6) size -= 0.5;
     doc.fillColor("#000").text(shown, x, y + 11 + (10 - size) / 2, { width: colWidth - 4, lineBreak: false });
   };
+  // Only: name, gender, email, assessment number (the student's username), class, year of study.
   field("Student Name", student.name, 0, 0);
   field("Gender", student.gender, 1, 0);
-  field("Index No.", student.assessmentNumber, 2, 0);
-  field("Admission No.", student.admissionNo, 0, 1);
+  field("Email", student.email, 2, 0);
+  field("Assessment No.", student.username || student.assessmentNumber, 0, 1);
   field("Class", student.studentClass, 1, 1);
   field("Year of Study", student.yearOfStudy, 2, 1);
   if (hasPhoto) {
@@ -249,8 +250,8 @@ function drawExamTable(doc, exam, theme, m) {
         return s.optional && !/\(\s*optional\s*\)/i.test(nm) ? `${nm} (Optional)` : nm;
       })(),
       s.absent ? "AB" : (s.percentage != null && !Number.isNaN(Number(s.percentage)) ? `${Math.floor(Number(s.percentage) + 1e-9)}%` : "—"),
-      s.points || "—",
-      s.result || "—",
+      s.absent ? "ABSENT" : (s.points || "—"),
+      s.absent ? "CRNM" : (s.result || "—"),
     ].map(String);
 
     // Measure first, so the row is exactly tall enough for its wrapped text.
@@ -307,7 +308,7 @@ function drawExamTable(doc, exam, theme, m) {
   doc.fillColor(theme.onPrimary).fontSize(m.font).font("Helvetica-Bold");
   const ay = y + (m.minRowH - doc.currentLineHeight(true)) / 2;
   doc.text("EXAM AVERAGE", pageLeft + 4, ay, { width: colW[0] - 8, lineBreak: false });
-  doc.text(exam.average != null ? `${Math.floor(Number(exam.average) + 1e-9)}%` : "—", colX[1] + 4, ay, { width: colW[1] - 8, align: "center", lineBreak: false });
+  doc.text(exam.average != null ? `${Math.floor(Number(exam.average) + 1e-9)}%` : (exam.subjects.some((x) => x.absent) ? "AB" : "—"), colX[1] + 4, ay, { width: colW[1] - 8, align: "center", lineBreak: false });
   doc.text(exam.overallResult || "—", colX[2], ay, { width: colW[2] + colW[3] - 4, align: "center", lineBreak: false });
   doc.fillColor("#000").font("Helvetica");
   y += m.minRowH;
@@ -653,6 +654,12 @@ function renderStudentPage(doc, page, ctx, m) {
   drawStudentInfo(doc, page.student, m);
   page.exams.forEach((exam) => drawExamTable(doc, exam, ctx.theme, m));
   drawCumulativeSummary(doc, page, ctx.theme);
+  // Key to the abbreviations used in the tables above.
+  doc.x = doc.page.margins.left;
+  doc.fontSize(7.5).font("Helvetica-Bold").fillColor("#555")
+    .text("Key: CRNM = Course Requirement Not Met; AB = Absent.", doc.page.margins.left, doc.y + 2, { width: doc.page.width - doc.page.margins.left - doc.page.margins.right });
+  doc.font("Helvetica").fillColor("#000");
+  doc.x = doc.page.margins.left;
   drawSignatureBlock(doc, ctx.signers, ctx.institution, ctx.theme, page.generalRemarks, m);
   doc.fontSize(7).fillColor("#999").text(`Generated: ${new Date().toLocaleString()}`, { align: "right" });
   doc.fillColor("#000");

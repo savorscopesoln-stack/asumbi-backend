@@ -49,7 +49,7 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
 
     /* ---------------- 1. Students in scope ---------------- */
     const studentsReq = pool.request();
-    let studentsQuery = `SELECT id, name, admissionNo, studentClass, gender, assessmentNumber, yearOfStudy, photoUrl FROM Students`;
+    let studentsQuery = `SELECT id, name, admissionNo, username, email, studentClass, gender, assessmentNumber, yearOfStudy, photoUrl FROM Students`;
     if (scope === "class") {
       studentsReq.input("className", sql.NVarChar, className);
       studentsQuery += ` WHERE studentClass = @className`;
@@ -169,7 +169,18 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
        whose session is over and that the student has no mark for, is listed as AB (absent) instead of
        being left out or shown as 0%. Optional subjects are never listed as AB. AB has no percentage, so it
        never changes an average. */
-    const examIdsInPlay = [...new Set([...byStudent.values()].flatMap((m) => [...m.keys()]).map(Number))].filter(Number.isFinite);
+    // A student who sat nothing has no marks, but must still get a transcript: give every student every exam
+    // that has released marks (for anyone in scope); exams not scheduled for them are dropped again below.
+    const examMeta = new Map();
+    marksRows.forEach((row) => {
+      if (!examMeta.has(row.mainExaminationId)) examMeta.set(row.mainExaminationId, { examName: row.examName, academic_year: row.academic_year, term: row.term });
+    });
+    students.forEach((st) => {
+      if (!byStudent.has(st.id)) byStudent.set(st.id, new Map());
+      const em = byStudent.get(st.id);
+      examMeta.forEach((meta, id) => { if (!em.has(id)) em.set(id, { ...meta, subjects: [] }); });
+    });
+    const examIdsInPlay = [...examMeta.keys()].map(Number).filter(Number.isFinite);
     const isOptionalByName = await loadOptionalMatcher(pool);
     const nm = (v) => String(v || "").replace(/\(\s*optional\s*\)/gi, "").replace(/\s+/g, " ").trim().toLowerCase();
     if (examIdsInPlay.length) {
@@ -207,6 +218,9 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
       }
     }
 
+    // drop exams that had no subject for the student (not scheduled for their class/year)
+    byStudent.forEach((em) => { [...em.keys()].forEach((id) => { if (!em.get(id).subjects.length) em.delete(id); }); });
+
     /* ---------------- 5. Shape into buildTranscriptPdf's expected format ----------------
        Students in scope with no released marks at all are skipped
        (rather than drawing a blank page for them). */
@@ -241,7 +255,7 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
             || String(a.subjectName).localeCompare(String(b.subjectName), undefined, { numeric: true });
         });
         const subjects = orderedSubjects.map((s) => {
-          if (s.absent) return { ...s, optional: false, grade: "—", points: "—", gradePoints: null, result: "—" };
+          if (s.absent) return { ...s, optional: false, grade: "—", points: "ABSENT", gradePoints: null, result: "CRNM" };
           const band = s.percentage != null ? getGradeForScore(s.percentage, gradingSystem) : null;
           return {
             ...s,
@@ -264,7 +278,7 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
           failedCount,
           totalMarks,
           totalPossible,
-          overallResult: average != null ? getOverallResultWithFails(average, failedCount, gradingSystem) : "—",
+          overallResult: subjects.some((x) => x.absent) ? "CRNM" : average != null ? getOverallResultWithFails(average, failedCount, gradingSystem) : "—",
           aggregatePoints,
         };
       });
@@ -291,7 +305,8 @@ const buildTranscripts = async (pool, { scope, className, studentId, examId, sep
         exams,
         cumulativeAverage,
         // Failing in any one examination under the minimum-fails rule makes the cumulative result a fail too.
-        cumulativeResult: cumulativeAverage != null
+        // A missed (AB) compulsory paper in any exam makes the cumulative result CRNM too.
+        cumulativeResult: exams.some((e) => e.subjects.some((x) => x.absent)) ? "CRNM" : cumulativeAverage != null
           ? getOverallResultWithFails(cumulativeAverage, Math.max(0, ...exams.map((e) => e.failedCount || 0)), gradingSystem)
           : "—",
       });
