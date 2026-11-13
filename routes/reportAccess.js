@@ -1,7 +1,7 @@
 const express = require("express");
 const router = express.Router();
 const { sql, getPool, listTenantKeys } = require("../config/db");
-const { signReportSession, signProfileToken, verifyProfileToken, verifyReportSession } = require("../utils/reportLink");
+const { signReportSession, signProfileToken, verifyProfileToken, verifyReportSession, signTeacherReportSession, verifyTeacherReportSession } = require("../utils/reportLink");
 const { checkDownload, publicView, logDownload } = require("../utils/downloadAccess");
 const { isActiveStudent } = require("../utils/examAccess");
 const { runPhotoUpload } = require("../middleware/photoUpload");
@@ -109,6 +109,27 @@ router.post("/verify", async (req, res) => {
       } catch (e) { /* a school DB that is down must not block the others */ }
     }
     if (!found.length) {
+      // Not a student: a TEACHER may use this same page to download the teacher-only reports.
+      const teachers = [];
+      for (const tenantKey of listTenantKeys()) {
+        try {
+          const pool = await getPool(tenantKey);
+          const r = await pool.request().input("u", sql.NVarChar, username)
+            .query(`SELECT TOP 1 id, name, username FROM Teachers WHERE username = @u`);
+          if (r.recordset[0]) teachers.push({ teacher: r.recordset[0], tenant: tenantKey });
+        } catch (e) { /* a school DB that is down must not block the others */ }
+      }
+      if (teachers.length > 1) {
+        return res.status(409).json({ message: "This username exists in more than one school. Please contact the school office." });
+      }
+      if (teachers.length === 1) {
+        const { teacher, tenant } = teachers[0];
+        return res.json({
+          status: "teacher_ready",
+          token: signTeacherReportSession({ teacher, tenant }),
+          user: { id: teacher.id, username: teacher.username, name: teacher.name || "", role: "teacher", tenant },
+        });
+      }
       noteMiss(req);
       return res.status(404).json({ message: "We couldn't find that username. Check it and try again." });
     }
@@ -357,6 +378,70 @@ router.post("/log", async (req, res) => {
   } catch (err) {
     console.log("REPORT ACCESS LOG ERROR:", err);
     res.status(500).json({ message: "Could not record the download." });
+  }
+});
+
+/* ---------------------------------------------------------- teacher reports */
+// TEACHERS ONLY. Reached only with the "teacher-report" session /verify gives when a teacher types their
+// username. A student session, a report link, or a normal portal login is refused (different token type).
+// The reports are exactly the dashboard's own exports (mainExamExports.controller.js) — same numbers,
+// same Result column — just reached through the teacher's username instead of an admin login.
+const TEACHER_REPORTS = new Set(["subject-analysis", "overall-performance", "class-ranking"]);
+
+const teacherSession = async (req, res) => {
+  if (tooMany(req)) { res.status(429).json({ message: "Too many attempts. Please wait a minute and try again." }); return null; }
+  const header = req.headers.authorization || "";
+  let session;
+  try { session = verifyTeacherReportSession(header.startsWith("Bearer ") ? header.slice(7) : ""); }
+  catch (e) {
+    res.status(e.name === "TokenExpiredError" ? 401 : 403).json({
+      message: e.name === "TokenExpiredError" ? "Your session timed out. Please enter your username again." : "These reports are for teachers only.",
+    });
+    return null;
+  }
+  const pool = await getPool(session.tenant || "default");
+  // The teacher must still exist (removed teachers lose access at once, not after the 2 hours).
+  const r = await pool.request().input("id", sql.Int, Number(session.tid)).query(`SELECT id FROM Teachers WHERE id = @id`);
+  if (!r.recordset[0]) { res.status(403).json({ message: "These reports are for teachers only." }); return null; }
+  return { session, pool };
+};
+
+const TEACHER_EXAM_STATUSES = `('published','ongoing','completed')`;
+
+router.get("/teacher/exams", async (req, res) => {
+  try {
+    const ctx = await teacherSession(req, res);
+    if (!ctx) return;
+    const r = await ctx.pool.request().query(
+      `SELECT id, name, academic_year, status FROM main_examinations WHERE status IN ${TEACHER_EXAM_STATUSES} ORDER BY id DESC`
+    );
+    res.json({ exams: r.recordset });
+  } catch (err) {
+    console.log("REPORT ACCESS TEACHER EXAMS ERROR:", err);
+    res.status(500).json({ message: "Could not load the examinations. Please try again." });
+  }
+});
+
+// GET /teacher/reports/:report/:format?examId=  (report: subject-analysis | overall-performance | class-ranking; format: pdf | excel)
+router.get("/teacher/reports/:report/:format", async (req, res) => {
+  try {
+    const ctx = await teacherSession(req, res);
+    if (!ctx) return;
+    const { report, format } = req.params;
+    if (!TEACHER_REPORTS.has(report) || !["pdf", "excel"].includes(format)) {
+      return res.status(404).json({ message: "That report isn't available." });
+    }
+    const examId = parseInt(req.query.examId, 10);
+    if (!Number.isFinite(examId) || examId <= 0) return res.status(400).json({ message: "Choose an examination first." });
+    const ex = await ctx.pool.request().input("id", sql.Int, examId)
+      .query(`SELECT id FROM main_examinations WHERE id = @id AND status IN ${TEACHER_EXAM_STATUSES}`);
+    if (!ex.recordset[0]) return res.status(404).json({ message: "That examination isn't available." });
+
+    const { buildExportHandler } = require("../controllers/mainExamExports.controller");
+    return buildExportHandler(report, format)({ pool: ctx.pool, params: { mainExamId: String(examId) }, query: {} }, res);
+  } catch (err) {
+    console.log("REPORT ACCESS TEACHER REPORT ERROR:", err);
+    res.status(500).json({ message: "Could not prepare the report. Please try again." });
   }
 });
 

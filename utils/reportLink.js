@@ -86,6 +86,20 @@ const verifyReportSession = (token) => {
   return d;
 };
 
+/* TEACHER REPORT SESSION — the public Download page (/report-download) when a TEACHER types their username.
+   It is a different kind of token on purpose (typ "teacher-report", no `scope`/`role` claims): it opens ONLY
+   the three teacher reports (Subject Analysis, Overall Performance, Class Ranking) under
+   /api/report-access/teacher/..., is refused by verifyReportSession (so it never works on a student endpoint)
+   and by authMiddleware's `protect` (so it is never a login). */
+const TEACHER_TYP = "teacher-report";
+const signTeacherReportSession = ({ teacher, tenant }) =>
+  jwt.sign({ typ: TEACHER_TYP, tid: teacher.id, username: teacher.username, tenant: tenant || "default" }, secret(), { expiresIn: `${SESSION_MINUTES}m` });
+const verifyTeacherReportSession = (token) => {
+  const d = jwt.verify(String(token || ""), secret());
+  if (d.typ !== TEACHER_TYP || d.tid == null) throw new Error("not a teacher report session");
+  return d;
+};
+
 const isAllowedForReportSession = (method, originalUrl) => {
   if (String(method).toUpperCase() !== "GET") return false;
   const path = String(originalUrl || "").split("?")[0].replace(/\/+$/, "").toLowerCase();
@@ -97,6 +111,7 @@ const renderMessage = (template, vars) =>
   String(template || "").replace(/\{(name|link|days|class)\}/gi, (_, k) => String(vars[k.toLowerCase()] ?? ""));
 
 module.exports = {
-  LINK_TYP, TRANSCRIPT_TYP, PROFILE_TYP, SESSION_SCOPE, REPORT_SESSION_ALLOWED_GET,
+  LINK_TYP, TRANSCRIPT_TYP, PROFILE_TYP, TEACHER_TYP, SESSION_SCOPE, REPORT_SESSION_ALLOWED_GET,
+  signTeacherReportSession, verifyTeacherReportSession,
   signProfileToken, verifyProfileToken, signReportLink, signTranscriptLink, verifyTranscriptLink, verifyReportLink, signReportSession, verifyReportSession, isAllowedForReportSession, renderMessage,
 };

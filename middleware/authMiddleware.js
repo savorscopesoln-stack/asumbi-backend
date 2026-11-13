@@ -74,7 +74,7 @@ const protect = (req, res, next) => {
     /* REPORT LINKS (utils/reportLink.js)
        A download-link token only proves "this link was issued for student X" — it is
        exchanged at POST /api/auth/report-link and must never work as a login itself. */
-    if (decoded?.typ === "report-link" || decoded?.typ === "transcript-link" || decoded?.typ === "report-profile") {
+    if (decoded?.typ === "report-link" || decoded?.typ === "transcript-link" || decoded?.typ === "report-profile" || decoded?.typ === "teacher-report") {
       return res.status(401).json({ success: false, message: "This is a download link, not a login." });
     }
 

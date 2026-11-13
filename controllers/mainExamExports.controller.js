@@ -148,6 +148,7 @@ const subjectAnalysisCols = [
   { header: "Sat", key: "sat", width: 7 },
   { header: "Absent", key: "absent", width: 8 },
   { header: "Mean (%)", key: "mean", width: 10, percent: true },
+  { header: "Result", key: "result", width: 14 },
   { header: "Median (%)", key: "median", width: 10, percent: true },
   { header: "Highest (%)", key: "highest", width: 11, percent: true },
   { header: "Top Student", key: "highest_student", width: 28 },
@@ -157,7 +158,7 @@ const subjectAnalysisCols = [
   { header: "Pass Rate (%)", key: "pass_rate", width: 12, percent: true },
   { header: "Best Class", key: "best_class", width: 14 },
 ];
-const subjectAnalysisRows = (list) => (list || []).map((r) => ({ ...r, rank: r.rank ?? "—" }));
+const subjectAnalysisRows = (list) => (list || []).map((r) => ({ ...r, rank: r.rank ?? "—", result: r.result || "—" }));
 
 const SHAPES = {
   subjectAnalysis(data) {
@@ -250,6 +251,7 @@ const SHAPES = {
       ...subjectMarkColumns(nominalSubjects),
       { header: "Total", key: "total_marks", width: 14 },
       { header: "Mean (%)", key: "average_percentage", width: 12, percent: true },
+      { header: "Result", key: "result", width: 14 },
     ];
     const overallRows = (data.overall_ranking || []).map((r) => subjectMarkValues(r.marks, {
       overall_position: r.overall_position,
@@ -258,6 +260,7 @@ const SHAPES = {
       class: r.class,
       total_marks: fmtTotal(r.total_obtained, r.total_possible),
       average_percentage: r.average_percentage,
+      result: r.result || "—",
     }));
 
     // Class Performance — one row per class/stream, from
@@ -269,11 +272,12 @@ const SHAPES = {
       { header: "Registered", key: "registered", width: 12 },
       { header: "Scored", key: "scored", width: 10 },
       { header: "Mean (%)", key: "mean", width: 12, percent: true },
+      { header: "Result", key: "result", width: 14 },
       { header: "Highest (%)", key: "highest", width: 12, percent: true },
       { header: "Lowest (%)", key: "lowest", width: 12, percent: true },
       { header: "Pass Rate (%)", key: "pass_rate", width: 12, percent: true },
     ];
-    const classRows = data.class_performance || [];
+    const classRows = (data.class_performance || []).map((r) => ({ ...r, result: r.result || "—" }));
 
     // Gender analysis — overall and per class (from getSummaryReport's gender_performance).
     const genderCols = [
@@ -282,11 +286,12 @@ const SHAPES = {
       { header: "Registered", key: "registered", width: 12 },
       { header: "Scored", key: "scored", width: 10 },
       { header: "Mean (%)", key: "mean", width: 12, percent: true },
+      { header: "Result", key: "result", width: 14 },
       { header: "Highest (%)", key: "highest", width: 12, percent: true },
       { header: "Lowest (%)", key: "lowest", width: 12, percent: true },
       { header: "Pass Rate (%)", key: "pass_rate", width: 12, percent: true },
     ];
-    const genderRows = data.gender_performance || [];
+    const genderRows = (data.gender_performance || []).map((r) => ({ ...r, result: r.result || "—" }));
 
     // Class Performance Ranking — every scored candidate, ranked WITHIN
     // their own class (class_position, from getSummaryReport's
@@ -303,6 +308,7 @@ const SHAPES = {
       ...subjectMarkColumns(nominalSubjects),
       { header: "Total", key: "total_marks", width: 14 },
       { header: "Mean (%)", key: "average_percentage", width: 12, percent: true },
+      { header: "Result", key: "result", width: 14 },
     ];
     const classRankingRows = (data.class_ranking || []).map((r) => subjectMarkValues(r.marks, {
       class_position: r.class_position,
@@ -311,6 +317,7 @@ const SHAPES = {
       class: r.class,
       total_marks: fmtTotal(r.total_obtained, r.total_possible),
       average_percentage: r.average_percentage,
+      result: r.result || "—",
     }));
 
     return {
@@ -532,6 +539,7 @@ const SHAPES = {
       ...subjectMarkColumns(nominalSubjects),
       { header: "Total", key: "total_marks", width: 14 },
       { header: "Mean (%)", key: "average_percentage", width: 12, percent: true },
+      { header: "Result", key: "result", width: 14 },
     ];
     const rows = (data.class_ranking || []).map((r) => subjectMarkValues(r.marks, {
       class_position: r.class_position,
@@ -540,6 +548,7 @@ const SHAPES = {
       class: r.class,
       total_marks: fmtTotal(r.total_obtained, r.total_possible),
       average_percentage: r.average_percentage,
+      result: r.result || "—",
     }));
     return {
       title: "Class Performance Ranking",
@@ -562,6 +571,7 @@ const SHAPES = {
       ...subjectMarkColumns(nominalSubjects),
       { header: "Total", key: "total_marks", width: 14 },
       { header: "Mean (%)", key: "average_percentage", width: 12, percent: true },
+      { header: "Result", key: "result", width: 14 },
     ];
     const rows = (data.overall_ranking || []).map((r) => subjectMarkValues(r.marks, {
       overall_position: r.overall_position,
@@ -570,6 +580,7 @@ const SHAPES = {
       class: r.class,
       total_marks: fmtTotal(r.total_obtained, r.total_possible),
       average_percentage: r.average_percentage,
+      result: r.result || "—",
     }));
     return {
       title: "Overall Performance — Candidate Ranking",

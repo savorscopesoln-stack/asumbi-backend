@@ -1,6 +1,7 @@
 const examPct = require("../utils/examPercentages");
 const sql = require("mssql");
 const combine = require("../utils/combinedSubjects");
+const { getOverallResultForScore, getOverallResultWithFails, countFailedSubjects } = require("../utils/grading");
 
 /* =========================================================================
    MAIN EXAMINATION ANALYTICS (Phase 9 — §15-§26)
@@ -408,7 +409,7 @@ function assignOverallPositions(rows) {
 // mean). `passMark` is whatever computeMainExaminationSummary's own
 // performance.pass_mark already resolved to, so the pass rate here always
 // agrees with the exam-wide pass rate on the same summary.
-function computeClassPerformance(rows, passMark) {
+function computeClassPerformance(rows, passMark, gradingSystem) {
   const byClass = new Map();
   rows.forEach((r) => {
     if (!r.class) return; // only real classes from the Classes table
@@ -425,6 +426,7 @@ function computeClassPerformance(rows, passMark) {
       registered: group.length,
       scored: scored.length,
       mean: round2(mean),
+      result: mean != null ? getOverallResultForScore(round2(mean), gradingSystem) : null,
       highest: scored.length ? round2(Math.max(...scored.map((r) => r.average_percentage))) : null,
       lowest: scored.length ? round2(Math.min(...scored.map((r) => r.average_percentage))) : null,
       pass_rate: scored.length ? pct(scored.filter((r) => r.average_percentage >= passMark).length, scored.length) : null,
@@ -450,7 +452,7 @@ function computeClassPerformance(rows, passMark) {
 // `passMark` is the exam's configured pass mark (same as the summary's).
 // Ties share a rank (1, 2, 2, 4); subjects nobody has been scored in yet
 // are listed last, unranked.
-function computeSubjectAnalysis(roll, passMark) {
+function computeSubjectAnalysis(roll, passMark, gradingSystem) {
   const subjects = (roll && roll.subjects) || [];
   const rows = (roll && roll.rows) || [];
   const namesOf = (list) => {
@@ -494,6 +496,7 @@ function computeSubjectAnalysis(roll, passMark) {
       sat: n,
       absent: entered.length - n,
       mean: round2(mean),
+      result: mean != null ? getOverallResultForScore(round2(mean), gradingSystem) : null,
       median: round2(median),
       highest: round2(maxP),
       highest_score: top.length ? top[0].score : null,
@@ -537,7 +540,7 @@ function normalizeGender(g) {
   if (v === "f" || v === "female" || v === "girl") return "Female";
   return "Not specified";
 }
-function computeGenderPerformance(rows, passMark) {
+function computeGenderPerformance(rows, passMark, gradingSystem) {
   const order = { Male: 0, Female: 1, "Not specified": 2 };
   const summarize = (group, className, gender) => {
     const scored = group.filter((r) => r.average_percentage != null);
@@ -548,6 +551,7 @@ function computeGenderPerformance(rows, passMark) {
       registered: group.length,
       scored: scored.length,
       mean: round2(mean),
+      result: mean != null ? getOverallResultForScore(round2(mean), gradingSystem) : null,
       highest: scored.length ? round2(Math.max(...scored.map((r) => r.average_percentage))) : null,
       lowest: scored.length ? round2(Math.min(...scored.map((r) => r.average_percentage))) : null,
       pass_rate: scored.length ? pct(scored.filter((r) => r.average_percentage >= passMark).length, scored.length) : null,
@@ -713,7 +717,12 @@ async function loadNominalRoll(pool, mainExaminationId) {
     });
     // Total / average are built from PERCENTAGES (never raw marks).
     // Split papers: every code is listed above, but a split subject counts once (the paper sat).
-    const sum = examPct.summarisePercentages(examPct.countedWithoutSplitDuplicates(counted), gradingSystem);
+    const countedFinal = examPct.countedWithoutSplitDuplicates(counted);
+    const sum = examPct.summarisePercentages(countedFinal, gradingSystem);
+    // Overall result (DISTINCTION / CREDIT / PASS / REFERRED / FAIL...) — the transcript's logic:
+    // the average's overall band, unless the "minimum failed subjects" rule forces the fail label.
+    const failedSubjects = countFailedSubjects(countedFinal.map((x) => x.percentage), gradingSystem);
+    const result = sum.average != null ? getOverallResultWithFails(sum.average, failedSubjects, gradingSystem) : null;
     return {
       student_id: st.student_id,
       name: st.name,
@@ -725,6 +734,8 @@ async function loadNominalRoll(pool, mainExaminationId) {
       total_obtained: sum.total,
       total_possible: sum.possible,
       average_percentage: sum.average,
+      failed_subjects: failedSubjects,
+      result,
     };
   });
 

@@ -105,6 +105,7 @@ const getSummaryReport = async (req, res) => {
         total_obtained: r.total_obtained,
         total_possible: r.total_possible,
         average_percentage: r.average_percentage,
+        result: r.result,
         marks: r.marks,
       }))
       .sort((a, b) => a.overall_position - b.overall_position);
@@ -113,12 +114,15 @@ const getSummaryReport = async (req, res) => {
     // same Nominal Roll rows (§51) using the exam's configured pass mark
     // (data.performance.pass_mark), so it always agrees with the
     // exam-wide pass rate shown above it.
-    const classPerformance = computeClassPerformance(nominalRoll.rows || [], data.performance.pass_mark);
-    const genderPerformance = computeGenderPerformance(nominalRoll.rows || [], data.performance.pass_mark);
+    // The Grading System is threaded through so every table's Result column uses the same
+    // overall bands (and fail rule) the transcript uses.
+    const gradingSystem = await examPct.loadGradingSystem(pool);
+    const classPerformance = computeClassPerformance(nominalRoll.rows || [], data.performance.pass_mark, gradingSystem);
+    const genderPerformance = computeGenderPerformance(nominalRoll.rows || [], data.performance.pass_mark, gradingSystem);
     // Subject Analysis — every subject ranked by its mean, with highest /
     // lowest candidate and the other relevant stats, from the same Nominal
     // Roll rows (§51).
-    const subjectAnalysis = computeSubjectAnalysis(nominalRoll, data.performance.pass_mark);
+    const subjectAnalysis = computeSubjectAnalysis(nominalRoll, data.performance.pass_mark, gradingSystem);
 
     // Class Performance Ranking — every scored candidate, ranked WITHIN
     // their own class/stream (class_position, from loadNominalRoll's
@@ -142,6 +146,7 @@ const getSummaryReport = async (req, res) => {
         total_obtained: r.total_obtained,
         total_possible: r.total_possible,
         average_percentage: r.average_percentage,
+        result: r.result,
         marks: r.marks,
       }))
       .sort((a, b) => {
